@@ -17,17 +17,24 @@ sweep. That failure is recoverable; the other is a phantom.
 import logging
 import uuid
 from collections import Counter
-from typing import TYPE_CHECKING
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.errors import ApiError
+from app.integrations.s3 import ObjectMetadata
 from app.integrations.sqs import PublishError, publish_processing_item
 from app.models.enums import ACTIVE_STATUSES, CANCELLABLE_STATUSES, RunItemStatus
-from app.models.processing import AiProcessingRun, AiProcessingRunItem
+from app.models.processing import (
+    ACTIVE_STATUS_PREDICATE,
+    AiProcessingRun,
+    AiProcessingRunItem,
+)
 from app.models.spring import reports
 from app.schemas.runs import (
     CancelRunResponse,
@@ -38,7 +45,11 @@ from app.schemas.runs import (
     SubmitOutcome,
     SubmittedItem,
 )
-from app.services.source_validation import SourceObjectUnavailableError, validate_source_object
+from app.services.source_validation import (
+    SourceObjectUnavailableError,
+    ValidationFailure,
+    validate_source_object,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mypy_boto3_s3.client import S3Client
@@ -49,6 +60,10 @@ logger = logging.getLogger(__name__)
 _ACTIVE = {status.value for status in ACTIVE_STATUSES}
 _CANCELLABLE = {status.value for status in CANCELLABLE_STATUSES}
 
+#: How many source files to HeadObject at once. Small enough not to hammer S3 or
+#: exhaust the botocore connection pool, large enough that a big batch is not serial.
+_VALIDATION_CONCURRENCY = 8
+
 
 def _report_filepaths(session: Session, report_ids: list[int]) -> dict[int, str]:
     """Existence + source key lookup. A sanity check, NOT an access-control check."""
@@ -58,15 +73,6 @@ def _report_filepaths(session: Session, report_ids: list[int]) -> dict[int, str]
     return {int(row.id): row.filepath for row in rows}
 
 
-def _latest_item_for_report(session: Session, report_id: int) -> AiProcessingRunItem | None:
-    return session.execute(
-        select(AiProcessingRunItem)
-        .where(AiProcessingRunItem.report_id == report_id)
-        .order_by(AiProcessingRunItem.created_at.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-
-
 def _active_item_for_report(session: Session, report_id: int) -> AiProcessingRunItem | None:
     return session.execute(
         select(AiProcessingRunItem).where(
@@ -74,6 +80,179 @@ def _active_item_for_report(session: Session, report_id: int) -> AiProcessingRun
             AiProcessingRunItem.status.in_(_ACTIVE),
         )
     ).scalar_one_or_none()
+
+
+def _active_items(session: Session, report_ids: list[int]) -> dict[int, AiProcessingRunItem]:
+    """In-flight item per report, for the whole batch in one query."""
+    rows = session.execute(
+        select(AiProcessingRunItem).where(
+            AiProcessingRunItem.report_id.in_(report_ids),
+            AiProcessingRunItem.status.in_(_ACTIVE),
+        )
+    ).scalars()
+    return {item.report_id: item for item in rows}
+
+
+def _latest_items(session: Session, report_ids: list[int]) -> dict[int, AiProcessingRunItem]:
+    """Most recent item per report, for the whole batch in one query.
+
+    ``DISTINCT ON`` is PostgreSQL-specific, which is fine — this service targets
+    PostgreSQL — and avoids one query per report on a 500-report submission.
+    """
+    rows = session.execute(
+        select(AiProcessingRunItem)
+        .where(AiProcessingRunItem.report_id.in_(report_ids))
+        .distinct(AiProcessingRunItem.report_id)
+        .order_by(AiProcessingRunItem.report_id, AiProcessingRunItem.created_at.desc())
+    ).scalars()
+    return {item.report_id: item for item in rows}
+
+
+def _validate_sources(
+    s3: "S3Client", settings: Settings, targets: dict[int, str]
+) -> dict[int, tuple[ObjectMetadata | None, ValidationFailure | None]]:
+    """HeadObject every candidate, a few at a time.
+
+    Sequentially this is one network round trip per report — on a 500-report batch
+    that alone is minutes of wall clock in an endpoint expected to answer quickly.
+    boto3 clients are thread-safe for API calls, so a small pool is enough.
+    """
+    if not targets:
+        return {}
+
+    if len(targets) == 1:
+        report_id, filepath = next(iter(targets.items()))
+        return {report_id: validate_source_object(s3, settings, filepath)}
+
+    workers = min(_VALIDATION_CONCURRENCY, len(targets))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="validate") as pool:
+        futures = {
+            pool.submit(validate_source_object, s3, settings, filepath): report_id
+            for report_id, filepath in targets.items()
+        }
+        # A transient S3 failure in any worker propagates, so the caller answers 503
+        # rather than permanently rejecting reports over a blip.
+        return {futures[future]: future.result() for future in as_completed(futures)}
+
+
+@dataclass
+class _Resolved:
+    """What a submitted report ended up mapped to."""
+
+    item_id: uuid.UUID
+    report_id: int
+    run_id: uuid.UUID
+    status: str
+    error_code: str | None
+    outcome: SubmitOutcome
+
+
+@dataclass
+class _Plan:
+    """Decisions made before touching the database."""
+
+    #: Reports answered from existing rows: in flight, or completed without force.
+    reused: dict[int, AiProcessingRunItem]
+    outcomes: dict[int, SubmitOutcome]
+    #: Reports needing a new item, as insertable column dicts.
+    new_rows: dict[int, dict[str, Any]]
+
+
+def _plan_items(
+    report_ids: list[int],
+    active: dict[int, AiProcessingRunItem],
+    latest: dict[int, AiProcessingRunItem],
+    validated: dict[int, tuple[ObjectMetadata | None, ValidationFailure | None]],
+    force_reprocess: bool,
+) -> _Plan:
+    """Pure decision step: no I/O, so the rules are easy to test and to read."""
+    reused: dict[int, AiProcessingRunItem] = {}
+    outcomes: dict[int, SubmitOutcome] = {}
+    new_rows: dict[int, dict[str, Any]] = {}
+
+    for report_id in report_ids:
+        in_flight = active.get(report_id)
+        if in_flight is not None:
+            # Already running, and already has a queue message. force_reprocess
+            # concerns finished results, not work still under way.
+            reused[report_id] = in_flight
+            outcomes[report_id] = SubmitOutcome.REUSED
+            continue
+
+        previous = latest.get(report_id)
+        if (
+            previous is not None
+            and previous.status == RunItemStatus.COMPLETED.value
+            and not force_reprocess
+        ):
+            # Never overwrite a completed result without an explicit force_reprocess.
+            reused[report_id] = previous
+            outcomes[report_id] = SubmitOutcome.ALREADY_COMPLETED
+            continue
+
+        meta, failure = validated.get(report_id, (None, None))
+        # Every row carries the same keys: a multi-row VALUES clause cannot mix
+        # differing column sets, and omitting one here fails at compile time.
+        new_rows[report_id] = {
+            "report_id": report_id,
+            "status": (
+                RunItemStatus.REJECTED.value
+                if failure is not None
+                # Terminal with a reason, rather than failing the whole batch.
+                else RunItemStatus.PENDING.value
+            ),
+            "content_hash": meta.etag if meta is not None else None,
+            "last_error_code": failure.code if failure is not None else None,
+            "last_error_message": failure.message if failure is not None else None,
+        }
+
+    return _Plan(reused=reused, outcomes=outcomes, new_rows=new_rows)
+
+
+def _insert_new_items(
+    session: Session, run_id: uuid.UUID, new_rows: dict[int, dict[str, Any]]
+) -> dict[int, Any]:
+    """Insert every new item in one statement, tolerating the idempotency race.
+
+    ``ON CONFLICT DO NOTHING`` replaces a per-item SAVEPOINT/flush. That matters twice
+    over: it is one round trip instead of three per report on a batch of up to 500,
+    and it removes the failure mode where catching IntegrityError and calling
+    ``session.rollback()`` would discard the whole transaction — run row and all
+    previously created items — while the response still reported their ids.
+    """
+    if not new_rows:
+        return {}
+
+    statement = (
+        pg_insert(AiProcessingRunItem)
+        .values([{**row, "run_id": run_id} for row in new_rows.values()])
+        # The predicate must match the partial index exactly to target it.
+        .on_conflict_do_nothing(
+            index_elements=[AiProcessingRunItem.report_id],
+            index_where=text(ACTIVE_STATUS_PREDICATE),
+        )
+        .returning(
+            AiProcessingRunItem.id,
+            AiProcessingRunItem.report_id,
+            AiProcessingRunItem.status,
+            AiProcessingRunItem.last_error_code,
+        )
+    )
+    return {row.report_id: row for row in session.execute(statement).all()}
+
+
+def _mark_queued(session: Session, item_ids: set[uuid.UUID]) -> None:
+    session.execute(
+        update(AiProcessingRunItem)
+        .where(
+            AiProcessingRunItem.id.in_(item_ids),
+            # Only advance from pending: a worker may already have picked the item
+            # up and moved it on before this update lands.
+            AiProcessingRunItem.status == RunItemStatus.PENDING.value,
+        )
+        .values(status=RunItemStatus.QUEUED.value)
+    )
+    session.commit()
 
 
 def create_run(
@@ -107,79 +286,28 @@ def create_run(
     )
     session.add(run)
     session.flush()  # assign run.id without committing
+    # Captured now: commit() may expire the instance, and re-reading these later
+    # would cost an extra round trip for no reason.
+    run_id, run_created_at = run.id, run.created_at
 
-    outcomes: dict[int, SubmitOutcome] = {}
-    items: dict[int, AiProcessingRunItem] = {}
-    publishable: list[AiProcessingRunItem] = []
+    # Two queries for the whole batch rather than two per report.
+    active = _active_items(session, unique_ids)
+    latest = _latest_items(session, unique_ids)
 
-    for report_id in unique_ids:
-        item, outcome = _submit_one(
-            session,
-            run,
-            report_id,
-            filepaths[report_id],
-            force_reprocess=payload.force_reprocess,
-            s3=s3,
-            settings=settings,
+    # Only reports that will actually produce new work need their source validated;
+    # reused and already-completed ones are answered from the database alone.
+    needs_validation = {
+        report_id: filepaths[report_id]
+        for report_id in unique_ids
+        if report_id not in active
+        and not (
+            (existing := latest.get(report_id)) is not None
+            and existing.status == RunItemStatus.COMPLETED.value
+            and not payload.force_reprocess
         )
-        items[report_id] = item
-        outcomes[report_id] = outcome
-        if outcome is SubmitOutcome.CREATED and item.status == RunItemStatus.PENDING.value:
-            publishable.append(item)
-
-    # Commit before publishing: a worker must never see an item id that is not
-    # yet committed.
-    session.commit()
-
-    _publish(session, sqs, settings, publishable)
-
-    session.refresh(run)
-    return CreateRunResponse(
-        run_id=run.id,
-        created_at=run.created_at,
-        items=[
-            SubmittedItem(
-                report_id=report_id,
-                item_id=items[report_id].id,
-                status=items[report_id].status,
-                outcome=outcomes[report_id],
-                error_code=items[report_id].last_error_code,
-            )
-            for report_id in unique_ids
-        ],
-    )
-
-
-def _submit_one(
-    session: Session,
-    run: AiProcessingRun,
-    report_id: int,
-    filepath: str,
-    *,
-    force_reprocess: bool,
-    s3: "S3Client",
-    settings: Settings,
-) -> tuple[AiProcessingRunItem, SubmitOutcome]:
-    """Create, or safely reuse, the item for one report."""
-    active = _active_item_for_report(session, report_id)
-    if active is not None:
-        # Already in flight, and already has a queue message. Reuse rather than
-        # process the same report twice; force_reprocess concerns finished results.
-        return active, SubmitOutcome.REUSED
-
-    latest = _latest_item_for_report(session, report_id)
-    if (
-        latest is not None
-        and latest.status == RunItemStatus.COMPLETED.value
-        and not force_reprocess
-    ):
-        # Never overwrite a completed result without an explicit force_reprocess.
-        return latest, SubmitOutcome.ALREADY_COMPLETED
-
-    # Validate the source file before spending any AI budget on it. A transient S3
-    # failure propagates rather than permanently rejecting a valid report.
+    }
     try:
-        meta, failure = validate_source_object(s3, settings, filepath)
+        validated = _validate_sources(s3, settings, needs_validation)
     except SourceObjectUnavailableError as exc:
         raise ApiError(
             503,
@@ -187,87 +315,122 @@ def _submit_one(
             "Could not verify source files; retry shortly",
         ) from exc
 
-    item = AiProcessingRunItem(run_id=run.id, report_id=report_id)
-    if failure is not None:
-        # Terminal: recorded with a reason instead of failing the whole batch.
-        item.status = RunItemStatus.REJECTED.value
-        item.last_error_code = failure.code
-        item.last_error_message = failure.message
-    else:
-        item.status = RunItemStatus.PENDING.value
-        item.content_hash = meta.etag if meta else None
+    plan = _plan_items(unique_ids, active, latest, validated, payload.force_reprocess)
+    created = _insert_new_items(session, run_id, plan.new_rows)
 
-    session.add(item)
-    try:
-        session.flush()
-    except IntegrityError:
-        # Lost a race with a concurrent submission. The unique index did its job;
-        # roll back and reuse whatever the winner created.
-        session.rollback()
-        session.add(run)
-        winner = _active_item_for_report(session, report_id)
-        if winner is None:  # pragma: no cover - only on an unrelated constraint
-            raise
-        return winner, SubmitOutcome.REUSED
+    # Rows the insert did not return lost the idempotency race to a concurrent
+    # submission. ON CONFLICT DO NOTHING means no exception and no lost transaction:
+    # look up the winners and reuse them.
+    losers = [report_id for report_id in plan.new_rows if report_id not in created]
+    winners = _active_items(session, losers) if losers else {}
 
-    return item, SubmitOutcome.CREATED
+    resolved: dict[int, _Resolved] = {}
+    publishable: list[_Resolved] = []
+    for report_id in unique_ids:
+        if report_id in plan.reused:
+            existing = plan.reused[report_id]
+            resolved[report_id] = _Resolved(
+                item_id=existing.id,
+                report_id=report_id,
+                run_id=existing.run_id,
+                status=existing.status,
+                error_code=existing.last_error_code,
+                outcome=plan.outcomes[report_id],
+            )
+        elif report_id in created:
+            row = created[report_id]
+            entry = _Resolved(
+                item_id=row.id,
+                report_id=report_id,
+                run_id=run_id,
+                status=row.status,
+                error_code=row.last_error_code,
+                outcome=SubmitOutcome.CREATED,
+            )
+            resolved[report_id] = entry
+            if row.status == RunItemStatus.PENDING.value:
+                publishable.append(entry)
+        else:
+            winner = winners.get(report_id)
+            if winner is None:  # pragma: no cover - the winner turned terminal instantly
+                raise ApiError(409, "submission_conflict", "Report is already being processed")
+            resolved[report_id] = _Resolved(
+                item_id=winner.id,
+                report_id=report_id,
+                run_id=winner.run_id,
+                status=winner.status,
+                error_code=winner.last_error_code,
+                outcome=SubmitOutcome.REUSED,
+            )
+
+    # Commit before publishing: a worker must never see an item id that is not
+    # yet committed.
+    session.commit()
+
+    published = _publish(sqs, settings, publishable)
+    if published:
+        _mark_queued(session, published)
+        for entry in publishable:
+            if entry.item_id in published:
+                entry.status = RunItemStatus.QUEUED.value
+
+    return CreateRunResponse(
+        run_id=run_id,
+        created_at=run_created_at,
+        items=[
+            SubmittedItem(
+                report_id=report_id,
+                item_id=resolved[report_id].item_id,
+                status=resolved[report_id].status,
+                outcome=resolved[report_id].outcome,
+                error_code=resolved[report_id].error_code,
+            )
+            for report_id in unique_ids
+        ],
+    )
 
 
 def _publish(
-    session: Session,
     sqs: "SQSClient",
     settings: Settings,
-    items: list[AiProcessingRunItem],
-) -> None:
-    """Enqueue committed items and advance them to `queued`.
+    entries: list["_Resolved"],
+) -> set[uuid.UUID]:
+    """Enqueue committed items. Returns the ids that made it onto the queue.
 
     A publish failure is not fatal. The item stays `pending`, which the stale-item
     sweep treats as retryable — better than failing a request whose work is already
     durably recorded.
     """
-    if not items:
-        return
+    if not entries:
+        return set()
 
     if not settings.sqs_queue_url:
-        logger.error(
-            "publish_skipped_no_queue_configured",
-            extra={"item_count": len(items)},
-        )
-        return
+        logger.error("publish_skipped_no_queue_configured", extra={"item_count": len(entries)})
+        return set()
 
-    published: list[uuid.UUID] = []
-    for item in items:
+    published: set[uuid.UUID] = set()
+    for entry in entries:
         try:
             message_id = publish_processing_item(
                 sqs,
                 settings.sqs_queue_url,
-                item_id=item.id,
-                run_id=item.run_id,
-                report_id=item.report_id,
-                attempt=item.attempt_count,
+                item_id=entry.item_id,
+                run_id=entry.run_id,
+                report_id=entry.report_id,
+                attempt=0,
             )
         except PublishError as exc:
             # Identifiers only -- never the report or the message body.
             logger.error(
-                "publish_failed",
-                extra={"item_id": str(item.id), "reason": str(exc)},
+                "publish_failed", extra={"item_id": str(entry.item_id), "reason": str(exc)}
             )
             continue
-        logger.info("item_published", extra={"item_id": str(item.id), "message_id": message_id})
-        published.append(item.id)
-
-    if published:
-        session.execute(
-            update(AiProcessingRunItem)
-            .where(
-                AiProcessingRunItem.id.in_(published),
-                # Only advance from pending: a worker may already have picked the
-                # item up and moved it on before this update lands.
-                AiProcessingRunItem.status == RunItemStatus.PENDING.value,
-            )
-            .values(status=RunItemStatus.QUEUED.value)
+        logger.info(
+            "item_published", extra={"item_id": str(entry.item_id), "message_id": message_id}
         )
-        session.commit()
+        published.add(entry.item_id)
+
+    return published
 
 
 def get_run(session: Session, run_id: uuid.UUID) -> RunResponse:
@@ -280,7 +443,7 @@ def get_run(session: Session, run_id: uuid.UUID) -> RunResponse:
     finished = not any(item.status in _ACTIVE for item in run.items)
 
     return RunResponse(
-        run_id=run.id,
+        run_id=run_id,
         caller=run.caller,
         requested_by_user_id=run.requested_by_user_id,
         force_reprocess=run.force_reprocess,

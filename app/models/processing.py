@@ -31,6 +31,11 @@ from app.models.enums import ACTIVE_STATUSES, RunItemStatus
 _STATUS_VALUES = ", ".join(f"'{status.value}'" for status in RunItemStatus)
 _ACTIVE_VALUES = ", ".join(f"'{status.value}'" for status in sorted(ACTIVE_STATUSES))
 
+#: The exact predicate of `uq_ai_run_items_active_report`. ON CONFLICT must repeat an
+#: index's predicate verbatim to target a partial index, so both are built from here
+#: rather than written out twice and allowed to drift.
+ACTIVE_STATUS_PREDICATE = f"status IN ({_ACTIVE_VALUES})"
+
 
 class AiProcessingRun(Base):
     """One submission from Spring."""
@@ -134,7 +139,7 @@ class AiProcessingRunItem(Base):
             "uq_ai_run_items_active_report",
             "report_id",
             unique=True,
-            postgresql_where=text(f"status IN ({_ACTIVE_VALUES})"),
+            postgresql_where=text(ACTIVE_STATUS_PREDICATE),
         ),
         Index("ix_ai_run_items_run_id", "run_id"),
         Index("ix_ai_run_items_report_id", "report_id"),
