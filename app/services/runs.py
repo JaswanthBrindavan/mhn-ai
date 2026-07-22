@@ -1,19 +1,31 @@
 """Report-processing run business logic.
 
-Idempotency is enforced by the database, not by application checks: a partial unique
-index permits at most one in-flight item per report. Two concurrent submissions for the
-same report therefore cannot both create an item — one raises ``IntegrityError`` and we
-reuse the winner's row. A read-then-write check alone would let a race through.
+Two invariants worth stating up front.
+
+**Idempotency is enforced by the database.** A partial unique index permits at most one
+in-flight item per report, so two concurrent submissions cannot both create work. One
+raises ``IntegrityError`` and we reuse the winner's row. A read-then-write check alone
+loses that race.
+
+**Messages are published only after the transaction commits.** SQS delivery can be
+faster than a transaction; publishing first lets a worker receive an item id that no
+committed row matches yet. Publishing after means the worst case is a committed item
+that never got a message — visible as `pending`, and recoverable by the stale-item
+sweep. That failure is recoverable; the other is a phantom.
 """
 
+import logging
 import uuid
 from collections import Counter
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings
 from app.core.errors import ApiError
+from app.integrations.sqs import PublishError, publish_processing_item
 from app.models.enums import ACTIVE_STATUSES, CANCELLABLE_STATUSES, RunItemStatus
 from app.models.processing import AiProcessingRun, AiProcessingRunItem
 from app.models.spring import reports
@@ -26,15 +38,24 @@ from app.schemas.runs import (
     SubmitOutcome,
     SubmittedItem,
 )
+from app.services.source_validation import SourceObjectUnavailableError, validate_source_object
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mypy_boto3_s3.client import S3Client
+    from mypy_boto3_sqs.client import SQSClient
+
+logger = logging.getLogger(__name__)
 
 _ACTIVE = {status.value for status in ACTIVE_STATUSES}
 _CANCELLABLE = {status.value for status in CANCELLABLE_STATUSES}
 
 
-def _existing_report_ids(session: Session, report_ids: list[int]) -> set[int]:
-    """Which of these reports exist. A sanity check, NOT an access-control check."""
-    rows = session.execute(select(reports.c.id).where(reports.c.id.in_(report_ids))).scalars()
-    return set(rows)
+def _report_filepaths(session: Session, report_ids: list[int]) -> dict[int, str]:
+    """Existence + source key lookup. A sanity check, NOT an access-control check."""
+    rows = session.execute(
+        select(reports.c.id, reports.c.filepath).where(reports.c.id.in_(report_ids))
+    ).all()
+    return {int(row.id): row.filepath for row in rows}
 
 
 def _latest_item_for_report(session: Session, report_id: int) -> AiProcessingRunItem | None:
@@ -56,15 +77,20 @@ def _active_item_for_report(session: Session, report_id: int) -> AiProcessingRun
 
 
 def create_run(
-    session: Session, payload: CreateRunRequest, request_id: str | None
+    session: Session,
+    payload: CreateRunRequest,
+    request_id: str | None,
+    *,
+    s3: "S3Client",
+    sqs: "SQSClient",
+    settings: Settings,
 ) -> CreateRunResponse:
-    """Persist a run and its items. Publishing to SQS arrives in step 4."""
     # Deduplicate while preserving caller order, so a repeated id in one request
     # cannot try to create two items and trip the unique index against itself.
     unique_ids = list(dict.fromkeys(payload.report_ids))
 
-    existing = _existing_report_ids(session, unique_ids)
-    missing = [report_id for report_id in unique_ids if report_id not in existing]
+    filepaths = _report_filepaths(session, unique_ids)
+    missing = [report_id for report_id in unique_ids if report_id not in filepaths]
     if missing:
         raise ApiError(
             404,
@@ -82,33 +108,64 @@ def create_run(
     session.add(run)
     session.flush()  # assign run.id without committing
 
-    submitted: list[SubmittedItem] = []
+    outcomes: dict[int, SubmitOutcome] = {}
+    items: dict[int, AiProcessingRunItem] = {}
+    publishable: list[AiProcessingRunItem] = []
+
     for report_id in unique_ids:
-        submitted.append(_submit_one(session, run, report_id, payload.force_reprocess))
+        item, outcome = _submit_one(
+            session,
+            run,
+            report_id,
+            filepaths[report_id],
+            force_reprocess=payload.force_reprocess,
+            s3=s3,
+            settings=settings,
+        )
+        items[report_id] = item
+        outcomes[report_id] = outcome
+        if outcome is SubmitOutcome.CREATED and item.status == RunItemStatus.PENDING.value:
+            publishable.append(item)
 
+    # Commit before publishing: a worker must never see an item id that is not
+    # yet committed.
     session.commit()
-    session.refresh(run)
 
-    return CreateRunResponse(run_id=run.id, created_at=run.created_at, items=submitted)
+    _publish(session, sqs, settings, publishable)
+
+    session.refresh(run)
+    return CreateRunResponse(
+        run_id=run.id,
+        created_at=run.created_at,
+        items=[
+            SubmittedItem(
+                report_id=report_id,
+                item_id=items[report_id].id,
+                status=items[report_id].status,
+                outcome=outcomes[report_id],
+                error_code=items[report_id].last_error_code,
+            )
+            for report_id in unique_ids
+        ],
+    )
 
 
 def _submit_one(
     session: Session,
     run: AiProcessingRun,
     report_id: int,
+    filepath: str,
+    *,
     force_reprocess: bool,
-) -> SubmittedItem:
+    s3: "S3Client",
+    settings: Settings,
+) -> tuple[AiProcessingRunItem, SubmitOutcome]:
     """Create, or safely reuse, the item for one report."""
     active = _active_item_for_report(session, report_id)
     if active is not None:
-        # Already in flight. Reuse rather than process the same report twice --
-        # force_reprocess does not apply, since the work has not finished yet.
-        return SubmittedItem(
-            report_id=report_id,
-            item_id=active.id,
-            status=active.status,
-            outcome=SubmitOutcome.REUSED,
-        )
+        # Already in flight, and already has a queue message. Reuse rather than
+        # process the same report twice; force_reprocess concerns finished results.
+        return active, SubmitOutcome.REUSED
 
     latest = _latest_item_for_report(session, report_id)
     if (
@@ -117,42 +174,100 @@ def _submit_one(
         and not force_reprocess
     ):
         # Never overwrite a completed result without an explicit force_reprocess.
-        return SubmittedItem(
-            report_id=report_id,
-            item_id=latest.id,
-            status=latest.status,
-            outcome=SubmitOutcome.ALREADY_COMPLETED,
-        )
+        return latest, SubmitOutcome.ALREADY_COMPLETED
 
-    item = AiProcessingRunItem(
-        run_id=run.id,
-        report_id=report_id,
-        status=RunItemStatus.PENDING.value,
-    )
+    # Validate the source file before spending any AI budget on it. A transient S3
+    # failure propagates rather than permanently rejecting a valid report.
+    try:
+        meta, failure = validate_source_object(s3, settings, filepath)
+    except SourceObjectUnavailableError as exc:
+        raise ApiError(
+            503,
+            "source_storage_unavailable",
+            "Could not verify source files; retry shortly",
+        ) from exc
+
+    item = AiProcessingRunItem(run_id=run.id, report_id=report_id)
+    if failure is not None:
+        # Terminal: recorded with a reason instead of failing the whole batch.
+        item.status = RunItemStatus.REJECTED.value
+        item.last_error_code = failure.code
+        item.last_error_message = failure.message
+    else:
+        item.status = RunItemStatus.PENDING.value
+        item.content_hash = meta.etag if meta else None
+
     session.add(item)
     try:
         session.flush()
     except IntegrityError:
         # Lost a race with a concurrent submission. The unique index did its job;
-        # roll back to the savepoint and reuse whatever the winner created.
+        # roll back and reuse whatever the winner created.
         session.rollback()
         session.add(run)
         winner = _active_item_for_report(session, report_id)
         if winner is None:  # pragma: no cover - only on an unrelated constraint
             raise
-        return SubmittedItem(
-            report_id=report_id,
-            item_id=winner.id,
-            status=winner.status,
-            outcome=SubmitOutcome.REUSED,
-        )
+        return winner, SubmitOutcome.REUSED
 
-    return SubmittedItem(
-        report_id=report_id,
-        item_id=item.id,
-        status=item.status,
-        outcome=SubmitOutcome.CREATED,
-    )
+    return item, SubmitOutcome.CREATED
+
+
+def _publish(
+    session: Session,
+    sqs: "SQSClient",
+    settings: Settings,
+    items: list[AiProcessingRunItem],
+) -> None:
+    """Enqueue committed items and advance them to `queued`.
+
+    A publish failure is not fatal. The item stays `pending`, which the stale-item
+    sweep treats as retryable — better than failing a request whose work is already
+    durably recorded.
+    """
+    if not items:
+        return
+
+    if not settings.sqs_queue_url:
+        logger.error(
+            "publish_skipped_no_queue_configured",
+            extra={"item_count": len(items)},
+        )
+        return
+
+    published: list[uuid.UUID] = []
+    for item in items:
+        try:
+            message_id = publish_processing_item(
+                sqs,
+                settings.sqs_queue_url,
+                item_id=item.id,
+                run_id=item.run_id,
+                report_id=item.report_id,
+                attempt=item.attempt_count,
+            )
+        except PublishError as exc:
+            # Identifiers only -- never the report or the message body.
+            logger.error(
+                "publish_failed",
+                extra={"item_id": str(item.id), "reason": str(exc)},
+            )
+            continue
+        logger.info("item_published", extra={"item_id": str(item.id), "message_id": message_id})
+        published.append(item.id)
+
+    if published:
+        session.execute(
+            update(AiProcessingRunItem)
+            .where(
+                AiProcessingRunItem.id.in_(published),
+                # Only advance from pending: a worker may already have picked the
+                # item up and moved it on before this update lands.
+                AiProcessingRunItem.status == RunItemStatus.PENDING.value,
+            )
+            .values(status=RunItemStatus.QUEUED.value)
+        )
+        session.commit()
 
 
 def get_run(session: Session, run_id: uuid.UUID) -> RunResponse:

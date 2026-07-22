@@ -4,21 +4,33 @@
                causes a restart loop.
 ``/ready``   — can it actually serve traffic? Checks each dependency and returns
                503 if any required one is down.
+
+Probes report only up/down. Failure detail goes to the log, never to the response —
+these endpoints are unauthenticated so orchestrators can reach them.
 """
 
 import logging
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.api.deps import s3_client, sqs_client
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mypy_boto3_s3.client import S3Client
+    from mypy_boto3_sqs.client import SQSClient
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
+
+_UP: dict[str, Any] = {"status": "up"}
+_DOWN: dict[str, Any] = {"status": "down"}
+_NOT_CONFIGURED: dict[str, Any] = {"status": "not_configured"}
 
 
 @router.get("/health")
@@ -26,28 +38,48 @@ def health() -> dict[str, Literal["ok"]]:
     return {"status": "ok"}
 
 
-def _check_database(session: Session) -> dict[str, Any]:
+def _check(name: str, probe: Any) -> dict[str, Any]:
     try:
-        session.execute(text("SELECT 1"))
+        probe()
     except Exception as exc:
-        # Log the detail; the response says only that it failed.
-        logger.warning("readiness_check_failed", extra={"dependency": "database"}, exc_info=exc)
-        return {"status": "down"}
-    return {"status": "up"}
+        logger.warning("readiness_check_failed", extra={"dependency": name}, exc_info=exc)
+        return _DOWN
+    return _UP
 
 
 @router.get("/ready")
 def ready(
     response: Response,
-    session: Session = Depends(get_session),
-    settings: Settings = Depends(get_settings),
+    session: Annotated[Session, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    s3: Annotated["S3Client", Depends(s3_client)],
+    sqs: Annotated["SQSClient", Depends(sqs_client)],
 ) -> dict[str, Any]:
-    # S3 and SQS probes are added in step 4, when those are configured.
-    checks: dict[str, Any] = {"database": _check_database(session)}
+    checks: dict[str, Any] = {
+        "database": _check("database", lambda: session.execute(text("SELECT 1"))),
+        "s3": (
+            _check("s3", lambda: s3.head_bucket(Bucket=settings.s3_bucket))
+            if settings.s3_bucket
+            else _NOT_CONFIGURED
+        ),
+        "sqs": (
+            _check(
+                "sqs",
+                lambda: sqs.get_queue_attributes(
+                    QueueUrl=settings.sqs_queue_url, AttributeNames=["QueueArn"]
+                ),
+            )
+            if settings.sqs_queue_url
+            else _NOT_CONFIGURED
+        ),
+    }
 
-    ok = all(check["status"] == "up" for check in checks.values())
+    # `not_configured` is not a failure: it keeps the service startable in
+    # environments where a dependency is genuinely absent, while still being visible.
+    ok = all(check["status"] != "down" for check in checks.values())
     if not ok:
         response.status_code = 503
+
     return {
         "status": "ready" if ok else "not_ready",
         "checks": checks,

@@ -61,8 +61,12 @@ class RunItemResponse(BaseModel):
 class SubmittedItem(BaseModel):
     report_id: int
     item_id: uuid.UUID
+    #: `queued` once the message is on the queue. Stays `pending` if publishing
+    #: failed — the item is durable and the stale-item sweep will retry it.
     status: str
     outcome: SubmitOutcome
+    #: Set when the item was rejected at submit, e.g. unsupported_content_type.
+    error_code: str | None = None
 
 
 class CreateRunResponse(BaseModel):

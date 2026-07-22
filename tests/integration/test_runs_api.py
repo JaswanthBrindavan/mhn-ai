@@ -35,8 +35,8 @@ def test_submit_creates_a_run_and_items(api, make_report):
     item = body["items"][0]
     assert item["report_id"] == report_id
     assert item["outcome"] == "created"
-    # Queue publishing arrives in step 4, so items start pending.
-    assert item["status"] == RunItemStatus.PENDING.value
+    # Published to the queue during the request, so it lands as queued.
+    assert item["status"] == RunItemStatus.QUEUED.value
 
 
 def test_submit_rejects_unknown_report_ids(api, make_report):
@@ -152,7 +152,7 @@ def test_get_run_reports_progress(api, make_report):
     body = api.get(f"/v1/report-processing-runs/{run_id}").json()
 
     assert body["progress"]["total"] == 2
-    assert body["progress"]["pending"] == 2
+    assert body["progress"]["queued"] == 2
     assert body["finished"] is False
     assert len(body["items"]) == 2
 

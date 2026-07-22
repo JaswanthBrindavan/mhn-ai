@@ -12,16 +12,21 @@ tests must never leave rows lying around or touch Spring-owned data they did not
 import uuid
 from collections.abc import Iterator
 
+import boto3
 import pytest
 from fastapi.testclient import TestClient
+from moto import mock_aws
 from sqlalchemy import Connection, text
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
+from app.api.deps import s3_client, sqs_client
+from app.core.config import Settings, get_settings
 from app.core.db import engine, get_session
 from app.main import create_app
 
 SERVICE_TOKEN = "test-service-token-at-least-32-chars-long"
+REGION = "ap-south-1"
+BUCKET = "mhn-reports-test"
 
 
 @pytest.fixture(scope="session")
@@ -92,10 +97,52 @@ def seed_user(db_session: Session) -> uuid.UUID:
 
 
 @pytest.fixture
-def make_report(db_session: Session, seed_user: uuid.UUID):
-    """Create a reports row. `created_by` may differ from `user_id` (family upload)."""
+def aws() -> Iterator[tuple]:
+    """moto-backed S3 and SQS, with the bucket and queue already created."""
+    with mock_aws():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": REGION})
+        sqs = boto3.client("sqs", region_name=REGION)
+        dlq = sqs.create_queue(QueueName="report-processing-dlq")["QueueUrl"]
+        queue_url = sqs.create_queue(QueueName="report-processing")["QueueUrl"]
+        yield s3, sqs, queue_url, dlq
 
-    def _make(*, created_by: uuid.UUID | None = None) -> int:
+
+@pytest.fixture
+def test_settings(aws) -> Settings:
+    """Settings pointed at the moto resources rather than the developer's .env."""
+    _, _, queue_url, dlq = aws
+    base = get_settings()
+    return Settings(
+        database_url=base.database_url,
+        mhn_service_token=base.mhn_service_token,
+        aws_region=REGION,
+        s3_bucket=BUCKET,
+        sqs_queue_url=queue_url,
+        sqs_dlq_url=dlq,
+        max_file_bytes=1_000_000,
+    )
+
+
+@pytest.fixture
+def make_report(db_session: Session, seed_user: uuid.UUID, aws):
+    """Create a reports row AND its S3 object, so the source validates.
+
+    `created_by` may differ from `user_id`, which is the family-upload case.
+    """
+    s3 = aws[0]
+
+    def _make(
+        *,
+        created_by: uuid.UUID | None = None,
+        body: bytes = b"%PDF-1.4 fake report",
+        content_type: str = "application/pdf",
+        suffix: str = ".pdf",
+        upload: bool = True,
+    ) -> int:
+        key = f"reports/test/{uuid.uuid4().hex}{suffix}"
+        if upload:
+            s3.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
         report_id = db_session.execute(
             text(
                 "INSERT INTO reports (user_id, filepath, created_by) "
@@ -103,7 +150,7 @@ def make_report(db_session: Session, seed_user: uuid.UUID):
             ),
             {
                 "user_id": seed_user,
-                "filepath": f"reports/test/{uuid.uuid4().hex}.pdf",
+                "filepath": key,
                 "created_by": created_by if created_by is not None else seed_user,
             },
         ).scalar_one()
@@ -114,13 +161,16 @@ def make_report(db_session: Session, seed_user: uuid.UUID):
 
 
 @pytest.fixture
-def api(db_session: Session) -> Iterator[TestClient]:
-    """A client whose requests share the test's transaction, and carry the token."""
+def api(db_session: Session, aws, test_settings: Settings) -> Iterator[TestClient]:
+    """A client sharing the test's transaction and moto clients, carrying the token."""
+    s3, sqs, _, _ = aws
     app = create_app()
     app.dependency_overrides[get_session] = lambda: db_session
+    app.dependency_overrides[s3_client] = lambda: s3
+    app.dependency_overrides[sqs_client] = lambda: sqs
+    app.dependency_overrides[get_settings] = lambda: test_settings
 
-    settings = get_settings()
     client = TestClient(app, raise_server_exceptions=False)
-    client.headers.update({"Authorization": f"Bearer {settings.mhn_service_token}"})
+    client.headers.update({"Authorization": f"Bearer {test_settings.mhn_service_token}"})
     with client:
         yield client

@@ -8,12 +8,18 @@ authenticates Spring as a service. These handlers perform no user-level authoriz
 """
 
 import uuid
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Depends, Header, Response, status
 from sqlalchemy.orm import Session
 
+from app.api.deps import s3_client, sqs_client
+from app.core.config import Settings, get_settings
 from app.core.db import get_session
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mypy_boto3_s3.client import S3Client
+    from mypy_boto3_sqs.client import SQSClient
 from app.schemas.runs import (
     CancelRunResponse,
     CreateRunRequest,
@@ -34,13 +40,18 @@ router = APIRouter(tags=["report-processing-runs"])
 def create_run(
     payload: CreateRunRequest,
     session: Annotated[Session, Depends(get_session)],
+    s3: Annotated["S3Client", Depends(s3_client)],
+    sqs: Annotated["SQSClient", Depends(sqs_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
     x_request_id: Annotated[str | None, Header(alias="X-Request-Id")] = None,
 ) -> CreateRunResponse:
-    """Persist the run and return immediately.
+    """Persist the run, publish to the queue, and return immediately.
 
     202 Accepted: no AI work happens inline. Callers poll the run endpoint.
     """
-    return runs_service.create_run(session, payload, x_request_id)
+    return runs_service.create_run(
+        session, payload, x_request_id, s3=s3, sqs=sqs, settings=settings
+    )
 
 
 @router.get(

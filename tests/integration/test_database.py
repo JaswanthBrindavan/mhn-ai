@@ -45,9 +45,11 @@ def test_reports_table_matches_plan_assumptions(connection):
     assert columns["content"] == "jsonb"
 
 
-def test_ready_endpoint_reports_up_against_live_database(client, connection):
-    # `connection` is requested purely so this skips (rather than blocking on a
-    # connection timeout) when the local database is not running.
-    response = client.get("/ready")
+def test_ready_endpoint_reports_up_against_live_database(api):
+    # Uses the `api` fixture so S3/SQS resolve to moto; /ready now probes all three.
+    response = api.get("/ready")
     assert response.status_code == 200
-    assert response.json()["checks"]["database"]["status"] == "up"
+    checks = response.json()["checks"]
+    assert checks["database"]["status"] == "up"
+    assert checks["s3"]["status"] == "up"
+    assert checks["sqs"]["status"] == "up"

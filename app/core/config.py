@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # --- AI provider --------------------------------------------------------
     ai_provider: str = "anthropic"
     ai_model: str = ""
-    ai_max_tokens: int = 4096
+    ai_max_tokens: int = 16000
     anthropic_api_key: str = ""
 
     # --- Service ------------------------------------------------------------

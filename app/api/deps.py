@@ -29,12 +29,18 @@ Two conditions make this model safe, and both live outside this file:
 """
 
 import secrets
+from typing import TYPE_CHECKING
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import Settings, get_settings
 from app.core.errors import ApiError
+from app.integrations.aws import get_s3_client, get_sqs_client
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mypy_boto3_s3.client import S3Client
+    from mypy_boto3_sqs.client import SQSClient
 
 # auto_error=False so a missing header produces our own error envelope rather than
 # Starlette's differently-shaped default.
@@ -63,3 +69,12 @@ def require_service_token(
     # compare_digest, not ==, so response timing cannot leak the token byte by byte.
     if not secrets.compare_digest(credentials.credentials, expected):
         raise ApiError(401, "unauthorized", "Invalid service credentials")
+
+
+def s3_client() -> "S3Client":
+    """Injected so tests can substitute a moto-backed client."""
+    return get_s3_client()
+
+
+def sqs_client() -> "SQSClient":
+    return get_sqs_client()
