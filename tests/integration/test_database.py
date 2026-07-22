@@ -45,7 +45,9 @@ def test_reports_table_matches_plan_assumptions(connection):
     assert columns["content"] == "jsonb"
 
 
-def test_ready_endpoint_reports_up_against_live_database(client):
+def test_ready_endpoint_reports_up_against_live_database(client, connection):
+    # `connection` is requested purely so this skips (rather than blocking on a
+    # connection timeout) when the local database is not running.
     response = client.get("/ready")
     assert response.status_code == 200
     assert response.json()["checks"]["database"]["status"] == "up"

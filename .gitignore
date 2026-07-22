@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 
+# Planning and assistant docs stay local; the repo holds code only.
+CLAUDE.md
+implementation.md
+docs/
+
 # Python
 .venv/
 __pycache__/

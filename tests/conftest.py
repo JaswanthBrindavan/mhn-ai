@@ -9,6 +9,8 @@ os.environ.setdefault("AWS_ENDPOINT_URL", "http://localhost:4566")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
+# create_app() fails closed without this; a test-only value, never a real secret.
+os.environ.setdefault("MHN_SERVICE_TOKEN", "test-service-token-at-least-32-chars-long")
 
 import pytest
 from fastapi.testclient import TestClient

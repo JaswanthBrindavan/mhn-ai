@@ -63,6 +63,32 @@ class Settings(BaseSettings):
         return bool(self.aws_endpoint_url)
 
 
+# A token shorter than this is not a credible secret. 32 bytes of randomness is the
+# documented minimum for MHN_SERVICE_TOKEN.
+MIN_SERVICE_TOKEN_LENGTH = 32
+
+
+def verify_required_settings(settings: Settings) -> None:
+    """Fail closed at startup rather than silently running without authentication.
+
+    An unset ``MHN_SERVICE_TOKEN`` must never mean "allow everyone". Since this
+    service trusts Spring's access decisions (see the authentication design notes),
+    the token is the only thing separating callers from every report's extracted lab
+    values — so a misconfiguration has to stop the process, not degrade quietly.
+    """
+    token = settings.mhn_service_token
+    if not token:
+        raise RuntimeError(
+            "MHN_SERVICE_TOKEN is not set. Refusing to start: an empty token would "
+            "disable service authentication entirely."
+        )
+    if len(token) < MIN_SERVICE_TOKEN_LENGTH:
+        raise RuntimeError(
+            f"MHN_SERVICE_TOKEN is too short ({len(token)} chars); "
+            f"at least {MIN_SERVICE_TOKEN_LENGTH} are required."
+        )
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Cached so the environment is read once per process."""
