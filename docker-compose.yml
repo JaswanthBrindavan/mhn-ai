@@ -1,0 +1,110 @@
+name: mhn-ai
+
+# Local development topology.
+#
+# Every dependency must be swappable by environment variable alone, with no code
+# changes: DATABASE_URL for Postgres, AWS_ENDPOINT_URL for S3/SQS. The throwaway
+# containers therefore live behind the `localdev` profile.
+#
+#   docker compose --profile localdev up -d                  # everything, offline
+#   docker compose --profile localdev up -d --scale worker=3  # exercise parallelism
+#   docker compose up -d                                     # app only, real infrastructure
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    # Inside the network Postgres is `db`, not localhost. This overrides the
+    # host-oriented value in .env; it is the only place that substitution happens.
+    DATABASE_URL: ${DATABASE_URL_CONTAINER:-postgresql+psycopg://postgres:postgres@db:5432/mhn_ai}
+    AWS_REGION: ${AWS_REGION:-ap-south-1}
+    AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL_CONTAINER-http://localstack:4566}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+    S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+    S3_BUCKET: ${S3_BUCKET:-mhn-reports-local}
+    SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
+    SQS_DLQ_URL: ${SQS_DLQ_URL:-}
+    SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+    WORKER_MAX_CONCURRENCY: ${WORKER_MAX_CONCURRENCY:-4}
+    MAX_ATTEMPTS: ${MAX_ATTEMPTS:-3}
+    STALE_ITEM_TIMEOUT_SECONDS: ${STALE_ITEM_TIMEOUT_SECONDS:-900}
+    MAX_FILE_BYTES: ${MAX_FILE_BYTES:-26214400}
+    ALLOWED_CONTENT_TYPES: ${ALLOWED_CONTENT_TYPES:-application/pdf,image/jpeg,image/png}
+    AI_PROVIDER: ${AI_PROVIDER:-anthropic}
+    AI_MODEL: ${AI_MODEL:-}
+    AI_MAX_TOKENS: ${AI_MAX_TOKENS:-4096}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    MHN_SERVICE_TOKEN: ${MHN_SERVICE_TOKEN:-}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app
+    container_name: mhn-ai-api
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    <<: *app
+    # No container_name: it would prevent `--scale worker=N`.
+    command: ["python", "-m", "app.workers.main"]
+
+  db:
+    image: postgres:17-alpine
+    profiles: ["localdev"]
+    container_name: mhn-ai-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mhn_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      # The unrelated `health-ai-postgres` container also publishes 5432.
+      # Override POSTGRES_HOST_PORT if both need to run at once.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - mhn-ai-pgdata:/var/lib/postgresql/data
+      # Spring base schema, imported once on first boot of an empty volume.
+      # Source of truth stays in the Spring repo; mounted read-only, never copied.
+      - ${SPRING_SCHEMA_PATH:-../mhn-spring/migrations/index.sql}:/docker-entrypoint-initdb.d/01-spring-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  localstack:
+    image: localstack/localstack:3.8
+    profiles: ["localdev"]
+    container_name: mhn-ai-localstack
+    environment:
+      SERVICES: s3,sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-ap-south-1}
+      S3_BUCKET: ${S3_BUCKET:-mhn-reports-local}
+      QUEUE_NAME: ${QUEUE_NAME:-report-processing}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+    ports:
+      - "${LOCALSTACK_HOST_PORT:-4566}:4566"
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs list-queues && awslocal s3 ls"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  mhn-ai-pgdata:

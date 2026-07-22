@@ -1,0 +1,14 @@
+# Normalise line endings in the repository.
+* text=auto eol=lf
+
+# These are mounted into or executed inside Linux containers. CRLF endings make
+# bash fail with `\r: command not found`, so they must stay LF on every platform.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary
+*.pdf binary
+*.png binary
+*.jpg binary

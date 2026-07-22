@@ -1,0 +1,40 @@
+# Tool configuration only. Dependencies live in requirements.txt / requirements-dev.txt
+# so there is exactly one place to change them.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "T20"]
+ignore = [
+    "ANN401",  # allow Any where it is genuinely unconstrained
+    "B008",    # FastAPI Depends() in defaults is the documented idiom
+]
+
+[tool.ruff.lint.isort]
+# Without this, `app` is treated as third-party and merged into the wrong block.
+known-first-party = ["app", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]      # test functions do not need return annotations
+"alembic/versions/*" = ["ANN", "E501", "N999"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+exclude = ["^alembic/versions/"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: requires a live database or LocalStack",
+]
