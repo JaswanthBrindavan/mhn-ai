@@ -20,3 +20,8 @@ router = APIRouter(
         503: {"description": "Service credentials are not configured"},
     },
 )
+
+# Imported after `router` exists: the sub-router is attached below.
+from app.api.v1.runs import router as runs_router  # noqa: E402
+
+router.include_router(runs_router)
