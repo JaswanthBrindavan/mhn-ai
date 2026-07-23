@@ -36,7 +36,7 @@ class RejectStageError(Exception):
 class StageContext:
     item_id: UUID
     run_id: UUID
-    report_id: int
+    document_id: int
     #: The processing attempt this run belongs to, for per-attempt cost logging.
     attempt: int
     session: Session

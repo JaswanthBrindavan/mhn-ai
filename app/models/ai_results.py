@@ -28,7 +28,7 @@ from app.core.db import Base
 
 
 class AiReportClassification(Base):
-    """Report / not-report decision, title, and confidence for one run item."""
+    """Classification result for one run item: the detected section, title, confidence."""
 
     __tablename__ = "ai_report_classifications"
 
@@ -45,10 +45,12 @@ class AiReportClassification(Base):
         nullable=False,
         unique=True,
     )
-    report_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The source document (an unclassified_files id).
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    is_report: Mapped[bool] = mapped_column(nullable=False)
-    document_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The MyHealthNotion section the model placed this document in (a resource_type
+    #: value, or "unknown"). This is what drives routing.
+    section: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     confidence: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False)
     #: Short model justification, kept for audit. Not user-facing and not a diagnosis.
@@ -81,7 +83,8 @@ class AiProcessLog(Base):
         ForeignKey("ai_processing_run_items.id", ondelete="CASCADE"),
         nullable=False,
     )
-    report_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The source document (an unclassified_files id).
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
     stage: Mapped[str] = mapped_column(String(32), nullable=False)
     #: Which processing attempt produced this call. Each retry is a real, separately

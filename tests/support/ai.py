@@ -28,10 +28,9 @@ def structured_response(
     return StructuredResponse(text=text, model=model, stop_reason=stop_reason, usage=usage)
 
 
-def lab_report_payload(**overrides: Any) -> dict[str, Any]:
+def classification_payload(**overrides: Any) -> dict[str, Any]:
     payload = {
-        "is_report": True,
-        "document_type": "lab_report",
+        "section": "reports",
         "title": "Complete Blood Count",
         "confidence": 0.96,
         "reasoning": "Structured lab result values with reference ranges.",
@@ -49,7 +48,7 @@ class FakeAIProvider:
         response: StructuredResponse | None = None,
         error: Exception | None = None,
     ) -> None:
-        self._response = response or structured_response(lab_report_payload())
+        self._response = response or structured_response(classification_payload())
         self._error = error
         self.calls: list[dict[str, Any]] = []
 

@@ -42,18 +42,18 @@ class ReceivedMessage:
     receipt_handle: str
     item_id: UUID
     run_id: UUID
-    report_id: int
+    document_id: int
     #: SQS's count of how many times this message has been delivered. The redrive
     #: policy sends it to the DLQ once this exceeds maxReceiveCount.
     approx_receive_count: int
 
 
-def build_message(*, item_id: UUID, run_id: UUID, report_id: int, attempt: int) -> dict[str, Any]:
+def build_message(*, item_id: UUID, run_id: UUID, document_id: int, attempt: int) -> dict[str, Any]:
     return {
         "schema_version": MESSAGE_SCHEMA_VERSION,
         "item_id": str(item_id),
         "run_id": str(run_id),
-        "report_id": report_id,
+        "document_id": document_id,
         "attempt": attempt,
     }
 
@@ -64,11 +64,11 @@ def publish_processing_item(
     *,
     item_id: UUID,
     run_id: UUID,
-    report_id: int,
+    document_id: int,
     attempt: int = 0,
 ) -> str:
     """Enqueue one report for processing. Returns the SQS message id."""
-    body = build_message(item_id=item_id, run_id=run_id, report_id=report_id, attempt=attempt)
+    body = build_message(item_id=item_id, run_id=run_id, document_id=document_id, attempt=attempt)
     try:
         response = sqs.send_message(
             QueueUrl=queue_url,
@@ -145,7 +145,7 @@ def _parse(raw: Any) -> ReceivedMessage | None:
             receipt_handle=receipt,
             item_id=UUID(str(body["item_id"])),
             run_id=UUID(str(body["run_id"])),
-            report_id=int(body["report_id"]),
+            document_id=int(body["document_id"]),
             approx_receive_count=int(raw.get("Attributes", {}).get("ApproximateReceiveCount", 1)),
         )
     except (KeyError, ValueError, TypeError):

@@ -1,7 +1,8 @@
-"""Report-processing run endpoints.
+"""Document-processing run endpoints.
 
 Handlers stay thin: parse, delegate, return. Business logic lives in
-``app.services.runs``.
+``app.services.runs``. The submitted unit of work is an uploaded document (an
+``unclassified_files`` id).
 
 Authentication is applied by the parent router (see ``app/api/v1/__init__.py``), which
 authenticates Spring as a service. These handlers perform no user-level authorization.
@@ -28,14 +29,14 @@ from app.schemas.runs import (
 )
 from app.services import runs as runs_service
 
-router = APIRouter(tags=["report-processing-runs"])
+router = APIRouter(tags=["document-processing-runs"])
 
 
 @router.post(
-    "/report-processing-runs",
+    "/document-processing-runs",
     response_model=CreateRunResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Submit reports for AI processing",
+    summary="Submit documents for AI classification and processing",
 )
 def create_run(
     payload: CreateRunRequest,
@@ -55,9 +56,9 @@ def create_run(
 
 
 @router.get(
-    "/report-processing-runs/{run_id}",
+    "/document-processing-runs/{run_id}",
     response_model=RunResponse,
-    summary="Batch progress and per-report stage",
+    summary="Batch progress and per-document stage",
 )
 def get_run(
     run_id: uuid.UUID,
@@ -67,7 +68,7 @@ def get_run(
 
 
 @router.delete(
-    "/report-processing-runs/{run_id}",
+    "/document-processing-runs/{run_id}",
     response_model=CancelRunResponse,
     summary="Cancel unfinished items in a run",
 )

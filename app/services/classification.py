@@ -1,9 +1,14 @@
-"""Report auto-classification — the first real pipeline stage.
+"""Document classification — the first real pipeline stage.
 
-Flow: download the source object, ask the model to classify it under a fixed schema,
-validate the JSON with Pydantic (never repair it), persist the result and a process
-log, then either continue the pipeline (it is a processable report) or reject the item
-with a clear reason (it is not).
+Flow: download the source object from ``unclassified_files``, ask the model which
+MyHealthNotion section it belongs to under a fixed schema, validate the JSON with
+Pydantic (never repair it), persist the classification and a process log, then either
+continue the pipeline (it is a report) or reject the item with the detected section as
+the reason.
+
+The actual move into the ``reports`` table (INSERT the row, write ``reports.content``,
+DELETE the ``unclassified_files`` row) happens in the assembly stage after extraction and
+insights, so a document is only moved once its content is ready — not here.
 
 Idempotent: the classification and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
@@ -19,7 +24,11 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.integrations.ai.base import AIProviderError, DocumentPayload, StructuredResponse
+from app.integrations.ai.base import (
+    AIProviderError,
+    DocumentPayload,
+    StructuredResponse,
+)
 from app.integrations.ai.pricing import estimate_cost_usd
 from app.integrations.s3 import (
     SourceObjectMissingError,
@@ -27,51 +36,46 @@ from app.integrations.s3 import (
     get_object,
 )
 from app.models.ai_results import AiProcessLog, AiReportClassification
-from app.models.spring import reports
+from app.models.spring import unclassified_files
 from app.services.source_validation import resolve_content_type
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "clf-2026-07-23"
-SCHEMA_VERSION = "clf-1"
+SCHEMA_VERSION = "clf-2"
 PROVIDER_NAME = "anthropic"
 STAGE_NAME = "classifying"
-#: Classification output is small (a label, a title, a short reason). Kept tight to
+#: Classification output is small (a section, a title, a short reason). Kept tight to
 #: bound cost; the JSON structured-output format keeps responses compact.
 CLASSIFY_MAX_TOKENS = 2048
 
 
-class DocumentType(StrEnum):
-    LAB_REPORT = "lab_report"
-    PATHOLOGY_REPORT = "pathology_report"
-    RADIOLOGY_REPORT = "radiology_report"
-    DISCHARGE_SUMMARY = "discharge_summary"
-    PRESCRIPTION = "prescription"
-    MEDICAL_INVOICE = "medical_invoice"
-    INSURANCE_DOCUMENT = "insurance_document"
-    OTHER_MEDICAL = "other_medical"
-    NON_MEDICAL = "non_medical"
-    UNKNOWN = "unknown"
+class DocumentSection(StrEnum):
+    """A MyHealthNotion section (the ``resource_type_enum`` values), or unknown.
+
+    This is what drives Spring's routing. Only ``REPORTS`` is deep-processed this sprint.
+    """
+
+    REPORTS = "reports"
+    SCANS_IMAGING = "scans_imaging"  # MRI, X-ray, CT, ultrasound, radiology reports
+    PRESCRIPTIONS = "prescriptions"
+    INSURANCE = "insurance"
+    BILLS = "bills"
+    VACCINATIONS = "vaccinations"
+    MEDICAL_CONDITION = "medical_condition"
+    UNKNOWN = "unknown"  # cannot confidently place -> stays in unclassified_files
 
 
-#: The document types this sprint actually processes (textual diagnostic reports).
-#: Everything else is a wrong document type and gets rejected with a reason.
-PROCESSABLE_TYPES: frozenset[DocumentType] = frozenset(
-    {
-        DocumentType.LAB_REPORT,
-        DocumentType.PATHOLOGY_REPORT,
-        DocumentType.RADIOLOGY_REPORT,
-        DocumentType.DISCHARGE_SUMMARY,
-    }
-)
+#: Only the reports section is moved and deep-processed this sprint. Everything else is
+#: recognised, recorded, and left in unclassified_files for future sprints to route.
+PROCESSABLE_SECTIONS: frozenset[DocumentSection] = frozenset({DocumentSection.REPORTS})
 
 
-class ReportClassification(BaseModel):
+class DocumentClassification(BaseModel):
     """Validated model output. Written to the DB only after this parses cleanly."""
 
-    is_report: bool
-    document_type: DocumentType
+    section: DocumentSection
     title: str = Field(min_length=1, max_length=512)
     confidence: float
     reasoning: str = Field(default="", max_length=2000)
@@ -89,47 +93,51 @@ class ReportClassification(BaseModel):
 CLASSIFICATION_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "is_report": {"type": "boolean"},
-        "document_type": {
+        "section": {
             "type": "string",
-            "enum": [member.value for member in DocumentType],
+            "enum": [member.value for member in DocumentSection],
         },
         "title": {"type": "string"},
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
     },
-    "required": ["is_report", "document_type", "title", "confidence", "reasoning"],
+    "required": ["section", "title", "confidence", "reasoning"],
     "additionalProperties": False,
 }
 
 SYSTEM_PROMPT = (
     "You are a document classifier in a medical-records intake pipeline. You receive a "
-    "single uploaded document and decide what kind of document it is. You do not "
-    "diagnose, interpret results, or give medical advice — you only classify.\n\n"
-    "Return your answer in the required structured format:\n"
-    "- is_report: true only if the document is a medical diagnostic report a clinician "
-    "would file as a result — for example a laboratory report, pathology report, "
-    "radiology/imaging report, or discharge summary. It is false for prescriptions, "
-    "bills or invoices, insurance paperwork, appointment letters, marketing, blank "
-    "forms, or anything non-medical.\n"
-    "- document_type: the single best-fitting category from the allowed list. Use "
-    "'unknown' only when the document is too unclear or unreadable to categorise.\n"
-    "- title: a short, human-readable label for the document, at most a few words "
-    "(for example 'Complete Blood Count' or 'Lipid Panel Report'). Do not invent "
-    "details that are not present; do not include long patient identifiers.\n"
+    "single uploaded document and decide which section of the app it belongs to. You do "
+    "not diagnose, interpret results, or give medical advice — you only classify.\n\n"
+    "Choose exactly one section:\n"
+    "- reports: a diagnostic report a clinician files as a result — laboratory report, "
+    "pathology report, or a clinical/discharge summary.\n"
+    "- scans_imaging: imaging and its radiology report — MRI, X-ray, CT, ultrasound, and "
+    "the radiologist's read of them.\n"
+    "- prescriptions: a prescription or medication order.\n"
+    "- insurance: insurance cards, policies, claims, or coverage letters.\n"
+    "- bills: invoices, receipts, or billing statements.\n"
+    "- vaccinations: immunisation or vaccination records.\n"
+    "- medical_condition: a record describing a diagnosed condition or its history.\n"
+    "- unknown: use ONLY when the document is unreadable or you cannot confidently place "
+    "it in any section.\n\n"
+    "Also return:\n"
+    "- title: a short, human-readable label, at most a few words (for example "
+    "'Complete Blood Count' or 'Chest X-Ray'). Do not invent details; do not include "
+    "long patient identifiers.\n"
     "- confidence: your calibrated confidence between 0 and 1.\n"
-    "- reasoning: one concise sentence citing what in the document drove the decision. "
-    "Do not restate patient data or clinical values.\n\n"
-    "Be conservative: if the document is unreadable or you cannot tell what it is, set "
-    "is_report to false and document_type to 'unknown' rather than guessing."
+    "- reasoning: one concise sentence citing what drove the decision. Do not restate "
+    "patient data or clinical values.\n\n"
+    "Be conservative: if the document is unreadable or genuinely ambiguous, choose "
+    "'unknown' rather than guessing a section."
 )
 
-INSTRUCTION = "Classify the attached document."
+INSTRUCTION = "Classify the attached document into one section."
 
 
 def classify_report(ctx: StageContext) -> None:
-    """Stage entrypoint: classify the report, persist, and gate the pipeline."""
-    filepath = _report_filepath(ctx)
+    """Stage entrypoint: classify the document, persist, and gate the pipeline."""
+    filepath = _document_filepath(ctx)
     document = _load_document(ctx, filepath)
 
     started = time.perf_counter()
@@ -142,13 +150,12 @@ def classify_report(ctx: StageContext) -> None:
             max_tokens=CLASSIFY_MAX_TOKENS,
         )
     except AIProviderError as exc:
-        duration_ms = _elapsed_ms(started)
         _log(
             ctx,
             outcome="error",
             error_code="ai_provider_error",
             detail=str(exc),
-            duration_ms=duration_ms,
+            duration_ms=_elapsed_ms(started),
         )
         raise TransientStageError(f"classification provider error: {exc}") from exc
 
@@ -165,7 +172,7 @@ def classify_report(ctx: StageContext) -> None:
         raise TransientStageError("classification refused by safety classifier")
 
     try:
-        result = ReportClassification.model_validate_json(response.text)
+        result = DocumentClassification.model_validate_json(response.text)
     except ValidationError as exc:
         # Never repair invalid model output — record the failure and let it retry.
         _log(
@@ -180,11 +187,12 @@ def classify_report(ctx: StageContext) -> None:
 
     _persist_classification(ctx, result)
 
-    processable = result.is_report and result.document_type in PROCESSABLE_TYPES
-    if not processable:
-        reason = _rejection_reason(result)
+    if result.section not in PROCESSABLE_SECTIONS:
+        # Correctly classified, just not a report this sprint routes/processes. The
+        # detected section is the reason; the document stays in unclassified_files.
+        reason = result.section.value
         _log(ctx, outcome="rejected", error_code=reason, response=response, duration_ms=duration_ms)
-        raise RejectStageError(reason, _rejection_message(result))
+        raise RejectStageError(reason, f"Document classified as {reason}, not a report")
 
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
 
@@ -192,13 +200,13 @@ def classify_report(ctx: StageContext) -> None:
 # --- helpers ----------------------------------------------------------------
 
 
-def _report_filepath(ctx: StageContext) -> str:
+def _document_filepath(ctx: StageContext) -> str:
     filepath = ctx.session.execute(
-        select(reports.c.filepath).where(reports.c.id == ctx.report_id)
+        select(unclassified_files.c.filepath).where(unclassified_files.c.id == ctx.document_id)
     ).scalar_one_or_none()
     if not filepath:
-        # The item should not exist without a report, but be defensive.
-        raise RejectStageError("source_report_missing", "Report record no longer exists")
+        # The item should not exist without a source document, but be defensive.
+        raise RejectStageError("source_document_missing", "Source document no longer exists")
     return str(filepath)
 
 
@@ -218,14 +226,13 @@ def _load_document(ctx: StageContext, filepath: str) -> DocumentPayload:
     return DocumentPayload(data=content.data, content_type=content_type, filename=filepath)
 
 
-def _persist_classification(ctx: StageContext, result: ReportClassification) -> None:
+def _persist_classification(ctx: StageContext, result: DocumentClassification) -> None:
     stmt = (
         pg_insert(AiReportClassification)
         .values(
             run_item_id=ctx.item_id,
-            report_id=ctx.report_id,
-            is_report=result.is_report,
-            document_type=result.document_type.value,
+            document_id=ctx.document_id,
+            section=result.section.value,
             title=result.title,
             confidence=result.confidence,
             reasoning=result.reasoning or None,
@@ -235,9 +242,8 @@ def _persist_classification(ctx: StageContext, result: ReportClassification) -> 
         .on_conflict_do_update(
             index_elements=[AiReportClassification.run_item_id],
             set_={
-                "report_id": ctx.report_id,
-                "is_report": result.is_report,
-                "document_type": result.document_type.value,
+                "document_id": ctx.document_id,
+                "section": result.section.value,
                 "title": result.title,
                 "confidence": result.confidence,
                 "reasoning": result.reasoning or None,
@@ -267,7 +273,7 @@ def _log(
         pg_insert(AiProcessLog)
         .values(
             run_item_id=ctx.item_id,
-            report_id=ctx.report_id,
+            document_id=ctx.document_id,
             stage=STAGE_NAME,
             attempt=ctx.attempt,
             provider=PROVIDER_NAME,
@@ -304,16 +310,6 @@ def _log(
     )
     ctx.session.execute(stmt)
     ctx.session.commit()
-
-
-def _rejection_reason(result: ReportClassification) -> str:
-    if not result.is_report:
-        return "not_a_report"
-    return "wrong_document_type"
-
-
-def _rejection_message(result: ReportClassification) -> str:
-    return f"Document classified as {result.document_type.value}, not a processable report"
 
 
 def _sanitize_validation_error(exc: ValidationError) -> str:

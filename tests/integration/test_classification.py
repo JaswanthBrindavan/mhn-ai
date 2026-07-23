@@ -13,31 +13,31 @@ from sqlalchemy import text
 from app.services import classification
 from app.services.classification import classify_report
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
-from tests.support.ai import FakeAIProvider, lab_report_payload, structured_response
+from tests.support.ai import FakeAIProvider, classification_payload, structured_response
 
 pytestmark = pytest.mark.integration
 
 
-def _seed_item(db_session, report_id: int) -> uuid.UUID:
+def _seed_item(db_session, document_id: int) -> uuid.UUID:
     run_id = db_session.execute(
         text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
     ).scalar_one()
     item_id = db_session.execute(
         text(
-            "INSERT INTO ai_processing_run_items (run_id, report_id, status) "
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status) "
             "VALUES (:r, :rep, 'processing') RETURNING id"
         ),
-        {"r": run_id, "rep": report_id},
+        {"r": run_id, "rep": document_id},
     ).scalar_one()
     db_session.flush()
     return item_id
 
 
-def _context(db_session, aws, test_settings, report_id, item_id, ai, attempt=1) -> StageContext:
+def _context(db_session, aws, test_settings, document_id, item_id, ai, attempt=1) -> StageContext:
     return StageContext(
         item_id=item_id,
         run_id=uuid.uuid4(),
-        report_id=report_id,
+        document_id=document_id,
         attempt=attempt,
         session=db_session,
         s3=aws[0],
@@ -74,18 +74,17 @@ def _logs(db_session, item_id):
 
 
 def test_processable_report_persists_classification_and_log(
-    db_session, make_report, aws, test_settings
+    db_session, make_document, aws, test_settings
 ):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
-    ai = FakeAIProvider()  # default: a lab_report
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    ai = FakeAIProvider()  # default: a report
 
-    classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+    classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
     row = _classification_row(db_session, item_id)
     assert row is not None
-    assert row["is_report"] is True
-    assert row["document_type"] == "lab_report"
+    assert row["section"] == "reports"
     assert row["title"] == "Complete Blood Count"
     assert row["prompt_version"] == classification.PROMPT_VERSION
 
@@ -98,12 +97,12 @@ def test_processable_report_persists_classification_and_log(
     assert logs[0]["input_tokens"] == 1200
 
 
-def test_document_media_type_is_passed_to_the_model(db_session, make_report, aws, test_settings):
-    report_id = make_report(content_type="image/png", suffix=".png", body=b"\x89PNG fake")
-    item_id = _seed_item(db_session, report_id)
+def test_document_media_type_is_passed_to_the_model(db_session, make_document, aws, test_settings):
+    document_id = make_document(content_type="image/png", suffix=".png", body=b"\x89PNG fake")
+    item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider()
 
-    classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+    classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
     assert ai.last_document.content_type == "image/png"
     assert ai.last_document.data == b"\x89PNG fake"
@@ -112,48 +111,49 @@ def test_document_media_type_is_passed_to_the_model(db_session, make_report, aws
 # --- rejection --------------------------------------------------------------
 
 
-def test_non_report_is_rejected_but_still_recorded(db_session, make_report, aws, test_settings):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
+def test_scan_is_rejected_with_its_section_but_still_recorded(
+    db_session, make_document, aws, test_settings
+):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    # A radiology/imaging doc -> scans_imaging, out of this sprint's scope.
     ai = FakeAIProvider(
         response=structured_response(
-            lab_report_payload(is_report=False, document_type="non_medical", title="Flyer")
+            classification_payload(section="scans_imaging", title="Chest X-Ray")
         )
     )
 
     with pytest.raises(RejectStageError) as excinfo:
-        classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
-    assert excinfo.value.code == "not_a_report"
+    # The reason IS the detected section, so Spring can route it.
+    assert excinfo.value.code == "scans_imaging"
     # The classification is still recorded (audit), and the log marks it rejected.
-    assert _classification_row(db_session, item_id)["is_report"] is False
+    assert _classification_row(db_session, item_id)["section"] == "scans_imaging"
     assert _logs(db_session, item_id)[0]["outcome"] == "rejected"
 
 
-def test_wrong_document_type_is_rejected(db_session, make_report, aws, test_settings):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
-    # A real medical doc, but a prescription — out of this sprint's scope.
+def test_unknown_is_rejected(db_session, make_document, aws, test_settings):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider(
-        response=structured_response(
-            lab_report_payload(is_report=True, document_type="prescription")
-        )
+        response=structured_response(classification_payload(section="unknown", title="Scan"))
     )
 
     with pytest.raises(RejectStageError) as excinfo:
-        classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
-    assert excinfo.value.code == "wrong_document_type"
-    assert _logs(db_session, item_id)[0]["error_code"] == "wrong_document_type"
+    assert excinfo.value.code == "unknown"
+    assert _logs(db_session, item_id)[0]["error_code"] == "unknown"
 
 
-def test_missing_s3_object_is_rejected(db_session, make_report, aws, test_settings):
-    report_id = make_report(upload=False)  # row exists, object does not
-    item_id = _seed_item(db_session, report_id)
+def test_missing_s3_object_is_rejected(db_session, make_document, aws, test_settings):
+    document_id = make_document(upload=False)  # row exists, object does not
+    item_id = _seed_item(db_session, document_id)
 
     with pytest.raises(RejectStageError) as excinfo:
         classify_report(
-            _context(db_session, aws, test_settings, report_id, item_id, FakeAIProvider())
+            _context(db_session, aws, test_settings, document_id, item_id, FakeAIProvider())
         )
 
     assert excinfo.value.code == "source_object_missing"
@@ -162,13 +162,13 @@ def test_missing_s3_object_is_rejected(db_session, make_report, aws, test_settin
 # --- failure handling -------------------------------------------------------
 
 
-def test_invalid_model_output_is_a_transient_failure(db_session, make_report, aws, test_settings):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
+def test_invalid_model_output_is_a_transient_failure(db_session, make_document, aws, test_settings):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider(response=structured_response('{"is_report": true, "title":'))  # broken JSON
 
     with pytest.raises(TransientStageError):
-        classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
     # Never repaired, never persisted as a result; the failure is logged.
     assert _classification_row(db_session, item_id) is None
@@ -178,44 +178,44 @@ def test_invalid_model_output_is_a_transient_failure(db_session, make_report, aw
 
 
 def test_validation_error_detail_does_not_leak_model_output(
-    db_session, make_report, aws, test_settings
+    db_session, make_document, aws, test_settings
 ):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
-    # Wrong enum value plus a made-up patient string that must NOT appear in the log.
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    # Invalid section value plus a made-up patient string that must NOT appear in the log.
     secret = "PATIENT-JANE-DOE-SSN-000"
     ai = FakeAIProvider(
-        response=structured_response(lab_report_payload(document_type=secret, title=secret))
+        response=structured_response(classification_payload(section=secret, title=secret))
     )
 
     with pytest.raises(TransientStageError):
-        classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
     detail = _logs(db_session, item_id)[0]["error_detail"] or ""
     assert secret not in detail
-    assert "document_type" in detail  # field location is fine to record
+    assert "section" in detail  # field location is fine to record
 
 
-def test_refusal_is_a_transient_failure(db_session, make_report, aws, test_settings):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
+def test_refusal_is_a_transient_failure(db_session, make_document, aws, test_settings):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider(response=structured_response("", stop_reason="refusal"))
 
     with pytest.raises(TransientStageError):
-        classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
     assert _logs(db_session, item_id)[0]["outcome"] == "refused"
 
 
-def test_provider_error_is_transient_and_logged(db_session, make_report, aws, test_settings):
+def test_provider_error_is_transient_and_logged(db_session, make_document, aws, test_settings):
     from app.integrations.ai.base import AIProviderError
 
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider(error=AIProviderError("Timeout"))
 
     with pytest.raises(TransientStageError):
-        classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai))
+        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
     log = _logs(db_session, item_id)[0]
     assert log["outcome"] == "error"
@@ -226,12 +226,12 @@ def test_provider_error_is_transient_and_logged(db_session, make_report, aws, te
 
 
 def test_rerun_same_attempt_updates_rather_than_duplicates(
-    db_session, make_report, aws, test_settings
+    db_session, make_document, aws, test_settings
 ):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider()
-    ctx = _context(db_session, aws, test_settings, report_id, item_id, ai, attempt=1)
+    ctx = _context(db_session, aws, test_settings, document_id, item_id, ai, attempt=1)
 
     classify_report(ctx)
     classify_report(ctx)  # same attempt re-runs (e.g. redelivery)
@@ -245,13 +245,13 @@ def test_rerun_same_attempt_updates_rather_than_duplicates(
     assert count == 1
 
 
-def test_a_new_attempt_adds_a_separate_log_row(db_session, make_report, aws, test_settings):
-    report_id = make_report()
-    item_id = _seed_item(db_session, report_id)
+def test_a_new_attempt_adds_a_separate_log_row(db_session, make_document, aws, test_settings):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider()
 
-    classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai, attempt=1))
-    classify_report(_context(db_session, aws, test_settings, report_id, item_id, ai, attempt=2))
+    classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai, attempt=1))
+    classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai, attempt=2))
 
     logs = _logs(db_session, item_id)
     assert len(logs) == 2  # each real attempt is a separately billed call

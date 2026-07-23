@@ -97,7 +97,7 @@ def _process(
     ctx = StageContext(
         item_id=item_id,
         run_id=message.run_id,
-        report_id=message.report_id,
+        document_id=message.document_id,
         attempt=claim.attempt,
         session=session,
         s3=s3,
