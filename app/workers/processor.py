@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.integrations.ai.base import AIProvider
 from app.integrations.sqs import ReceivedMessage, delete_message
 from app.models.enums import RunItemStatus
 from app.services import processing
@@ -56,11 +57,12 @@ def process_message(
     session_factory: SessionFactory,
     s3: "S3Client",
     sqs: "SQSClient",
+    ai: AIProvider,
     settings: Settings,
 ) -> Outcome:
     session = session_factory()
     try:
-        return _process(message, session=session, s3=s3, sqs=sqs, settings=settings)
+        return _process(message, session=session, s3=s3, sqs=sqs, ai=ai, settings=settings)
     finally:
         session.close()
 
@@ -71,6 +73,7 @@ def _process(
     session: Session,
     s3: "S3Client",
     sqs: "SQSClient",
+    ai: AIProvider,
     settings: Settings,
 ) -> Outcome:
     item_id = message.item_id
@@ -95,8 +98,10 @@ def _process(
         item_id=item_id,
         run_id=message.run_id,
         report_id=message.report_id,
+        attempt=claim.attempt,
         session=session,
         s3=s3,
+        ai=ai,
         settings=settings,
     )
 

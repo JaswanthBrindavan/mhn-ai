@@ -8,6 +8,7 @@ to autogenerate and will silently never get a migration.
 MetaData so they can never become migration targets.
 """
 
+from app.models.ai_results import AiProcessLog, AiReportClassification
 from app.models.enums import (
     ACTIVE_STATUSES,
     CANCELLABLE_STATUSES,
@@ -20,7 +21,9 @@ __all__ = [
     "ACTIVE_STATUSES",
     "CANCELLABLE_STATUSES",
     "TERMINAL_STATUSES",
+    "AiProcessLog",
     "AiProcessingRun",
     "AiProcessingRunItem",
+    "AiReportClassification",
     "RunItemStatus",
 ]

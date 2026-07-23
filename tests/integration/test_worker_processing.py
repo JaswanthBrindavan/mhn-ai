@@ -14,8 +14,13 @@ from sqlalchemy.orm import Session
 from app.integrations.sqs import publish_processing_item, receive_messages
 from app.models.enums import RunItemStatus
 from app.workers.processor import Outcome, process_message
+from tests.support.ai import FakeAIProvider
 
 pytestmark = pytest.mark.integration
+
+# A processable lab-report classification, so the real classify stage lets the pipeline
+# complete. Monkeypatched-STAGE_SEQUENCE tests replace classify, so `ai` is unused there.
+_FAKE_AI = FakeAIProvider()
 
 
 @pytest.fixture
@@ -70,7 +75,12 @@ def _process(sqs, queue_url, session_factory, test_settings, aws):
     s3 = aws[0]
     message = _receive_one(sqs, queue_url)
     return process_message(
-        message, session_factory=session_factory, s3=s3, sqs=sqs, settings=test_settings
+        message,
+        session_factory=session_factory,
+        s3=s3,
+        sqs=sqs,
+        ai=_FAKE_AI,
+        settings=test_settings,
     )
 
 
@@ -261,8 +271,7 @@ def test_message_giving_up_after_max_attempts_fails_and_acks(
     # Push attempt_count to the cap so the next claim gives up.
     db_session.execute(
         text(
-            "UPDATE ai_processing_run_items SET attempt_count=:a, status='processing' "
-            "WHERE id=:id"
+            "UPDATE ai_processing_run_items SET attempt_count=:a, status='processing' WHERE id=:id"
         ),
         {"a": test_settings.max_attempts, "id": item_id},
     )

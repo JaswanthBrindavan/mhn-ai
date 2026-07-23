@@ -20,6 +20,7 @@ from types import FrameType
 from app.core.config import Settings, get_settings
 from app.core.db import SessionLocal
 from app.core.logging import configure_logging
+from app.integrations.ai.factory import get_ai_provider
 from app.integrations.aws import get_s3_client, get_sqs_client
 from app.integrations.sqs import ReceivedMessage, receive_messages
 from app.workers.processor import process_message
@@ -33,6 +34,7 @@ class Worker:
         self._shutdown = threading.Event()
         self._s3 = get_s3_client()
         self._sqs = get_sqs_client()
+        self._ai = get_ai_provider()
         # One permit per concurrent slot. Acquired before a message is submitted,
         # released when it finishes — so the poll loop can size each receive to the
         # slots actually free.
@@ -121,6 +123,7 @@ class Worker:
                 session_factory=SessionLocal,
                 s3=self._s3,
                 sqs=self._sqs,
+                ai=self._ai,
                 settings=self._settings,
             )
             logger.info(

@@ -1,0 +1,48 @@
+"""Model pricing and cost estimation.
+
+Cost is computed by application code from token counts, never asked of the model.
+Prices are USD per 1,000,000 tokens and live here as the single place to update when
+they change. Cache reads bill at ~0.1x input, cache writes at ~1.25x input (5-minute
+TTL) — the standard Anthropic multipliers.
+"""
+
+from dataclasses import dataclass
+from decimal import Decimal
+
+from app.integrations.ai.base import AIUsage
+
+_PER_MILLION = Decimal(1_000_000)
+_CACHE_READ_MULTIPLIER = Decimal("0.1")
+_CACHE_WRITE_MULTIPLIER = Decimal("1.25")
+
+
+@dataclass(frozen=True)
+class ModelPrice:
+    input_per_million: Decimal
+    output_per_million: Decimal
+
+
+#: Keyed by exact model id. Extend as models are adopted; an unknown model costs 0 and
+#: is flagged by the caller rather than silently mispriced.
+PRICES: dict[str, ModelPrice] = {
+    "claude-opus-4-8": ModelPrice(Decimal("5.00"), Decimal("25.00")),
+    "claude-opus-4-7": ModelPrice(Decimal("5.00"), Decimal("25.00")),
+    "claude-sonnet-5": ModelPrice(Decimal("3.00"), Decimal("15.00")),
+    "claude-haiku-4-5": ModelPrice(Decimal("1.00"), Decimal("5.00")),
+}
+
+
+def estimate_cost_usd(model: str, usage: AIUsage) -> Decimal:
+    """Best-effort USD cost for one call. Returns 0 for an unpriced model."""
+    price = PRICES.get(model)
+    if price is None:
+        return Decimal("0")
+
+    input_rate = price.input_per_million
+    cost = (
+        Decimal(usage.input_tokens) * input_rate
+        + Decimal(usage.output_tokens) * price.output_per_million
+        + Decimal(usage.cache_read_input_tokens) * input_rate * _CACHE_READ_MULTIPLIER
+        + Decimal(usage.cache_creation_input_tokens) * input_rate * _CACHE_WRITE_MULTIPLIER
+    )
+    return (cost / _PER_MILLION).quantize(Decimal("0.000001"))
