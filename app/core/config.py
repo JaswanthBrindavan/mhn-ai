@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     worker_max_concurrency: int = 4
     max_attempts: int = 3
     stale_item_timeout_seconds: int = 900
+    # How long a received message stays invisible while a worker holds it. The
+    # heartbeat re-extends this before it lapses, so a stage may run longer than
+    # this value without the message being redelivered.
+    sqs_visibility_timeout_seconds: int = 300
+    # Long-poll wait; SQS caps this at 20. Fewer empty receives, lower cost.
+    sqs_wait_time_seconds: int = 20
 
     # --- File validation ----------------------------------------------------
     max_file_bytes: int = 26_214_400
