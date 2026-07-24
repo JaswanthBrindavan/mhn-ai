@@ -111,6 +111,46 @@ class AiReportExtraction(Base):
     )
 
 
+class AiReportInsight(Base):
+    """Informational insights generated for one run item.
+
+    Built from the validated extraction (not the raw file), so insights cannot introduce
+    values that bypassed extraction. Informational only — never a diagnosis, emergency
+    instruction, or medical certainty (enforced by the prompt and validated shape). One
+    row per item, upserted; the ``data`` JSONB is assembled into ``reports.content``.
+    """
+
+    __tablename__ = "ai_report_insights"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+        default=uuid.uuid4,
+    )
+    run_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai_processing_run_items.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    #: The source document (an unclassified_files id).
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    #: {"insights": [{heading, body, related_tests}, ...], "summary": ..., "disclaimer": ...}
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AiProcessLog(Base):
     """One model call's provenance and cost. Never stores report contents or prompts."""
 

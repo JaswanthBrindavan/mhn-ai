@@ -2,7 +2,7 @@
 
 * classify          -> implemented (app.services.classification)
 * extract/normalise -> implemented (app.services.extraction)
-* generate insights -> step 8
+* generate insights -> implemented (app.services.insights)
 
 Shared types (``StageContext``, ``TransientStageError``, ``RejectStageError``) live in
 ``app.workers.stagetypes`` and are re-exported here for existing importers. Stage
@@ -13,6 +13,7 @@ sequence, so a stage upserts its results rather than appending.
 from app.models.enums import RunItemStatus
 from app.services.classification import classify_report
 from app.services.extraction import extract_report
+from app.services.insights import generate_insights
 from app.workers.stagetypes import (
     RejectStageError,
     Stage,
@@ -29,13 +30,9 @@ __all__ = [
 ]
 
 
-def _generate_insights(ctx: StageContext) -> None:
-    """Informational insights. Body added in step 8."""
-
-
 #: (status to move into before running, stage callable). The order IS the pipeline.
 STAGE_SEQUENCE: list[tuple[RunItemStatus, Stage]] = [
     (RunItemStatus.CLASSIFYING, classify_report),
     (RunItemStatus.EXTRACTING, extract_report),
-    (RunItemStatus.GENERATING_INSIGHTS, _generate_insights),
+    (RunItemStatus.GENERATING_INSIGHTS, generate_insights),
 ]

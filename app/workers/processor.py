@@ -16,7 +16,7 @@ from app.core.config import Settings
 from app.integrations.ai.base import AIProvider
 from app.integrations.sqs import ReceivedMessage, delete_message
 from app.models.enums import RunItemStatus
-from app.services import processing
+from app.services import assembly, processing
 from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
 from app.workers.stages import STAGE_SEQUENCE, RejectStageError, StageContext, TransientStageError
@@ -151,10 +151,15 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
 
         stage_fn(ctx)
 
-    if processing.complete_item(session, ctx.item_id, expected=_IN_PROGRESS):
+    # Every stage passed: this is a report. Assemble its content and move it into the
+    # reports table, recording reports_id and completing the item in one transaction.
+    content = assembly.build_content(session, ctx.item_id)
+    if processing.move_and_complete(
+        session, ctx.item_id, ctx.document_id, content, expected=_IN_PROGRESS
+    ):
         logger.info("item_completed", extra={"item_id": str(ctx.item_id)})
         return Outcome.COMPLETED
-    # Completion guard failed → cancelled between the last stage and here.
+    # Move guard failed → cancelled between the last stage and here.
     return Outcome.CANCELLED
 
 
