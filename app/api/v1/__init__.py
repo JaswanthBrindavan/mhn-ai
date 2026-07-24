@@ -21,7 +21,9 @@ router = APIRouter(
     },
 )
 
-# Imported after `router` exists: the sub-router is attached below.
+# Imported after `router` exists: the sub-routers are attached below.
+from app.api.v1.documents import router as documents_router  # noqa: E402
 from app.api.v1.runs import router as runs_router  # noqa: E402
 
 router.include_router(runs_router)
+router.include_router(documents_router)
