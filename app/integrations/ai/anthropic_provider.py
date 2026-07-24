@@ -74,6 +74,30 @@ class AnthropicProvider:
 
         return _to_structured_response(response, self._model)
 
+    def generate_structured(
+        self,
+        *,
+        system: str,
+        instruction: str,
+        json_schema: dict[str, Any],
+        max_tokens: int,
+    ) -> StructuredResponse:
+        messages: Any = [{"role": "user", "content": [{"type": "text", "text": instruction}]}]
+        output_config: Any = {"format": {"type": "json_schema", "schema": json_schema}}
+        try:
+            response = self._client.beta.messages.create(
+                model=self._model,
+                max_tokens=max_tokens,
+                betas=[_FILES_BETA],
+                system=system,
+                messages=messages,
+                output_config=output_config,
+            )
+        except Exception as exc:
+            raise AIProviderError(type(exc).__name__) from exc
+
+        return _to_structured_response(response, self._model)
+
     def _upload(self, document: DocumentPayload) -> str:
         try:
             uploaded = self._client.beta.files.upload(

@@ -56,7 +56,7 @@ class StructuredResponse:
 
 
 class AIProvider(Protocol):
-    """Analyse a document and return structured JSON constrained to ``json_schema``."""
+    """Return structured JSON constrained to ``json_schema``, from a document or from text."""
 
     def analyze_document(
         self,
@@ -67,3 +67,18 @@ class AIProvider(Protocol):
         json_schema: dict[str, Any],
         max_tokens: int,
     ) -> StructuredResponse: ...
+
+    def generate_structured(
+        self,
+        *,
+        system: str,
+        instruction: str,
+        json_schema: dict[str, Any],
+        max_tokens: int,
+    ) -> StructuredResponse:
+        """Text-only structured generation, with no document attached.
+
+        Insight generation reasons over the already-extracted, validated data rather than
+        the raw file, so the model cannot introduce values that bypassed extraction.
+        """
+        ...

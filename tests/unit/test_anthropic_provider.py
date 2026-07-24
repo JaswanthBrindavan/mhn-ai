@@ -65,6 +65,23 @@ def _analyze(client, document):
     )
 
 
+def test_generate_structured_sends_text_only_and_uploads_nothing():
+    client = _StubClient(_response())
+
+    result = AnthropicProvider(client, "claude-opus-4-8").generate_structured(
+        system="sys", instruction="over this data", json_schema=_SCHEMA, max_tokens=1024
+    )
+
+    call = client.beta.messages.calls[0]
+    assert call["output_config"]["format"]["schema"] is _SCHEMA
+    content = call["messages"][0]["content"]
+    assert content == [{"type": "text", "text": "over this data"}]
+    # No document went through the Files API.
+    assert client.beta.files.uploaded == []
+    assert client.beta.files.deleted == []
+    assert result.usage.output_tokens == 7
+
+
 def test_pdf_uses_a_document_block_with_files_beta():
     client = _StubClient(_response())
     doc = DocumentPayload(data=b"%PDF-1.4", content_type="application/pdf", filename="r.pdf")
