@@ -28,6 +28,7 @@ PRICES: dict[str, ModelPrice] = {
     "claude-opus-4-8": ModelPrice(Decimal("5.00"), Decimal("25.00")),
     "claude-opus-4-7": ModelPrice(Decimal("5.00"), Decimal("25.00")),
     "claude-sonnet-5": ModelPrice(Decimal("3.00"), Decimal("15.00")),
+    "claude-sonnet-4-6": ModelPrice(Decimal("3.00"), Decimal("15.00")),
     "claude-haiku-4-5": ModelPrice(Decimal("1.00"), Decimal("5.00")),
 }
 

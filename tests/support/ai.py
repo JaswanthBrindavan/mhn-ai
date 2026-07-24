@@ -140,6 +140,7 @@ class FakeAIProvider:
         instruction: str,
         json_schema: dict[str, Any],
         max_tokens: int,
+        model: str | None = None,
     ) -> StructuredResponse:
         self.calls.append(
             {
@@ -148,6 +149,7 @@ class FakeAIProvider:
                 "instruction": instruction,
                 "json_schema": json_schema,
                 "max_tokens": max_tokens,
+                "model": model,
             }
         )
         if self._error is not None:

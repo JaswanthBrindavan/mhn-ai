@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # --- AI provider --------------------------------------------------------
     ai_provider: str = "anthropic"
     ai_model: str = ""
+    # Insights run on their own model (typically a stronger one); empty falls back to ai_model.
+    ai_model_insights: str = ""
     ai_max_tokens: int = 16000
     anthropic_api_key: str = ""
 
