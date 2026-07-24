@@ -23,11 +23,12 @@ from enum import StrEnum
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, delete, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.models.enums import TERMINAL_STATUSES, RunItemStatus
 from app.models.processing import AiProcessingRunItem
+from app.models.spring import reports, unclassified_files
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,17 @@ def _now() -> datetime:
 
 def _execute_update(session: Session, stmt: Any) -> int:
     """Run a guarded UPDATE and return the affected row count, committed."""
-    result = cast("CursorResult[Any]", session.execute(stmt))
+    rows = _rowcount(session, stmt)
     session.commit()
+    return rows
+
+
+def _rowcount(session: Session, stmt: Any) -> int:
+    """Execute a statement and return affected rows WITHOUT committing.
+
+    Used inside a multi-statement transaction (the move) that must commit as a unit.
+    """
+    result = cast("CursorResult[Any]", session.execute(stmt))
     return result.rowcount
 
 
@@ -170,17 +180,80 @@ def advance(
     return _execute_update(session, stmt) == 1
 
 
-def complete_item(session: Session, item_id: UUID, *, expected: set[str]) -> bool:
-    """Mark an item completed, guarded on its final in-progress state."""
-    stmt = (
-        update(AiProcessingRunItem)
-        .where(
-            AiProcessingRunItem.id == item_id,
-            AiProcessingRunItem.status.in_(expected),
+def move_and_complete(
+    session: Session,
+    item_id: UUID,
+    document_id: int,
+    content: dict[str, Any],
+    *,
+    expected: set[str],
+) -> bool:
+    """Atomically move a classified report into ``reports`` and complete the item.
+
+    In ONE transaction: read the source document's fields, INSERT a ``reports`` row with
+    the assembled ``content``, record ``reports_id`` and mark the item completed (guarded
+    on ``expected``, so a concurrent cancel wins), then DELETE the source
+    ``unclassified_files`` row. Returns False when the guard matches nothing — the whole
+    transaction rolls back, so no ``reports`` row is left orphaned and no source row is
+    deleted.
+
+    Because the move and the completion commit together, a document is never in both
+    tables or in neither, and a redelivery only ever sees a fully-completed item (skipped
+    at claim time) or an untouched source to reprocess — never a half-done move.
+    """
+    src = session.execute(
+        select(
+            unclassified_files.c.user_id,
+            unclassified_files.c.filepath,
+            unclassified_files.c.private,
+            unclassified_files.c.created_by,
+        ).where(unclassified_files.c.id == document_id)
+    ).one_or_none()
+
+    if src is None:
+        # No source to move. Under the one-active-item-per-document invariant this is an
+        # anomaly (the source vanished without this item completing). Don't fabricate a
+        # reports row; leave the item as-is for the guard-failure path to handle.
+        session.rollback()
+        logger.warning(
+            "move_source_missing", extra={"item_id": str(item_id), "document_id": document_id}
         )
-        .values(status=RunItemStatus.COMPLETED.value, completed_at=_now())
+        return False
+
+    reports_id = session.execute(
+        insert(reports)
+        .values(
+            user_id=src.user_id,
+            filepath=src.filepath,
+            private=src.private,
+            created_by=src.created_by,
+            content=content,
+        )
+        .returning(reports.c.id)
+    ).scalar_one()
+
+    moved = _rowcount(
+        session,
+        update(AiProcessingRunItem)
+        .where(AiProcessingRunItem.id == item_id, AiProcessingRunItem.status.in_(expected))
+        .values(
+            status=RunItemStatus.COMPLETED.value,
+            completed_at=_now(),
+            reports_id=reports_id,
+        ),
     )
-    return _execute_update(session, stmt) == 1
+    if moved != 1:
+        # Cancelled or moved underneath us: undo the reports insert entirely.
+        session.rollback()
+        return False
+
+    session.execute(delete(unclassified_files).where(unclassified_files.c.id == document_id))
+    session.commit()
+    logger.info(
+        "item_moved_and_completed",
+        extra={"item_id": str(item_id), "reports_id": reports_id},
+    )
+    return True
 
 
 def reject_item(

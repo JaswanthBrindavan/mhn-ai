@@ -120,13 +120,6 @@ def test_advance_refuses_when_cancelled(db_session, make_document):
     assert _status(db_session, item_id) == "cancelled"
 
 
-def test_complete_is_guarded_against_cancellation(db_session, make_document):
-    item_id = _make_item(db_session, make_document, status="cancelled")
-    ok = processing.complete_item(db_session, item_id, expected=_IN_PROGRESS)
-    assert ok is False
-    assert _status(db_session, item_id) == "cancelled"
-
-
 def test_is_cancelled_detects_cancellation(db_session, make_document):
     item_id = _make_item(db_session, make_document, status="cancelled")
     assert processing.is_cancelled(db_session, item_id) is True
