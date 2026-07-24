@@ -9,6 +9,7 @@ tokens, estimated cost, duration, outcome, and sanitized failure data — keyed 
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     DateTime,
@@ -21,7 +22,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -55,6 +56,49 @@ class AiReportClassification(Base):
     confidence: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False)
     #: Short model justification, kept for audit. Not user-facing and not a diagnosis.
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AiReportExtraction(Base):
+    """Structured extraction result for one run item.
+
+    The validated lab data (test name, value, unit, reference range, observed date,
+    source context) plus the deterministic normalisation computed in Python (numeric
+    value, abnormal/out-of-range flag, converted value/unit) is stored as a single JSONB
+    ``data`` payload. One row per item; a re-run upserts it. Kept separate from the final
+    ``reports.content`` so extraction and insights can be assembled independently.
+    """
+
+    __tablename__ = "ai_report_extractions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+        default=uuid.uuid4,
+    )
+    run_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai_processing_run_items.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    #: The source document (an unclassified_files id).
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    #: {"results": [ {test_name, value, unit, reference_range, observed_date,
+    #: source_context, value_numeric, abnormal_flag, normalized_value, normalized_unit,
+    #: normalized}, ... ], "report_date": ...}
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)

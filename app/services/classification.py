@@ -16,35 +16,22 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 
 import logging
 import time
-from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.integrations.ai.base import (
-    AIProviderError,
-    DocumentPayload,
-    StructuredResponse,
-)
-from app.integrations.ai.pricing import estimate_cost_usd
-from app.integrations.s3 import (
-    SourceObjectMissingError,
-    SourceObjectUnavailableError,
-    get_object,
-)
-from app.models.ai_results import AiProcessLog, AiReportClassification
-from app.models.spring import unclassified_files
-from app.services.source_validation import resolve_content_type
+from app.integrations.ai.base import AIProviderError
+from app.models.ai_results import AiReportClassification
+from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
+from app.services.source_loading import load_source_document
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "clf-2026-07-23"
 SCHEMA_VERSION = "clf-2"
-PROVIDER_NAME = "anthropic"
 STAGE_NAME = "classifying"
 #: Classification output is small (a section, a title, a short reason). Kept tight to
 #: bound cost; the JSON structured-output format keeps responses compact.
@@ -137,8 +124,7 @@ INSTRUCTION = "Classify the attached document into one section."
 
 def classify_report(ctx: StageContext) -> None:
     """Stage entrypoint: classify the document, persist, and gate the pipeline."""
-    filepath = _document_filepath(ctx)
-    document = _load_document(ctx, filepath)
+    document = load_source_document(ctx)
 
     started = time.perf_counter()
     try:
@@ -155,11 +141,11 @@ def classify_report(ctx: StageContext) -> None:
             outcome="error",
             error_code="ai_provider_error",
             detail=str(exc),
-            duration_ms=_elapsed_ms(started),
+            duration_ms=elapsed_ms(started),
         )
         raise TransientStageError(f"classification provider error: {exc}") from exc
 
-    duration_ms = _elapsed_ms(started)
+    duration_ms = elapsed_ms(started)
 
     if response.refused:
         _log(
@@ -179,7 +165,7 @@ def classify_report(ctx: StageContext) -> None:
             ctx,
             outcome="validation_failed",
             error_code="invalid_model_output",
-            detail=_sanitize_validation_error(exc),
+            detail=sanitize_validation_error(exc),
             response=response,
             duration_ms=duration_ms,
         )
@@ -198,32 +184,6 @@ def classify_report(ctx: StageContext) -> None:
 
 
 # --- helpers ----------------------------------------------------------------
-
-
-def _document_filepath(ctx: StageContext) -> str:
-    filepath = ctx.session.execute(
-        select(unclassified_files.c.filepath).where(unclassified_files.c.id == ctx.document_id)
-    ).scalar_one_or_none()
-    if not filepath:
-        # The item should not exist without a source document, but be defensive.
-        raise RejectStageError("source_document_missing", "Source document no longer exists")
-    return str(filepath)
-
-
-def _load_document(ctx: StageContext, filepath: str) -> DocumentPayload:
-    try:
-        content = get_object(ctx.s3, ctx.settings.s3_bucket, filepath)
-    except SourceObjectMissingError as exc:
-        raise RejectStageError("source_object_missing", "Source file was not found") from exc
-    except SourceObjectUnavailableError as exc:
-        raise TransientStageError(f"source storage unavailable: {exc}") from exc
-
-    content_type = resolve_content_type(content.metadata)
-    if content_type is None or content_type not in ctx.settings.allowed_content_type_set:
-        # Validated at submit, but the object could have changed underneath us.
-        raise RejectStageError("unsupported_content_type", "Source file type is not supported")
-
-    return DocumentPayload(data=content.data, content_type=content_type, filename=filepath)
 
 
 def _persist_classification(ctx: StageContext, result: DocumentClassification) -> None:
@@ -256,68 +216,11 @@ def _persist_classification(ctx: StageContext, result: DocumentClassification) -
     ctx.session.commit()
 
 
-def _log(
-    ctx: StageContext,
-    *,
-    outcome: str,
-    duration_ms: int,
-    response: StructuredResponse | None = None,
-    error_code: str | None = None,
-    detail: str | None = None,
-) -> None:
-    usage = response.usage if response is not None else None
-    model = response.model if response is not None else (ctx.settings.ai_model or "unknown")
-    cost = estimate_cost_usd(model, usage) if usage is not None else Decimal("0")
-
-    stmt = (
-        pg_insert(AiProcessLog)
-        .values(
-            run_item_id=ctx.item_id,
-            document_id=ctx.document_id,
-            stage=STAGE_NAME,
-            attempt=ctx.attempt,
-            provider=PROVIDER_NAME,
-            model=model,
-            prompt_version=PROMPT_VERSION,
-            schema_version=SCHEMA_VERSION,
-            input_tokens=usage.input_tokens if usage else 0,
-            output_tokens=usage.output_tokens if usage else 0,
-            cache_read_input_tokens=usage.cache_read_input_tokens if usage else 0,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens if usage else 0,
-            estimated_cost_usd=cost,
-            duration_ms=duration_ms,
-            outcome=outcome,
-            error_code=error_code,
-            error_detail=detail,
-        )
-        # One row per (item, stage, attempt): a re-run of the SAME attempt updates it,
-        # so a single attempt's cost is never logged twice.
-        .on_conflict_do_update(
-            constraint="uq_ai_process_logs_item_stage_attempt",
-            set_={
-                "model": model,
-                "input_tokens": usage.input_tokens if usage else 0,
-                "output_tokens": usage.output_tokens if usage else 0,
-                "cache_read_input_tokens": usage.cache_read_input_tokens if usage else 0,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens if usage else 0,
-                "estimated_cost_usd": cost,
-                "duration_ms": duration_ms,
-                "outcome": outcome,
-                "error_code": error_code,
-                "error_detail": detail,
-            },
-        )
+def _log(ctx: StageContext, **kwargs: Any) -> None:
+    log_process(
+        ctx,
+        stage=STAGE_NAME,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
+        **kwargs,
     )
-    ctx.session.execute(stmt)
-    ctx.session.commit()
-
-
-def _sanitize_validation_error(exc: ValidationError) -> str:
-    # Field locations and messages only — never the offending model output/value,
-    # which could echo report contents.
-    parts = [f"{'.'.join(str(p) for p in err['loc'])}: {err['type']}" for err in exc.errors()]
-    return "; ".join(parts)[:2000]
-
-
-def _elapsed_ms(started: float) -> int:
-    return int((time.perf_counter() - started) * 1000)

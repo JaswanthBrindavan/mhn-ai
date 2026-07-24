@@ -39,8 +39,31 @@ def classification_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def extraction_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "results": [
+            {
+                "test_name": "Fasting Glucose",
+                "value": "126",
+                "unit": "mg/dL",
+                "reference_range": "70-99",
+                "observed_date": "2026-07-20",
+                "source_context": "Glucose, Fasting",
+            }
+        ],
+        "report_date": "2026-07-20",
+    }
+    payload.update(overrides)
+    return payload
+
+
 class FakeAIProvider:
-    """Returns a fixed response (or raises), recording each call for assertions."""
+    """Returns a fixed response (or raises), recording each call for assertions.
+
+    Without an explicit ``response`` it picks a canned payload from the requested
+    schema's shape, so a full pipeline that classifies then extracts on one fake gets a
+    valid response for each stage.
+    """
 
     def __init__(
         self,
@@ -48,7 +71,7 @@ class FakeAIProvider:
         response: StructuredResponse | None = None,
         error: Exception | None = None,
     ) -> None:
-        self._response = response or structured_response(classification_payload())
+        self._response = response
         self._error = error
         self.calls: list[dict[str, Any]] = []
 
@@ -79,7 +102,12 @@ class FakeAIProvider:
         )
         if self._error is not None:
             raise self._error
-        return self._response
+        if self._response is not None:
+            return self._response
+        # No override: answer according to what the stage asked for.
+        if "results" in json_schema.get("properties", {}):
+            return structured_response(extraction_payload())
+        return structured_response(classification_payload())
 
     @property
     def last_document(self) -> DocumentPayload:
