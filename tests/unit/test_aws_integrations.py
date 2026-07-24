@@ -82,8 +82,8 @@ def test_connection_failure_is_transient(s3):
 
 def test_message_body_carries_identifiers_only():
     """No report contents, no S3 keys, no patient data on the queue."""
-    body = build_message(item_id=uuid.uuid4(), run_id=uuid.uuid4(), report_id=7, attempt=0)
-    assert set(body) == {"schema_version", "item_id", "run_id", "report_id", "attempt"}
+    body = build_message(item_id=uuid.uuid4(), run_id=uuid.uuid4(), document_id=7, attempt=0)
+    assert set(body) == {"schema_version", "item_id", "run_id", "document_id", "attempt"}
     assert body["schema_version"] == MESSAGE_SCHEMA_VERSION
 
 
@@ -91,13 +91,15 @@ def test_publish_puts_a_readable_message_on_the_queue(sqs):
     client, url = sqs
     item_id, run_id = uuid.uuid4(), uuid.uuid4()
 
-    message_id = publish_processing_item(client, url, item_id=item_id, run_id=run_id, report_id=42)
+    message_id = publish_processing_item(
+        client, url, item_id=item_id, run_id=run_id, document_id=42
+    )
 
     assert message_id
     received = client.receive_message(QueueUrl=url, MaxNumberOfMessages=1)["Messages"][0]
     body = json.loads(received["Body"])
     assert body["item_id"] == str(item_id)
-    assert body["report_id"] == 42
+    assert body["document_id"] == 42
     # The key must not travel with the message.
     assert "filepath" not in body
 
@@ -110,5 +112,5 @@ def test_publish_failure_raises_publish_failed(sqs):
             "https://sqs.ap-south-1.amazonaws.com/000000000000/does-not-exist",
             item_id=uuid.uuid4(),
             run_id=uuid.uuid4(),
-            report_id=1,
+            document_id=1,
         )

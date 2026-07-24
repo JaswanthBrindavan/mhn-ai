@@ -1,9 +1,9 @@
-"""Report-processing run business logic.
+"""Document-processing run business logic.
 
 Two invariants worth stating up front.
 
 **Idempotency is enforced by the database.** A partial unique index permits at most one
-in-flight item per report, so two concurrent submissions cannot both create work. One
+in-flight item per document, so two concurrent submissions cannot both create work. One
 raises ``IntegrityError`` and we reuse the winner's row. A read-then-write check alone
 loses that race.
 
@@ -35,7 +35,7 @@ from app.models.processing import (
     AiProcessingRun,
     AiProcessingRunItem,
 )
-from app.models.spring import reports
+from app.models.spring import unclassified_files
 from app.schemas.runs import (
     CancelRunResponse,
     CreateRunRequest,
@@ -65,47 +65,40 @@ _CANCELLABLE = {status.value for status in CANCELLABLE_STATUSES}
 _VALIDATION_CONCURRENCY = 8
 
 
-def _report_filepaths(session: Session, report_ids: list[int]) -> dict[int, str]:
-    """Existence + source key lookup. A sanity check, NOT an access-control check."""
+def _document_filepaths(session: Session, document_ids: list[int]) -> dict[int, str]:
+    """Existence + source key lookup against unclassified_files. A sanity check."""
     rows = session.execute(
-        select(reports.c.id, reports.c.filepath).where(reports.c.id.in_(report_ids))
+        select(unclassified_files.c.id, unclassified_files.c.filepath).where(
+            unclassified_files.c.id.in_(document_ids)
+        )
     ).all()
     return {int(row.id): row.filepath for row in rows}
 
 
-def _active_item_for_report(session: Session, report_id: int) -> AiProcessingRunItem | None:
-    return session.execute(
-        select(AiProcessingRunItem).where(
-            AiProcessingRunItem.report_id == report_id,
-            AiProcessingRunItem.status.in_(_ACTIVE),
-        )
-    ).scalar_one_or_none()
-
-
-def _active_items(session: Session, report_ids: list[int]) -> dict[int, AiProcessingRunItem]:
-    """In-flight item per report, for the whole batch in one query."""
+def _active_items(session: Session, document_ids: list[int]) -> dict[int, AiProcessingRunItem]:
+    """In-flight item per document, for the whole batch in one query."""
     rows = session.execute(
         select(AiProcessingRunItem).where(
-            AiProcessingRunItem.report_id.in_(report_ids),
+            AiProcessingRunItem.document_id.in_(document_ids),
             AiProcessingRunItem.status.in_(_ACTIVE),
         )
     ).scalars()
-    return {item.report_id: item for item in rows}
+    return {item.document_id: item for item in rows}
 
 
-def _latest_items(session: Session, report_ids: list[int]) -> dict[int, AiProcessingRunItem]:
-    """Most recent item per report, for the whole batch in one query.
+def _latest_items(session: Session, document_ids: list[int]) -> dict[int, AiProcessingRunItem]:
+    """Most recent item per document, for the whole batch in one query.
 
     ``DISTINCT ON`` is PostgreSQL-specific, which is fine — this service targets
-    PostgreSQL — and avoids one query per report on a 500-report submission.
+    PostgreSQL — and avoids one query per document on a 500-document submission.
     """
     rows = session.execute(
         select(AiProcessingRunItem)
-        .where(AiProcessingRunItem.report_id.in_(report_ids))
-        .distinct(AiProcessingRunItem.report_id)
-        .order_by(AiProcessingRunItem.report_id, AiProcessingRunItem.created_at.desc())
+        .where(AiProcessingRunItem.document_id.in_(document_ids))
+        .distinct(AiProcessingRunItem.document_id)
+        .order_by(AiProcessingRunItem.document_id, AiProcessingRunItem.created_at.desc())
     ).scalars()
-    return {item.report_id: item for item in rows}
+    return {item.document_id: item for item in rows}
 
 
 def _validate_sources(
@@ -113,7 +106,7 @@ def _validate_sources(
 ) -> dict[int, tuple[ObjectMetadata | None, ValidationFailure | None]]:
     """HeadObject every candidate, a few at a time.
 
-    Sequentially this is one network round trip per report — on a 500-report batch
+    Sequentially this is one network round trip per document — on a 500-document batch
     that alone is minutes of wall clock in an endpoint expected to answer quickly.
     boto3 clients are thread-safe for API calls, so a small pool is enough.
     """
@@ -121,26 +114,26 @@ def _validate_sources(
         return {}
 
     if len(targets) == 1:
-        report_id, filepath = next(iter(targets.items()))
-        return {report_id: validate_source_object(s3, settings, filepath)}
+        document_id, filepath = next(iter(targets.items()))
+        return {document_id: validate_source_object(s3, settings, filepath)}
 
     workers = min(_VALIDATION_CONCURRENCY, len(targets))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="validate") as pool:
         futures = {
-            pool.submit(validate_source_object, s3, settings, filepath): report_id
-            for report_id, filepath in targets.items()
+            pool.submit(validate_source_object, s3, settings, filepath): document_id
+            for document_id, filepath in targets.items()
         }
         # A transient S3 failure in any worker propagates, so the caller answers 503
-        # rather than permanently rejecting reports over a blip.
+        # rather than permanently rejecting documents over a blip.
         return {futures[future]: future.result() for future in as_completed(futures)}
 
 
 @dataclass
 class _Resolved:
-    """What a submitted report ended up mapped to."""
+    """What a submitted document ended up mapped to."""
 
     item_id: uuid.UUID
-    report_id: int
+    document_id: int
     run_id: uuid.UUID
     status: str
     error_code: str | None
@@ -151,15 +144,15 @@ class _Resolved:
 class _Plan:
     """Decisions made before touching the database."""
 
-    #: Reports answered from existing rows: in flight, or completed without force.
+    #: Documents answered from existing rows: in flight, or completed without force.
     reused: dict[int, AiProcessingRunItem]
     outcomes: dict[int, SubmitOutcome]
-    #: Reports needing a new item, as insertable column dicts.
+    #: Documents needing a new item, as insertable column dicts.
     new_rows: dict[int, dict[str, Any]]
 
 
 def _plan_items(
-    report_ids: list[int],
+    document_ids: list[int],
     active: dict[int, AiProcessingRunItem],
     latest: dict[int, AiProcessingRunItem],
     validated: dict[int, tuple[ObjectMetadata | None, ValidationFailure | None]],
@@ -170,31 +163,31 @@ def _plan_items(
     outcomes: dict[int, SubmitOutcome] = {}
     new_rows: dict[int, dict[str, Any]] = {}
 
-    for report_id in report_ids:
-        in_flight = active.get(report_id)
+    for document_id in document_ids:
+        in_flight = active.get(document_id)
         if in_flight is not None:
             # Already running, and already has a queue message. force_reprocess
             # concerns finished results, not work still under way.
-            reused[report_id] = in_flight
-            outcomes[report_id] = SubmitOutcome.REUSED
+            reused[document_id] = in_flight
+            outcomes[document_id] = SubmitOutcome.REUSED
             continue
 
-        previous = latest.get(report_id)
+        previous = latest.get(document_id)
         if (
             previous is not None
             and previous.status == RunItemStatus.COMPLETED.value
             and not force_reprocess
         ):
             # Never overwrite a completed result without an explicit force_reprocess.
-            reused[report_id] = previous
-            outcomes[report_id] = SubmitOutcome.ALREADY_COMPLETED
+            reused[document_id] = previous
+            outcomes[document_id] = SubmitOutcome.ALREADY_COMPLETED
             continue
 
-        meta, failure = validated.get(report_id, (None, None))
+        meta, failure = validated.get(document_id, (None, None))
         # Every row carries the same keys: a multi-row VALUES clause cannot mix
         # differing column sets, and omitting one here fails at compile time.
-        new_rows[report_id] = {
-            "report_id": report_id,
+        new_rows[document_id] = {
+            "document_id": document_id,
             "status": (
                 RunItemStatus.REJECTED.value
                 if failure is not None
@@ -215,7 +208,7 @@ def _insert_new_items(
     """Insert every new item in one statement, tolerating the idempotency race.
 
     ``ON CONFLICT DO NOTHING`` replaces a per-item SAVEPOINT/flush. That matters twice
-    over: it is one round trip instead of three per report on a batch of up to 500,
+    over: it is one round trip instead of three per document on a batch of up to 500,
     and it removes the failure mode where catching IntegrityError and calling
     ``session.rollback()`` would discard the whole transaction — run row and all
     previously created items — while the response still reported their ids.
@@ -228,17 +221,17 @@ def _insert_new_items(
         .values([{**row, "run_id": run_id} for row in new_rows.values()])
         # The predicate must match the partial index exactly to target it.
         .on_conflict_do_nothing(
-            index_elements=[AiProcessingRunItem.report_id],
+            index_elements=[AiProcessingRunItem.document_id],
             index_where=text(ACTIVE_STATUS_PREDICATE),
         )
         .returning(
             AiProcessingRunItem.id,
-            AiProcessingRunItem.report_id,
+            AiProcessingRunItem.document_id,
             AiProcessingRunItem.status,
             AiProcessingRunItem.last_error_code,
         )
     )
-    return {row.report_id: row for row in session.execute(statement).all()}
+    return {row.document_id: row for row in session.execute(statement).all()}
 
 
 def _mark_queued(session: Session, item_ids: set[uuid.UUID]) -> None:
@@ -266,16 +259,16 @@ def create_run(
 ) -> CreateRunResponse:
     # Deduplicate while preserving caller order, so a repeated id in one request
     # cannot try to create two items and trip the unique index against itself.
-    unique_ids = list(dict.fromkeys(payload.report_ids))
+    unique_ids = list(dict.fromkeys(payload.document_ids))
 
-    filepaths = _report_filepaths(session, unique_ids)
-    missing = [report_id for report_id in unique_ids if report_id not in filepaths]
+    filepaths = _document_filepaths(session, unique_ids)
+    missing = [document_id for document_id in unique_ids if document_id not in filepaths]
     if missing:
         raise ApiError(
             404,
-            "report_not_found",
-            "One or more reports do not exist",
-            {"missing_report_ids": missing},
+            "document_not_found",
+            "One or more documents do not exist",
+            {"missing_document_ids": missing},
         )
 
     run = AiProcessingRun(
@@ -290,18 +283,18 @@ def create_run(
     # would cost an extra round trip for no reason.
     run_id, run_created_at = run.id, run.created_at
 
-    # Two queries for the whole batch rather than two per report.
+    # Two queries for the whole batch rather than two per document.
     active = _active_items(session, unique_ids)
     latest = _latest_items(session, unique_ids)
 
-    # Only reports that will actually produce new work need their source validated;
+    # Only documents that will actually produce new work need their source validated;
     # reused and already-completed ones are answered from the database alone.
     needs_validation = {
-        report_id: filepaths[report_id]
-        for report_id in unique_ids
-        if report_id not in active
+        document_id: filepaths[document_id]
+        for document_id in unique_ids
+        if document_id not in active
         and not (
-            (existing := latest.get(report_id)) is not None
+            (existing := latest.get(document_id)) is not None
             and existing.status == RunItemStatus.COMPLETED.value
             and not payload.force_reprocess
         )
@@ -321,42 +314,42 @@ def create_run(
     # Rows the insert did not return lost the idempotency race to a concurrent
     # submission. ON CONFLICT DO NOTHING means no exception and no lost transaction:
     # look up the winners and reuse them.
-    losers = [report_id for report_id in plan.new_rows if report_id not in created]
+    losers = [document_id for document_id in plan.new_rows if document_id not in created]
     winners = _active_items(session, losers) if losers else {}
 
     resolved: dict[int, _Resolved] = {}
     publishable: list[_Resolved] = []
-    for report_id in unique_ids:
-        if report_id in plan.reused:
-            existing = plan.reused[report_id]
-            resolved[report_id] = _Resolved(
+    for document_id in unique_ids:
+        if document_id in plan.reused:
+            existing = plan.reused[document_id]
+            resolved[document_id] = _Resolved(
                 item_id=existing.id,
-                report_id=report_id,
+                document_id=document_id,
                 run_id=existing.run_id,
                 status=existing.status,
                 error_code=existing.last_error_code,
-                outcome=plan.outcomes[report_id],
+                outcome=plan.outcomes[document_id],
             )
-        elif report_id in created:
-            row = created[report_id]
+        elif document_id in created:
+            row = created[document_id]
             entry = _Resolved(
                 item_id=row.id,
-                report_id=report_id,
+                document_id=document_id,
                 run_id=run_id,
                 status=row.status,
                 error_code=row.last_error_code,
                 outcome=SubmitOutcome.CREATED,
             )
-            resolved[report_id] = entry
+            resolved[document_id] = entry
             if row.status == RunItemStatus.PENDING.value:
                 publishable.append(entry)
         else:
-            winner = winners.get(report_id)
+            winner = winners.get(document_id)
             if winner is None:  # pragma: no cover - the winner turned terminal instantly
-                raise ApiError(409, "submission_conflict", "Report is already being processed")
-            resolved[report_id] = _Resolved(
+                raise ApiError(409, "submission_conflict", "Document is already being processed")
+            resolved[document_id] = _Resolved(
                 item_id=winner.id,
-                report_id=report_id,
+                document_id=document_id,
                 run_id=winner.run_id,
                 status=winner.status,
                 error_code=winner.last_error_code,
@@ -379,13 +372,13 @@ def create_run(
         created_at=run_created_at,
         items=[
             SubmittedItem(
-                report_id=report_id,
-                item_id=resolved[report_id].item_id,
-                status=resolved[report_id].status,
-                outcome=resolved[report_id].outcome,
-                error_code=resolved[report_id].error_code,
+                document_id=document_id,
+                item_id=resolved[document_id].item_id,
+                status=resolved[document_id].status,
+                outcome=resolved[document_id].outcome,
+                error_code=resolved[document_id].error_code,
             )
-            for report_id in unique_ids
+            for document_id in unique_ids
         ],
     )
 
@@ -416,11 +409,11 @@ def _publish(
                 settings.sqs_queue_url,
                 item_id=entry.item_id,
                 run_id=entry.run_id,
-                report_id=entry.report_id,
+                document_id=entry.document_id,
                 attempt=0,
             )
         except PublishError as exc:
-            # Identifiers only -- never the report or the message body.
+            # Identifiers only -- never the document or the message body.
             logger.error(
                 "publish_failed", extra={"item_id": str(entry.item_id), "reason": str(exc)}
             )

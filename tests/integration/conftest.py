@@ -125,10 +125,11 @@ def test_settings(aws) -> Settings:
 
 
 @pytest.fixture
-def make_report(db_session: Session, seed_user: uuid.UUID, aws):
-    """Create a reports row AND its S3 object, so the source validates.
+def make_document(db_session: Session, seed_user: uuid.UUID, aws):
+    """Create an `unclassified_files` row AND its S3 object, and return its id.
 
-    `created_by` may differ from `user_id`, which is the family-upload case.
+    This is the submitted unit of work. `created_by` may differ from `user_id`, which is
+    the family-upload case.
     """
     s3 = aws[0]
 
@@ -140,12 +141,12 @@ def make_report(db_session: Session, seed_user: uuid.UUID, aws):
         suffix: str = ".pdf",
         upload: bool = True,
     ) -> int:
-        key = f"reports/test/{uuid.uuid4().hex}{suffix}"
+        key = f"uploads/test/{uuid.uuid4().hex}{suffix}"
         if upload:
             s3.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
-        report_id = db_session.execute(
+        document_id = db_session.execute(
             text(
-                "INSERT INTO reports (user_id, filepath, created_by) "
+                "INSERT INTO unclassified_files (user_id, filepath, created_by) "
                 "VALUES (:user_id, :filepath, :created_by) RETURNING id"
             ),
             {
@@ -155,7 +156,7 @@ def make_report(db_session: Session, seed_user: uuid.UUID, aws):
             },
         ).scalar_one()
         db_session.flush()
-        return int(report_id)
+        return int(document_id)
 
     return _make
 

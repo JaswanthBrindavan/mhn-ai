@@ -22,7 +22,7 @@ def _valid_body() -> dict:
         "schema_version": MESSAGE_SCHEMA_VERSION,
         "item_id": str(uuid.uuid4()),
         "run_id": str(uuid.uuid4()),
-        "report_id": 7,
+        "document_id": 7,
         "attempt": 0,
     }
 
@@ -35,7 +35,7 @@ def test_valid_message_parses():
     msg = _parse(_raw(body, receipt="handle-1", receive_count=3))
     assert msg is not None
     assert str(msg.item_id) == body["item_id"]
-    assert msg.report_id == 7
+    assert msg.document_id == 7
     assert msg.receipt_handle == "handle-1"
     assert msg.approx_receive_count == 3
 
@@ -56,7 +56,7 @@ def test_missing_field_is_dropped():
 
 
 def test_non_integer_report_id_is_dropped():
-    body = _valid_body() | {"report_id": "not-a-number"}
+    body = _valid_body() | {"document_id": "not-a-number"}
     assert _parse(_raw(body)) is None
 
 

@@ -1,7 +1,9 @@
 """Processing run and run-item tables.
 
-A **run** is one submission from Spring (possibly many reports). A **run item** is the
-per-report unit of work, and carries all lifecycle state.
+A **run** is one submission from Spring (possibly many documents). A **run item** is the
+per-document unit of work and carries all lifecycle state. Its identity is the source
+``unclassified_files`` id (``document_id``); once a document is classified as a report and
+moved into ``reports``, that created row's id is recorded in ``reports_id``.
 
 The run has no denormalised status column: progress is derived by counting item
 statuses at read time. A stored aggregate would need updating from every worker on
@@ -80,7 +82,7 @@ class AiProcessingRun(Base):
 
 
 class AiProcessingRunItem(Base):
-    """Per-report unit of work. Holds all lifecycle state."""
+    """Per-document unit of work. Holds all lifecycle state."""
 
     __tablename__ = "ai_processing_run_items"
 
@@ -96,9 +98,13 @@ class AiProcessingRunItem(Base):
         nullable=False,
     )
 
-    # Integer, matching reports.id. No foreign key: `reports` is Spring-owned and a
-    # constraint from our table would couple their migrations to ours.
-    report_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The source document: an `unclassified_files` id. Integer, no foreign key -- those
+    # tables are Spring-owned and a constraint from our table would couple their
+    # migrations to ours.
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The `reports` row created when this document was moved into the reports section.
+    #: Null until the move happens (only for documents classified as reports).
+    reports_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=RunItemStatus.PENDING.value
@@ -109,7 +115,7 @@ class AiProcessingRunItem(Base):
     )
 
     #: Checksum of the source object, filled by the worker after download. Combined
-    #: with report_id this identifies "this exact file already processed".
+    #: with document_id this identifies "this exact file already processed".
     content_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     #: Stable, machine-readable failure reason. Never free-form model output.
@@ -133,15 +139,15 @@ class AiProcessingRunItem(Base):
             f"status IN ({_STATUS_VALUES})",
             name="ck_ai_processing_run_items_status",
         ),
-        # THE idempotency guarantee: at most one in-flight item per report, enforced
+        # THE idempotency guarantee: at most one in-flight item per document, enforced
         # by the database rather than by application checks that races can slip past.
         Index(
-            "uq_ai_run_items_active_report",
-            "report_id",
+            "uq_ai_run_items_active_document",
+            "document_id",
             unique=True,
             postgresql_where=text(ACTIVE_STATUS_PREDICATE),
         ),
         Index("ix_ai_run_items_run_id", "run_id"),
-        Index("ix_ai_run_items_report_id", "report_id"),
+        Index("ix_ai_run_items_document_id", "document_id"),
         Index("ix_ai_run_items_status", "status"),
     )

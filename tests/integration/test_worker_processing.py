@@ -14,8 +14,13 @@ from sqlalchemy.orm import Session
 from app.integrations.sqs import publish_processing_item, receive_messages
 from app.models.enums import RunItemStatus
 from app.workers.processor import Outcome, process_message
+from tests.support.ai import FakeAIProvider
 
 pytestmark = pytest.mark.integration
+
+# A processable lab-report classification, so the real classify stage lets the pipeline
+# complete. Monkeypatched-STAGE_SEQUENCE tests replace classify, so `ai` is unused there.
+_FAKE_AI = FakeAIProvider()
 
 
 @pytest.fixture
@@ -28,20 +33,22 @@ def session_factory(db_connection):
     return _make
 
 
-def _seed_item(db_session, make_report, status: str = "queued") -> tuple[uuid.UUID, uuid.UUID, int]:
-    report_id = make_report()
+def _seed_item(
+    db_session, make_document, status: str = "queued"
+) -> tuple[uuid.UUID, uuid.UUID, int]:
+    document_id = make_document()
     run_id = db_session.execute(
         text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
     ).scalar_one()
     item_id = db_session.execute(
         text(
-            "INSERT INTO ai_processing_run_items (run_id, report_id, status) "
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status) "
             "VALUES (:r, :rep, :s) RETURNING id"
         ),
-        {"r": run_id, "rep": report_id, "s": status},
+        {"r": run_id, "rep": document_id, "s": status},
     ).scalar_one()
     db_session.flush()
-    return item_id, run_id, report_id
+    return item_id, run_id, document_id
 
 
 def _status(db_session, item_id) -> str:
@@ -70,7 +77,12 @@ def _process(sqs, queue_url, session_factory, test_settings, aws):
     s3 = aws[0]
     message = _receive_one(sqs, queue_url)
     return process_message(
-        message, session_factory=session_factory, s3=s3, sqs=sqs, settings=test_settings
+        message,
+        session_factory=session_factory,
+        s3=s3,
+        sqs=sqs,
+        ai=_FAKE_AI,
+        settings=test_settings,
     )
 
 
@@ -78,11 +90,11 @@ def _process(sqs, queue_url, session_factory, test_settings, aws):
 
 
 def test_full_pipeline_completes_and_acks(
-    db_session, make_report, session_factory, test_settings, aws
+    db_session, make_document, session_factory, test_settings, aws
 ):
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report)
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
@@ -93,11 +105,11 @@ def test_full_pipeline_completes_and_acks(
 
 
 def test_completed_at_and_started_at_are_set(
-    db_session, make_report, session_factory, test_settings, aws
+    db_session, make_document, session_factory, test_settings, aws
 ):
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report)
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     _process(sqs, queue_url, session_factory, test_settings, aws)
 
@@ -117,16 +129,16 @@ def test_completed_at_and_started_at_are_set(
 
 
 def test_duplicate_delivery_of_completed_item_is_a_noop(
-    db_session, make_report, session_factory, test_settings, aws
+    db_session, make_document, session_factory, test_settings, aws
 ):
     """A redelivered message for an already-completed item must not reprocess it."""
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report)
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
     _process(sqs, queue_url, session_factory, test_settings, aws)  # completes it
 
     # Same message delivered again (e.g. an earlier delete that never landed).
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
     assert outcome is Outcome.SKIPPED_TERMINAL
@@ -134,11 +146,11 @@ def test_duplicate_delivery_of_completed_item_is_a_noop(
 
 
 def test_message_for_deleted_item_is_acked_as_not_found(
-    db_session, make_report, session_factory, test_settings, aws
+    db_session, make_document, session_factory, test_settings, aws
 ):
     _, sqs, queue_url, _ = aws
     ghost = uuid.uuid4()
-    publish_processing_item(sqs, queue_url, item_id=ghost, run_id=uuid.uuid4(), report_id=1)
+    publish_processing_item(sqs, queue_url, item_id=ghost, run_id=uuid.uuid4(), document_id=1)
 
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
@@ -150,11 +162,11 @@ def test_message_for_deleted_item_is_acked_as_not_found(
 
 
 def test_cancelled_before_processing_is_skipped(
-    db_session, make_report, session_factory, test_settings, aws
+    db_session, make_document, session_factory, test_settings, aws
 ):
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report, status="cancelled")
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    item_id, run_id, document_id = _seed_item(db_session, make_document, status="cancelled")
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
@@ -167,12 +179,12 @@ def test_cancelled_before_processing_is_skipped(
 
 
 def test_cancellation_during_a_stage_stops_the_pipeline(
-    db_session, make_report, session_factory, test_settings, aws, monkeypatch
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
 ):
     """A cancel that lands while a stage runs must stop the worker cleanly."""
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report)
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     from app.models.enums import RunItemStatus as S
 
@@ -201,11 +213,11 @@ def test_cancellation_during_a_stage_stops_the_pipeline(
 
 
 def test_transient_stage_failure_leaves_message_for_redelivery(
-    db_session, make_report, session_factory, test_settings, aws, monkeypatch
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
 ):
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report)
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     from app.models.enums import RunItemStatus as S
     from app.workers.stages import TransientStageError
@@ -225,11 +237,11 @@ def test_transient_stage_failure_leaves_message_for_redelivery(
 
 
 def test_reject_stage_marks_rejected_and_acks(
-    db_session, make_report, session_factory, test_settings, aws, monkeypatch
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
 ):
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report)
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     from app.models.enums import RunItemStatus as S
     from app.workers.stages import RejectStageError
@@ -254,20 +266,19 @@ def test_reject_stage_marks_rejected_and_acks(
 
 
 def test_message_giving_up_after_max_attempts_fails_and_acks(
-    db_session, make_report, session_factory, test_settings, aws
+    db_session, make_document, session_factory, test_settings, aws
 ):
     _, sqs, queue_url, _ = aws
-    item_id, run_id, report_id = _seed_item(db_session, make_report)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
     # Push attempt_count to the cap so the next claim gives up.
     db_session.execute(
         text(
-            "UPDATE ai_processing_run_items SET attempt_count=:a, status='processing' "
-            "WHERE id=:id"
+            "UPDATE ai_processing_run_items SET attempt_count=:a, status='processing' WHERE id=:id"
         ),
         {"a": test_settings.max_attempts, "id": item_id},
     )
     db_session.flush()
-    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, report_id=report_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 

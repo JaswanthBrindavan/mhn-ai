@@ -14,17 +14,17 @@ pytestmark = pytest.mark.integration
 _IN_PROGRESS = {"processing", "classifying", "extracting", "generating_insights"}
 
 
-def _make_item(db_session, make_report, status: str = "queued", attempt: int = 0) -> uuid.UUID:
-    report_id = make_report()
+def _make_item(db_session, make_document, status: str = "queued", attempt: int = 0) -> uuid.UUID:
+    document_id = make_document()
     run_id = db_session.execute(
         text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
     ).scalar_one()
     item_id = db_session.execute(
         text(
-            "INSERT INTO ai_processing_run_items (run_id, report_id, status, attempt_count) "
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status, attempt_count) "
             "VALUES (:r, :rep, :s, :a) RETURNING id"
         ),
-        {"r": run_id, "rep": report_id, "s": status, "a": attempt},
+        {"r": run_id, "rep": document_id, "s": status, "a": attempt},
     ).scalar_one()
     # Commit (releases the savepoint) so claim_item's own rollback on skip paths —
     # correct in production where it holds a fresh session — cannot discard the seed.
@@ -41,8 +41,8 @@ def _status(db_session, item_id) -> str:
 # --- claim ------------------------------------------------------------------
 
 
-def test_claim_a_queued_item_starts_processing(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="queued")
+def test_claim_a_queued_item_starts_processing(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="queued")
 
     claim = processing.claim_item(db_session, item_id, max_attempts=3)
 
@@ -51,8 +51,8 @@ def test_claim_a_queued_item_starts_processing(db_session, make_report):
     assert _status(db_session, item_id) == RunItemStatus.PROCESSING.value
 
 
-def test_claiming_a_completed_item_is_skipped(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="completed")
+def test_claiming_a_completed_item_is_skipped(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="completed")
 
     claim = processing.claim_item(db_session, item_id, max_attempts=3)
 
@@ -61,8 +61,8 @@ def test_claiming_a_completed_item_is_skipped(db_session, make_report):
     assert _status(db_session, item_id) == "completed"
 
 
-def test_claiming_a_cancelled_item_is_skipped(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="cancelled")
+def test_claiming_a_cancelled_item_is_skipped(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="cancelled")
     claim = processing.claim_item(db_session, item_id, max_attempts=3)
     assert claim.outcome is ClaimOutcome.SKIP_TERMINAL
 
@@ -72,9 +72,9 @@ def test_claiming_a_missing_item_reports_not_found(db_session):
     assert claim.outcome is ClaimOutcome.NOT_FOUND
 
 
-def test_claim_gives_up_after_max_attempts(db_session, make_report):
+def test_claim_gives_up_after_max_attempts(db_session, make_document):
     # Already at the cap: the next claim should fail it, not process it.
-    item_id = _make_item(db_session, make_report, status="processing", attempt=3)
+    item_id = _make_item(db_session, make_document, status="processing", attempt=3)
 
     claim = processing.claim_item(db_session, item_id, max_attempts=3)
 
@@ -87,8 +87,8 @@ def test_claim_gives_up_after_max_attempts(db_session, make_report):
     assert code == "max_attempts_exceeded"
 
 
-def test_claim_increments_attempt_each_time(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="queued", attempt=0)
+def test_claim_increments_attempt_each_time(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="queued", attempt=0)
     assert processing.claim_item(db_session, item_id, max_attempts=5).attempt == 1
     # Simulate redelivery: still non-terminal, claim again.
     assert processing.claim_item(db_session, item_id, max_attempts=5).attempt == 2
@@ -97,8 +97,8 @@ def test_claim_increments_attempt_each_time(db_session, make_report):
 # --- guarded transitions ----------------------------------------------------
 
 
-def test_advance_moves_from_expected_state(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="processing")
+def test_advance_moves_from_expected_state(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="processing")
 
     ok = processing.advance(
         db_session, item_id, to_status=RunItemStatus.CLASSIFYING, expected=_IN_PROGRESS
@@ -108,8 +108,8 @@ def test_advance_moves_from_expected_state(db_session, make_report):
     assert _status(db_session, item_id) == "classifying"
 
 
-def test_advance_refuses_when_cancelled(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="cancelled")
+def test_advance_refuses_when_cancelled(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="cancelled")
 
     ok = processing.advance(
         db_session, item_id, to_status=RunItemStatus.CLASSIFYING, expected=_IN_PROGRESS
@@ -120,18 +120,18 @@ def test_advance_refuses_when_cancelled(db_session, make_report):
     assert _status(db_session, item_id) == "cancelled"
 
 
-def test_complete_is_guarded_against_cancellation(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="cancelled")
+def test_complete_is_guarded_against_cancellation(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="cancelled")
     ok = processing.complete_item(db_session, item_id, expected=_IN_PROGRESS)
     assert ok is False
     assert _status(db_session, item_id) == "cancelled"
 
 
-def test_is_cancelled_detects_cancellation(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="cancelled")
+def test_is_cancelled_detects_cancellation(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="cancelled")
     assert processing.is_cancelled(db_session, item_id) is True
 
 
-def test_is_cancelled_false_while_processing(db_session, make_report):
-    item_id = _make_item(db_session, make_report, status="processing")
+def test_is_cancelled_false_while_processing(db_session, make_document):
+    item_id = _make_item(db_session, make_document, status="processing")
     assert processing.is_cancelled(db_session, item_id) is False

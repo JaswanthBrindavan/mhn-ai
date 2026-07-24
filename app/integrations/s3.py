@@ -67,3 +67,36 @@ def head_object(client: "S3Client", bucket: str, key: str) -> ObjectMetadata:
         content_type=response.get("ContentType"),
         etag=etag.strip('"') if etag else None,
     )
+
+
+@dataclass(frozen=True)
+class ObjectContent:
+    """A downloaded object: its bytes plus the metadata from the same GET."""
+
+    metadata: ObjectMetadata
+    data: bytes
+
+
+def get_object(client: "S3Client", bucket: str, key: str) -> ObjectContent:
+    """Download an object's bytes. Same missing/transient split as ``head_object``."""
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+        data = response["Body"].read()
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in _MISSING_CODES or code in _DENIED_CODES or status in (403, 404):
+            raise SourceObjectMissingError(key) from exc
+        logger.warning("s3_get_object_failed", extra={"error_code": code, "http_status": status})
+        raise SourceObjectUnavailableError(code) from exc
+    except Exception as exc:
+        raise SourceObjectUnavailableError(str(type(exc).__name__)) from exc
+
+    etag = response.get("ETag")
+    metadata = ObjectMetadata(
+        key=key,
+        size_bytes=len(data),
+        content_type=response.get("ContentType"),
+        etag=etag.strip('"') if etag else None,
+    )
+    return ObjectContent(metadata=metadata, data=data)

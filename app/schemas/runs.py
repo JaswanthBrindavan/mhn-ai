@@ -1,4 +1,9 @@
-"""Request and response models for report-processing runs."""
+"""Request and response models for document-processing runs.
+
+The submitted unit of work is an uploaded document (an ``unclassified_files`` id).
+``reports_id`` on an item is set only once a document is classified as a report and
+moved into the ``reports`` table.
+"""
 
 import uuid
 from datetime import datetime
@@ -7,11 +12,11 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
-MAX_REPORTS_PER_RUN = 500
+MAX_DOCUMENTS_PER_RUN = 500
 
 
 class SubmitOutcome(StrEnum):
-    """What happened to each report id in a submission."""
+    """What happened to each document id in a submission."""
 
     CREATED = "created"
     #: An in-flight item already existed; it was reused rather than duplicated.
@@ -23,9 +28,13 @@ class SubmitOutcome(StrEnum):
 class CreateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    report_ids: Annotated[
+    document_ids: Annotated[
         list[int],
-        Field(min_length=1, max_length=MAX_REPORTS_PER_RUN, description="Report ids to process"),
+        Field(
+            min_length=1,
+            max_length=MAX_DOCUMENTS_PER_RUN,
+            description="unclassified_files ids to classify and process",
+        ),
     ]
 
     # AUDIT ONLY. This service performs no user-level authorization; Spring has
@@ -37,7 +46,7 @@ class CreateRunRequest(BaseModel):
 
     force_reprocess: bool = Field(
         default=False,
-        description="Re-run reports that already completed. Ignored for in-flight items.",
+        description="Re-run documents that already completed. Ignored for in-flight items.",
     )
 
 
@@ -48,7 +57,9 @@ class RunItemResponse(BaseModel):
 
     #: Exposed as `item_id`; read from the model's `id` attribute.
     item_id: uuid.UUID = Field(validation_alias="id")
-    report_id: int
+    document_id: int
+    #: The reports row created if this document was moved into the reports section.
+    reports_id: int | None = None
     status: str
     attempt_count: int
     last_error_code: str | None = None
@@ -59,7 +70,7 @@ class RunItemResponse(BaseModel):
 
 
 class SubmittedItem(BaseModel):
-    report_id: int
+    document_id: int
     item_id: uuid.UUID
     #: `queued` once the message is on the queue. Stays `pending` if publishing
     #: failed — the item is durable and the stale-item sweep will retry it.
