@@ -75,10 +75,12 @@ class AIProvider(Protocol):
         instruction: str,
         json_schema: dict[str, Any],
         max_tokens: int,
+        model: str | None = None,
     ) -> StructuredResponse:
         """Text-only structured generation, with no document attached.
 
         Insight generation reasons over the already-extracted, validated data rather than
         the raw file, so the model cannot introduce values that bypassed extraction.
+        ``model`` overrides the provider's default model for this call (None = default).
         """
         ...

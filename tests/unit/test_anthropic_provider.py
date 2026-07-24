@@ -109,6 +109,26 @@ def test_image_uses_an_image_block():
     assert block["type"] == "image"
 
 
+def test_upload_filename_is_sanitized_from_the_s3_key():
+    # Filenames are S3 keys ("uploads/demo/report.pdf"); the Files API rejects the '/'
+    # (forbidden character -> 400). The upload must send a safe basename.
+    client = _StubClient(_response())
+    doc = DocumentPayload(
+        data=b"%PDF-1.4",
+        content_type="application/pdf",
+        filename="uploads/demo/sample report (1).pdf",
+    )
+
+    _analyze(client, doc)
+
+    sent_filename = client.beta.files.uploaded[0][0]
+    assert "/" not in sent_filename
+    assert set(sent_filename) <= set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+    )
+    assert sent_filename.endswith(".pdf")
+
+
 def test_uploaded_file_is_always_deleted():
     client = _StubClient(_response())
     doc = DocumentPayload(data=b"%PDF", content_type="application/pdf", filename="r.pdf")

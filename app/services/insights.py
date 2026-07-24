@@ -120,6 +120,7 @@ def generate_insights(ctx: StageContext) -> None:
             instruction=instruction,
             json_schema=INSIGHTS_JSON_SCHEMA,
             max_tokens=INSIGHTS_MAX_TOKENS,
+            model=ctx.settings.ai_model_insights or None,
         )
     except AIProviderError as exc:
         _log(

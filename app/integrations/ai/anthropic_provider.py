@@ -11,6 +11,7 @@ can be reused across stages (classification now, extraction next).
 
 import io
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from app.integrations.ai.base import (
@@ -27,6 +28,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-4-8"
 _FILES_BETA = "files-api-2025-04-14"
+
+# The Files API rejects filenames with forbidden characters (path separators, etc.).
+# Our filenames are S3 keys like "uploads/demo/report.pdf" — always slash-bearing — so
+# reduce to a safe basename before upload. The name is cosmetic: we reference the file
+# by the returned file_id and delete it after the call.
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_upload_filename(name: str) -> str:
+    base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("_", base).strip("._")
+    return (cleaned or "document")[:255]
 
 
 class AnthropicProvider:
@@ -81,12 +94,14 @@ class AnthropicProvider:
         instruction: str,
         json_schema: dict[str, Any],
         max_tokens: int,
+        model: str | None = None,
     ) -> StructuredResponse:
+        chosen_model = model or self._model
         messages: Any = [{"role": "user", "content": [{"type": "text", "text": instruction}]}]
         output_config: Any = {"format": {"type": "json_schema", "schema": json_schema}}
         try:
             response = self._client.beta.messages.create(
-                model=self._model,
+                model=chosen_model,
                 max_tokens=max_tokens,
                 betas=[_FILES_BETA],
                 system=system,
@@ -96,12 +111,16 @@ class AnthropicProvider:
         except Exception as exc:
             raise AIProviderError(type(exc).__name__) from exc
 
-        return _to_structured_response(response, self._model)
+        return _to_structured_response(response, chosen_model)
 
     def _upload(self, document: DocumentPayload) -> str:
         try:
             uploaded = self._client.beta.files.upload(
-                file=(document.filename, io.BytesIO(document.data), document.content_type),
+                file=(
+                    _safe_upload_filename(document.filename),
+                    io.BytesIO(document.data),
+                    document.content_type,
+                ),
             )
         except Exception as exc:
             raise AIProviderError(type(exc).__name__) from exc
