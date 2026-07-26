@@ -11,3 +11,4 @@ alembic==1.18.5
 psycopg[binary]==3.3.4
 boto3==1.43.53
 anthropic==0.117.1
+pypdf==6.14.2

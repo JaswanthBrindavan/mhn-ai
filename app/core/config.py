@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # Comma-separated rather than a JSON list so .env stays human-editable.
     allowed_content_types: str = "application/pdf,image/jpeg,image/png"
 
+    # Pages of a PDF sent to the classifier (the type is evident from the first pages,
+    # so extraction re-reads the whole document but classification need not). 0 disables
+    # trimming and sends the full document.
+    classify_max_pages: int = 2
+
     # --- AI provider --------------------------------------------------------
     ai_provider: str = "anthropic"
     ai_model: str = ""
