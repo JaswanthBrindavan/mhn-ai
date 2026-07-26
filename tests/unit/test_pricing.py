@@ -22,8 +22,20 @@ def test_cache_reads_and_writes_are_priced():
     assert estimate_cost_usd("claude-opus-4-8", usage) == Decimal("6.750000")
 
 
+def test_dated_snapshot_id_prices_same_as_alias():
+    # response.model is the dated snapshot (claude-haiku-4-5-20251001); the price table
+    # is keyed by alias. The dated id must price identically, not fall through to $0.
+    usage = AIUsage(input_tokens=76_828, output_tokens=87)
+    dated = estimate_cost_usd("claude-haiku-4-5-20251001", usage)
+    alias = estimate_cost_usd("claude-haiku-4-5", usage)
+    assert dated == alias
+    assert dated > Decimal("0")
+
+
 def test_unknown_model_costs_zero_rather_than_guessing():
     assert estimate_cost_usd("some-unlisted-model", AIUsage(1000, 1000)) == Decimal("0")
+    # A dated suffix on an unknown alias still resolves to nothing, not a guess.
+    assert estimate_cost_usd("mystery-model-20260101", AIUsage(1000, 1000)) == Decimal("0")
 
 
 def test_zero_usage_is_zero():

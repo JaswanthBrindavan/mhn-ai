@@ -6,6 +6,7 @@ they change. Cache reads bill at ~0.1x input, cache writes at ~1.25x input (5-mi
 TTL) — the standard Anthropic multipliers.
 """
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -14,6 +15,10 @@ from app.integrations.ai.base import AIUsage
 _PER_MILLION = Decimal(1_000_000)
 _CACHE_READ_MULTIPLIER = Decimal("0.1")
 _CACHE_WRITE_MULTIPLIER = Decimal("1.25")
+# The API resolves an alias to a dated snapshot id (e.g. "claude-haiku-4-5" ->
+# "claude-haiku-4-5-20251001"), and response.model carries the dated form. The price
+# table is keyed by alias, so strip a trailing -YYYYMMDD before falling back.
+_DATE_SUFFIX = re.compile(r"-\d{8}$")
 
 
 @dataclass(frozen=True)
@@ -35,7 +40,8 @@ PRICES: dict[str, ModelPrice] = {
 
 def estimate_cost_usd(model: str, usage: AIUsage) -> Decimal:
     """Best-effort USD cost for one call. Returns 0 for an unpriced model."""
-    price = PRICES.get(model)
+    # Exact match first; then retry with any dated snapshot suffix stripped.
+    price = PRICES.get(model) or PRICES.get(_DATE_SUFFIX.sub("", model))
     if price is None:
         return Decimal("0")
 
