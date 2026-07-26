@@ -3,12 +3,13 @@ name: mhn-ai
 # Local development topology.
 #
 # Every dependency must be swappable by environment variable alone, with no code
-# changes: DATABASE_URL for Postgres, AWS_ENDPOINT_URL for S3/SQS. The throwaway
-# containers therefore live behind the `localdev` profile.
+# changes: DATABASE_URL for Postgres, AWS_ENDPOINT_URL for S3/SQS. S3 and SQS point
+# at real AWS (credentials + queue URLs in .env); only the throwaway Postgres lives
+# behind the `localdev` profile.
 #
-#   docker compose --profile localdev up -d                  # everything, offline
+#   docker compose --profile localdev up -d                   # api + worker + local Postgres
 #   docker compose --profile localdev up -d --scale worker=3  # exercise parallelism
-#   docker compose up -d                                     # app only, real infrastructure
+#   docker compose up -d                                      # api + worker only (real DB + AWS)
 
 x-app: &app
   build:
@@ -19,11 +20,13 @@ x-app: &app
     # host-oriented value in .env; it is the only place that substitution happens.
     DATABASE_URL: ${DATABASE_URL_CONTAINER:-postgresql+psycopg://postgres:postgres@db:5432/mhn_ai}
     AWS_REGION: ${AWS_REGION:-ap-south-1}
-    AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL_CONTAINER-http://localstack:4566}
-    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
-    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
-    S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
-    S3_BUCKET: ${S3_BUCKET:-mhn-reports-local}
+    # Empty endpoint => real AWS; credentials come from .env via the default boto3 chain.
+    AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-false}
+    S3_BUCKET: ${S3_BUCKET:-}
     SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
     SQS_DLQ_URL: ${SQS_DLQ_URL:-}
     SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
@@ -83,28 +86,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
-    restart: unless-stopped
-
-  localstack:
-    image: localstack/localstack:3.8
-    profiles: ["localdev"]
-    container_name: mhn-ai-localstack
-    environment:
-      SERVICES: s3,sqs
-      AWS_DEFAULT_REGION: ${AWS_REGION:-ap-south-1}
-      S3_BUCKET: ${S3_BUCKET:-mhn-reports-local}
-      QUEUE_NAME: ${QUEUE_NAME:-report-processing}
-      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
-    ports:
-      - "${LOCALSTACK_HOST_PORT:-4566}:4566"
-    volumes:
-      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
-    healthcheck:
-      test: ["CMD-SHELL", "awslocal sqs list-queues && awslocal s3 ls"]
-      interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 15s
     restart: unless-stopped
 
 volumes:
