@@ -16,6 +16,7 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 
 import logging
 import time
+from dataclasses import replace
 from enum import StrEnum
 from typing import Any
 
@@ -25,6 +26,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.integrations.ai.base import AIProviderError
 from app.models.ai_results import AiReportClassification
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
+from app.services.pdf_pages import limit_pdf_pages
 from app.services.source_loading import load_source_document
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 
@@ -125,6 +127,11 @@ INSTRUCTION = "Classify the attached document into one section."
 def classify_report(ctx: StageContext) -> None:
     """Stage entrypoint: classify the document, persist, and gate the pipeline."""
     document = load_source_document(ctx)
+    # The document type is evident from the first pages; send only those to the
+    # classifier. Extraction still reads the whole document.
+    document = replace(
+        document, data=limit_pdf_pages(document.data, ctx.settings.classify_max_pages)
+    )
 
     started = time.perf_counter()
     try:
