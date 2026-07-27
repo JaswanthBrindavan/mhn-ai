@@ -32,6 +32,12 @@ exclude = ["^alembic/versions/"]
 module = ["tests.*"]
 disallow_untyped_defs = false
 
+# PyMuPDF and pytesseract ship no stubs and no py.typed marker. They are confined to
+# app/insights/ocr.py, which wraps them behind typed dataclasses.
+[[tool.mypy.overrides]]
+module = ["fitz.*", "pytesseract.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
