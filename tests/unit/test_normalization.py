@@ -109,3 +109,26 @@ def test_enrich_result_leaves_non_numeric_unflagged():
     assert enriched["value_numeric"] is None
     assert enriched["abnormal_flag"] is None
     assert enriched["normalized"] is False
+
+
+def test_enrich_result_defaults_to_report_range_source():
+    enriched = enrich_result({"test_name": "Glucose", "value": "95", "reference_range": "70-99"})
+    assert enriched["abnormal_flag"] == "normal"  # 95 in 70-99
+    assert enriched["range_source"] == "report_range"
+    assert enriched["matched_parameter"] is None
+    assert enriched["matched_group"] is None
+
+
+def test_override_bounds_win_over_report_range():
+    result = {"test_name": "Glucose", "value": "95", "reference_range": "70-99"}
+    # Report range says 95 is normal; the approved ideal range (70-90) says high.
+    enriched = enrich_result(
+        result,
+        override_bounds=(70.0, 90.0),
+        matched_parameter="Fasting Glucose",
+        matched_group="adult male",
+    )
+    assert enriched["abnormal_flag"] == "high"
+    assert enriched["range_source"] == "ideal_range"
+    assert enriched["matched_parameter"] == "Fasting Glucose"
+    assert enriched["matched_group"] == "adult male"

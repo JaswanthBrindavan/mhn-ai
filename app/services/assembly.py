@@ -24,7 +24,9 @@ from app.models.ai_results import (
 )
 
 #: Version of the reports.content["ai"] shape, so consumers can migrate on change.
-CONTENT_SCHEMA_VERSION = "1.0"
+#: 1.1 — extraction results gained range_source/matched_parameter/matched_group and the
+#: extraction payload gained patient_age/patient_gender (approved-THP ideal-range override).
+CONTENT_SCHEMA_VERSION = "1.1"
 
 
 def build_content(session: Session, item_id: UUID) -> dict[str, Any]:
