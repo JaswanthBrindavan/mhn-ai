@@ -8,6 +8,9 @@ CLAUDE.md
 implementation.md
 docs/
 
+# Local test documents — never commit patient data.
+Sample reports/
+
 # Python
 .venv/
 __pycache__/
