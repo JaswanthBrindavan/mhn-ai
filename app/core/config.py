@@ -43,7 +43,10 @@ class Settings(BaseSettings):
     sqs_wait_time_seconds: int = 20
 
     # --- File validation ----------------------------------------------------
-    max_file_bytes: int = 26_214_400
+    # 50 MiB. Merged multi-image PDFs (Spring stitches reordered photos into one PDF)
+    # run larger than native reports; uploads go through the Files API (500 MB ceiling),
+    # so this is our own guard, not an API limit.
+    max_file_bytes: int = 52_428_800
     # Comma-separated rather than a JSON list so .env stays human-editable.
     allowed_content_types: str = "application/pdf,image/jpeg,image/png"
 
