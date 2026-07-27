@@ -18,15 +18,16 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
 from app.models.ai_results import AiReportExtraction
-from app.services import normalization
+from app.services import ideal_ranges, normalization
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
 from app.services.source_loading import load_source_document
+from app.services.thp_fallback import FallbackEntry, record_fallbacks
 from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ext-2026-07-23"
-SCHEMA_VERSION = "ext-1"
+PROMPT_VERSION = "ext-2026-07-27"
+SCHEMA_VERSION = "ext-2"
 STAGE_NAME = "extracting"
 #: Reports can carry many analytes; give the model room but keep it bounded.
 EXTRACT_MAX_TOKENS = 8192
@@ -49,6 +50,10 @@ class DocumentExtraction(BaseModel):
 
     results: list[ExtractedLabResult]
     report_date: str | None = Field(default=None, max_length=64)
+    #: Patient demographics as printed on the report (free text: "23", "6 months", "M").
+    #: Drive the age-group ideal-range lookup; parsed in Python, never by the model.
+    patient_age: str | None = Field(default=None, max_length=32)
+    patient_gender: str | None = Field(default=None, max_length=32)
 
 
 #: Structured-output schema. Same constraints as classification: no numeric/length
@@ -81,8 +86,10 @@ EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
             },
         },
         "report_date": _NULLABLE_STR,
+        "patient_age": _NULLABLE_STR,
+        "patient_gender": _NULLABLE_STR,
     },
-    "required": ["results", "report_date"],
+    "required": ["results", "report_date", "patient_age", "patient_gender"],
     "additionalProperties": False,
 }
 
@@ -101,7 +108,11 @@ SYSTEM_PROMPT = (
     "- observed_date: the date this specimen/result is dated, if shown, or null.\n"
     "- source_context: a short snippet of surrounding label text that identifies the row, "
     "or null. Do not copy patient identifiers.\n\n"
-    "Also return report_date: the report's overall date if shown, else null.\n\n"
+    "Also return report_date: the report's overall date if shown, else null.\n"
+    "Also return patient_age and patient_gender exactly as printed (for example '23', "
+    "'6 months', 'M', 'Female'), or null if not shown. These demographics select the "
+    "correct reference range; they are not patient identifiers, so returning them is "
+    "expected. Do not infer or compute them.\n\n"
     "Transcribe only what is present. If the document has no tabular results (for example "
     "a discharge summary), return an empty results list. Never invent values or ranges."
 )
@@ -158,20 +169,78 @@ def extract_report(ctx: StageContext) -> None:
         )
         raise TransientStageError("extraction output failed validation") from exc
 
-    payload = _normalize(result)
+    # Resolve approved-THP ideal ranges (age-group) when enabled; otherwise behaviour is
+    # exactly as before (report's own reference range drives the flag).
+    if ctx.settings.ideal_ranges_enabled:
+        lookup: ideal_ranges.Lookup | None = ideal_ranges.load_lookup(ctx.session)
+        ladder = ideal_ranges.build_group_ladder(result.patient_age, result.patient_gender)
+        demographics = ideal_ranges.has_demographics(result.patient_age, result.patient_gender)
+    else:
+        lookup, ladder, demographics = None, [], False
+
+    payload, fallbacks = _normalize(result, lookup, ladder, demographics)
     _persist_extraction(ctx, payload)
+    if lookup is not None:
+        # Always call (even with no fallbacks) to clear a prior attempt's worklist rows.
+        record_fallbacks(ctx, fallbacks)
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
 
 
 # --- helpers ----------------------------------------------------------------
 
 
-def _normalize(result: DocumentExtraction) -> dict[str, Any]:
-    """Enrich each result with the deterministic (Python-computed) fields."""
-    return {
-        "results": [normalization.enrich_result(r.model_dump()) for r in result.results],
+def _normalize(
+    result: DocumentExtraction,
+    lookup: ideal_ranges.Lookup | None,
+    ladder: list[str],
+    demographics_present: bool,
+) -> tuple[dict[str, Any], list[FallbackEntry]]:
+    """Enrich each result deterministically, applying the approved ideal-range override
+    when one resolves. Returns the persisted payload and any R&D worklist fallbacks."""
+    enriched: list[dict[str, Any]] = []
+    fallbacks: list[FallbackEntry] = []
+
+    for r in result.results:
+        data = r.model_dump()
+        if lookup is None:  # feature off — unchanged behaviour, no worklist
+            enriched.append(normalization.enrich_result(data))
+            continue
+
+        res = ideal_ranges.resolve(data["test_name"], lookup, ladder)
+        if res.bounds is not None:
+            enriched.append(
+                normalization.enrich_result(
+                    data,
+                    override_bounds=res.bounds,
+                    matched_parameter=res.matched_parameter,
+                    matched_group=res.matched_group,
+                )
+            )
+            continue
+
+        enriched.append(normalization.enrich_result(data))
+        # Log real curation gaps (unmatched/unapproved always; no_ideal_range only when the
+        # report actually gave demographics — otherwise the gap is the report's, not R&D's).
+        if res.reason != "no_ideal_range" or demographics_present:
+            fallbacks.append(
+                FallbackEntry(
+                    test_name=data["test_name"],
+                    reason=res.reason or "no_ideal_range",
+                    matched_parameter=res.matched_parameter,
+                    group_attempted=ladder[0] if ladder else None,
+                    patient_age=result.patient_age,
+                    patient_gender=result.patient_gender,
+                    report_reference_range=data.get("reference_range"),
+                )
+            )
+
+    payload = {
+        "results": enriched,
         "report_date": result.report_date,
+        "patient_age": result.patient_age,
+        "patient_gender": result.patient_gender,
     }
+    return payload, fallbacks
 
 
 def _persist_extraction(ctx: StageContext, payload: dict[str, Any]) -> None:

@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import (
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -96,8 +97,11 @@ class AiReportExtraction(Base):
     document_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
     #: {"results": [ {test_name, value, unit, reference_range, observed_date,
-    #: source_context, value_numeric, abnormal_flag, normalized_value, normalized_unit,
-    #: normalized}, ... ], "report_date": ...}
+    #: source_context, value_numeric, abnormal_flag, range_source, matched_parameter,
+    #: matched_group, normalized_value, normalized_unit, normalized}, ... ],
+    #: "report_date": ..., "patient_age": ..., "patient_gender": ...}
+    #: range_source is "ideal_range" when an approved-THP age-group range drove the flag,
+    #: else "report_range" (the report's own printed range).
     data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -208,4 +212,56 @@ class AiProcessLog(Base):
         UniqueConstraint(
             "run_item_id", "stage", "attempt", name="uq_ai_process_logs_item_stage_attempt"
         ),
+    )
+
+
+class AiThpFallback(Base):
+    """R&D worklist: one row per extracted test where we fell back to the report's own
+    reference range because no approved-THP ideal range applied.
+
+    ``reason`` tells R&D what to fix — ``unmatched`` (the test is not a known parameter),
+    ``unapproved`` (the parameter exists but isn't doctor-approved), or ``no_ideal_range``
+    (approved, but no ideal range for the patient's age group). Many rows per run item;
+    a re-run replaces this item's rows (delete-then-insert), so there are no duplicates.
+    Never surfaced in ``reports.content`` — internal curation signal only.
+    """
+
+    __tablename__ = "ai_thp_fallbacks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+        default=uuid.uuid4,
+    )
+    run_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai_processing_run_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: The source document (an unclassified_files id).
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    test_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    #: The approved/known parameter this matched, if any (null when reason is unmatched).
+    matched_parameter: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    #: The most-specific age-group key we tried (null when there was no demographic to try).
+    group_attempted: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: unmatched | unapproved | no_ideal_range
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    #: Demographics the report gave us (context for R&D; not identifiers).
+    patient_age: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    patient_gender: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: The report's own printed range that we fell back to (for R&D to sanity-check).
+    report_reference_range: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_ai_thp_fallbacks_reason", "reason"),
+        Index("ix_ai_thp_fallbacks_matched_parameter", "matched_parameter"),
+        Index("ix_ai_thp_fallbacks_run_item_id", "run_item_id"),
     )

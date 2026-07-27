@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     ai_max_tokens: int = 16000
     anthropic_api_key: str = ""
 
+    # --- Ideal ranges (approved-THP override) -------------------------------
+    # When on, extraction overrides the report's reference range with the R&D-approved
+    # ideal range for the patient's age group (Spring-owned parameter tables). OFF by
+    # default: those tables do not exist in the Spring DB yet, so enabling before they
+    # land would break the lookup. Flip on only after the tables + approval predicate
+    # are confirmed. See docs/superpowers/specs and app/services/ideal_ranges.py.
+    ideal_ranges_enabled: bool = False
+
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""
     log_level: str = "INFO"

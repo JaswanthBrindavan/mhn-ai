@@ -93,16 +93,35 @@ def convert_unit(test_name: str, value: float | None, unit: str | None) -> tuple
     return None
 
 
-def enrich_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Add the deterministic fields to one extracted result. Pure; returns a new dict."""
+def enrich_result(
+    result: dict[str, Any],
+    *,
+    override_bounds: tuple[float | None, float | None] | None = None,
+    range_source: str = "report_range",
+    matched_parameter: str | None = None,
+    matched_group: str | None = None,
+) -> dict[str, Any]:
+    """Add the deterministic fields to one extracted result. Pure; returns a new dict.
+
+    ``override_bounds`` is the R&D-approved ideal range for the patient's age group; when
+    given it drives the abnormal flag instead of the report's printed reference range, and
+    ``range_source`` is forced to ``"ideal_range"``. Without it, behaviour is unchanged
+    (bounds parsed from ``reference_range``, ``range_source`` stays ``"report_range"``)."""
     value = parse_number(result.get("value"))
-    bounds = parse_reference_range(result.get("reference_range"))
+    if override_bounds is not None:
+        bounds: tuple[float | None, float | None] | None = override_bounds
+        range_source = "ideal_range"
+    else:
+        bounds = parse_reference_range(result.get("reference_range"))
     conv = convert_unit(result.get("test_name", ""), value, result.get("unit"))
 
     return {
         **result,
         "value_numeric": value,
         "abnormal_flag": abnormal_flag(value, bounds),
+        "range_source": range_source,
+        "matched_parameter": matched_parameter,
+        "matched_group": matched_group,
         "normalized_value": conv[0] if conv else None,
         "normalized_unit": conv[1] if conv else None,
         "normalized": conv is not None,
@@ -133,3 +152,12 @@ if __name__ == "__main__":  # pragma: no cover - self-check
     assert convert_unit("Hemoglobin", 14, "g/dL") == (140.0, "g/L")
     assert convert_unit("WBC", 7000, "/µL") == (7.0, "10^9/L")
     assert convert_unit("Sodium", 140, "mmol/L") is None  # outside the table
+    # override_bounds wins over the report range: 100 is normal for 70-99? no -> high,
+    # but the approved ideal (70, 90) also says high; prove the override drives it by
+    # using an ideal range that DISAGREES with the report range.
+    _report = {"value": "95", "reference_range": "70-99", "unit": None, "test_name": "Glucose"}
+    assert enrich_result(_report)["abnormal_flag"] == "normal"  # report range: 95 in 70-99
+    _over = enrich_result(_report, override_bounds=(70.0, 90.0), matched_group="adult all")
+    assert _over["abnormal_flag"] == "high"  # ideal range 70-90: 95 is high
+    assert _over["range_source"] == "ideal_range"
+    assert _over["matched_group"] == "adult all"

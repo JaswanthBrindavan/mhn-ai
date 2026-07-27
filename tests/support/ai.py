@@ -52,6 +52,8 @@ def extraction_payload(**overrides: Any) -> dict[str, Any]:
             }
         ],
         "report_date": "2026-07-20",
+        "patient_age": "45",
+        "patient_gender": "Male",
     }
     payload.update(overrides)
     return payload
