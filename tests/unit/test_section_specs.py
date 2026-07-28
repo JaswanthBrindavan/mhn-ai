@@ -6,8 +6,9 @@ lands in ``ai_section_extractions`` — validated fields, ISO dates, and data-qu
 
 import pytest
 
-from app.insights.extraction import build_payload
-from app.insights.sections import (
+from app.services.classification import DocumentSection
+from app.services.section_extraction import build_payload
+from app.services.section_specs import (
     SECTION_SPECS,
     SUPPORTED_SECTIONS,
     InsuranceFields,
@@ -15,7 +16,6 @@ from app.insights.sections import (
     VaccinationFields,
     spec_for,
 )
-from app.services.classification import DocumentSection
 
 
 def test_every_spec_is_self_consistent():

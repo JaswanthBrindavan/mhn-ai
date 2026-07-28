@@ -10,8 +10,8 @@ import fitz
 import pytest
 from sqlalchemy import text
 
-from app.insights.extraction import extract_section
 from app.integrations.ai.base import AIProviderError
+from app.services.section_extraction import extract_section
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 from tests.support.ai import FakeAIProvider, structured_response
 

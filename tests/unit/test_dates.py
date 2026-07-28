@@ -8,7 +8,7 @@ from datetime import date, datetime
 
 import pytest
 
-from app.insights.dates import display_date, in_order, iso_date, parse_date
+from app.services.dates import display_date, in_order, iso_date, parse_date
 
 
 @pytest.mark.parametrize(

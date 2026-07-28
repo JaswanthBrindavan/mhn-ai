@@ -10,12 +10,10 @@ extract its TEXT (embedded layer first, Tesseract OCR for image-only pages), ask
 model for that section's fields under a fixed schema, validate with Pydantic (never
 repaired), normalise dates in Python (never the model), then persist and log.
 
-The model is given extracted text, not the file. That means the raw document never
-leaves as an image payload, the token cost is bounded by the text rather than the page
-count, and — most usefully — a failure is attributable: OCR metadata is stored beside
-the result, so a missing field can be traced to a poor scan rather than blamed on the
-model. The trade is that OCR is now the accuracy ceiling; whatever it drops, the model
-cannot recover.
+The model is given the extracted text, not the file — the opposite of what the report
+pipeline does. ``app.services.ocr`` carries that argument and what it costs; the part
+that matters here is that OCR provenance is stored in the payload, so a missing field
+can be traced to a bad scan rather than blamed on the model.
 
 Dates are normalised here rather than trusted from the model, for the same reason
 extraction computes abnormal flags in Python: a deterministic rule beats a prompt. An
@@ -25,6 +23,12 @@ silently stored as fact.
 
 Idempotent: the extraction row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
+
+Not yet wired in. ``STAGE_SEQUENCE`` does not include this stage and ``classify_report``
+still rejects every non-report section, so behaviour today is unchanged. Connecting it
+needs a decision on how the sequence branches — a report runs
+``extract_report -> generate_insights``, a section runs this and stops — which is a
+change to the sequence's shape rather than a line to append.
 """
 
 import logging
@@ -35,13 +39,13 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.insights.dates import in_order, iso_date
-from app.insights.ocr import ExtractedText, TextExtractionError, extract_text
-from app.insights.sections import INSTRUCTION_PREFIX, SectionSpec, spec_for
 from app.integrations.ai.base import AIProviderError
 from app.models.ai_results import AiReportClassification, AiSectionExtraction
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
 from app.services.classification import DocumentSection
+from app.services.dates import in_order, iso_date
+from app.services.ocr import ExtractedText, TextExtractionError, extract_text
+from app.services.section_specs import INSTRUCTION_PREFIX, SectionSpec, spec_for
 from app.services.source_loading import load_source_document
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 

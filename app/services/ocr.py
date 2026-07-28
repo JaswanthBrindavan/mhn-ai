@@ -4,15 +4,37 @@ Per page, in order of preference:
 
 1. **Embedded text layer** (a digitally generated PDF) — read it with PyMuPDF. Exact,
    free, and instant. Most insurance policies and lab reports arrive this way.
-2. **Image-only page or an image file** — rasterise and OCR with Tesseract.
+2. **Image-only page or an image file** — rasterise at ``RASTER_DPI`` and OCR with
+   Tesseract, keeping the word-level confidence.
 
 The distinction matters for accuracy, not just cost: a text layer is what the document
 *says*, while OCR is a best guess at what it looks like. Where a text layer exists it is
 always the better source, so it is never overridden.
 
-Extracted text is handed to the insight step and then discarded — it is never persisted.
-Only small non-PII metadata (engine, confidence, page counts) is kept, which is what
-lets a reviewer tell "the model missed it" from "OCR never saw it".
+Measured on the sample documents — each one first as issued, then rasterised to force
+the OCR path:
+
+    Chest X-Ray               1,424 chars in  3 ms  ->  1,358 chars, confidence 0.91
+    Insurance receipt         1,669 chars in  9 ms  ->  1,467 chars, confidence 0.91
+    Vaccination certificate   1,251 chars in 48 ms  ->  1,352 chars, confidence 0.76
+
+Every sample is digital, so in practice the text layer handles them and OCR never runs.
+It exists for the phone photo of a vaccination card.
+
+**Why extract text at all**, rather than hand the file to the model as the report
+pipeline does: the token cost becomes bounded by the text rather than the page count,
+and — more usefully — a failure becomes attributable. The engine, page counts and mean
+confidence are stored beside every extraction, so a missing field can be traced to a bad
+scan instead of blamed on the model. The cost of that bet is real: OCR becomes the
+accuracy ceiling, because whatever Tesseract drops the model never sees.
+
+Extracted text is handed to the model and then discarded — it is never persisted. Only
+the small non-PII metadata from ``as_metadata()`` is kept, which is what lets a reviewer
+tell "the model missed it" from "OCR never saw it".
+
+OCR needs the **Tesseract binary**, which ``pytesseract`` only binds to. Without it
+digital PDFs still work — a text layer needs no binary — and scanned ones fail.
+``TESSERACT_CMD`` overrides the binary path when it is not on ``PATH``.
 
 Hard caps bound the work so a pathological upload cannot hold an SQS message past its
 visibility timeout.

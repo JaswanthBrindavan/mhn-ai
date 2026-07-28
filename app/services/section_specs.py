@@ -1,15 +1,16 @@
 """What each non-report section extracts: prompt, schema, and validated shape.
 
-One ``SectionSpec`` per section. The stage in ``app.insights.extraction`` is generic and
-reads this, so adding a section is an entry here plus a Pydantic model — no new stage
-code and no change to the worker.
+One ``SectionSpec`` per section. The stage in ``app.services.section_extraction`` is
+generic and reads this, so adding a section is an entry in ``SECTION_SPECS`` plus a
+Pydantic model, a hand-written schema and a prompt — no new stage code, and nothing to
+change in the persistence, the logging or the worker.
 
 Every schema follows the same rules as classification and extraction: hand-written to
 stay inside what ``json_schema`` structured output supports — no numeric or length
 constraints, ``additionalProperties`` false, every field required, nullable expressed as
 a union. Length limits live on the Pydantic model, which is what actually validates.
 
-Dates are requested as ``DD/MM/YYYY`` but never trusted: ``app.insights.dates``
+Dates are requested as ``DD/MM/YYYY`` but never trusted: ``app.services.dates``
 normalises whatever comes back before it is stored.
 """
 

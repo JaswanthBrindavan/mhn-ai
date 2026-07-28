@@ -8,7 +8,8 @@ committing a binary fixture.
 import fitz
 import pytest
 
-from app.insights.ocr import (
+from app.integrations.ai.base import DocumentPayload
+from app.services.ocr import (
     MIN_TEXT_CHARS,
     ExtractedText,
     PageText,
@@ -16,7 +17,6 @@ from app.insights.ocr import (
     extract_text,
     tesseract_available,
 )
-from app.integrations.ai.base import DocumentPayload
 
 needs_tesseract = pytest.mark.skipif(
     not tesseract_available(), reason="Tesseract binary not installed"
