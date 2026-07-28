@@ -203,7 +203,7 @@ def _normalize(
     for r in result.results:
         data = r.model_dump()
         if lookup is None:  # feature off — unchanged behaviour, no worklist
-            enriched.append(normalization.enrich_result(data))
+            enriched.append(normalization.enrich_result(data, gender=result.patient_gender))
             continue
 
         res = ideal_ranges.resolve(data["test_name"], lookup, ladder)
@@ -214,11 +214,12 @@ def _normalize(
                     override_bounds=res.bounds,
                     matched_parameter=res.matched_parameter,
                     matched_group=res.matched_group,
+                    gender=result.patient_gender,
                 )
             )
             continue
 
-        enriched.append(normalization.enrich_result(data))
+        enriched.append(normalization.enrich_result(data, gender=result.patient_gender))
         # Log real curation gaps (unmatched/unapproved always; no_ideal_range only when the
         # report actually gave demographics — otherwise the gap is the report's, not R&D's).
         if res.reason != "no_ideal_range" or demographics_present:
