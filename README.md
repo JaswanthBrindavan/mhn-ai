@@ -55,7 +55,9 @@ Design notes worth knowing before reading the code:
   redelivered message can only redo work, never duplicate it.
 - **The model transcribes; Python decides.** Abnormal/out-of-range flags and unit conversion
   are deterministic application code, never model arithmetic. Model output is validated with
-  Pydantic and never silently repaired.
+  Pydantic and never silently repaired. Where a reading is genuinely ambiguous — a censored
+  value like `< 200` against a range it might sit either side of — the flag is left unset
+  rather than guessed.
 - **Insights are informational only** — no diagnosis, no emergency instruction, no medical
   certainty. A disclaimer is always stored alongside them.
 - **Source files stay private in S3.** The service handles object keys, never public URLs.
@@ -75,6 +77,7 @@ decision and re-authorizes on read.
 - AWS S3 (source documents) + SQS (work queue, with a DLQ)
 - Anthropic Claude (per-stage models: a fast model for classification and extraction, a
   stronger one for insights)
+- pypdfium2 — the single PDF library, used to trim documents for the classifier
 - Docker Compose
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
@@ -197,6 +200,8 @@ money and no test writes to Spring-owned tables.
 - [x] Per-stage models and AI cost/token logging
 - [x] Approved-THP age-group ideal-range override (behind `IDEAL_RANGES_ENABLED`, off until
       the Spring parameter tables and the approval predicate are confirmed)
+- [x] Reference-range parsing for the shapes labs actually print, and flags for non-numeric
+      results (censored, present/absent, qualitative)
 - [ ] Additional sections (scans/imaging, prescriptions, insurance) via a section-dispatch
       table — reusing the one worker and one queue, not adding new ones
 - [ ] Stale-item reaper for interrupted work
