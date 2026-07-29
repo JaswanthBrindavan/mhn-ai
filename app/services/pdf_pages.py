@@ -8,12 +8,17 @@ or fails to trim, is returned unchanged so classification never breaks over it.
 Detection is by file signature (the ``%PDF`` magic), not the declared MIME type, so a
 mislabelled upload is still handled correctly. Logs carry page counts and error types
 only — never document content.
+
+Built on ``pypdfium2`` (PDFium, BSD-3/Apache-2.0), the service's single PDF library. It
+was measured against pypdf, PyMuPDF and pdfplumber on the sample reports: fastest of the
+four, the only permissively-licensed one that can also rasterise pages, and the only one
+besides PyMuPDF whose text preserves column order. See ``docs/extraction-cost-options.md``.
 """
 
 import io
 import logging
 
-from pypdf import PdfReader, PdfWriter
+import pypdfium2 as pdfium
 
 logger = logging.getLogger(__name__)
 
@@ -33,23 +38,28 @@ def limit_pdf_pages(data: bytes, max_pages: int) -> bytes:
         logger.debug("pdf_trim_skipped_not_pdf")
         return data
 
+    source = trimmed = None
     try:
-        reader = PdfReader(io.BytesIO(data))
-        pages_before = len(reader.pages)
+        source = pdfium.PdfDocument(data)
+        pages_before = len(source)
         if pages_before <= max_pages:
             logger.debug("pdf_trim_skipped_within_limit", extra={"pages": pages_before})
             return data
 
-        writer = PdfWriter()
-        for page in reader.pages[:max_pages]:
-            writer.add_page(page)
+        trimmed = pdfium.PdfDocument.new()
+        trimmed.import_pages(source, list(range(max_pages)))
         buffer = io.BytesIO()
-        writer.write(buffer)
+        trimmed.save(buffer)
     except Exception as exc:
         # Best effort: a trim failure forfeits the saving for this document, never the
         # classification. Log the exception type only (no content).
         logger.warning("pdf_trim_failed", extra={"error_type": type(exc).__name__})
         return data
+    finally:
+        # PDFium holds native handles; these are not garbage-collected for us.
+        for document in (trimmed, source):
+            if document is not None:
+                document.close()
 
     logger.info("pdf_trimmed", extra={"pages_before": pages_before, "pages_after": max_pages})
     return buffer.getvalue()

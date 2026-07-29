@@ -11,4 +11,6 @@ alembic==1.18.5
 psycopg[binary]==3.3.4
 boto3==1.43.53
 anthropic==0.117.1
-pypdf==6.14.2
+# The service's single PDF library (PDFium, BSD-3/Apache-2.0). Chosen over pypdf,
+# PyMuPDF and pdfplumber on measurements — see docs/extraction-cost-options.md.
+pypdfium2==5.12.1

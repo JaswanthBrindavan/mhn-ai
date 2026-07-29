@@ -32,6 +32,12 @@ exclude = ["^alembic/versions/"]
 module = ["tests.*"]
 disallow_untyped_defs = false
 
+# pypdfium2 ships no py.typed marker. It is confined to app/services/pdf_pages.py, which
+# wraps it behind a bytes-in/bytes-out function.
+[[tool.mypy.overrides]]
+module = ["pypdfium2.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
