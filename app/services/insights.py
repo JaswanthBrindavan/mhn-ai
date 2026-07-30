@@ -7,8 +7,8 @@ disclaimer, then persist to ``ai_report_insights`` and a process log.
 
 Insights are informational only — never a diagnosis, emergency instruction, or medical
 certainty. That is enforced by the system prompt; a fixed disclaimer is always stored
-alongside them. When there are no extracted results there is nothing to interpret, so the
-model call is skipped entirely.
+alongside them. When there is nothing to interpret — no extracted results, or every
+result determined to be in range — the model call is skipped entirely.
 
 Idempotent: the insights row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
@@ -30,7 +30,7 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ins-2026-07-24"
+PROMPT_VERSION = "ins-2026-07-28"
 SCHEMA_VERSION = "ins-1"
 STAGE_NAME = "generating_insights"
 INSIGHTS_MAX_TOKENS = 4096
@@ -40,6 +40,10 @@ DISCLAIMER = (
     "These insights are informational only and are not a medical diagnosis or advice. "
     "Discuss your results with a qualified healthcare professional."
 )
+
+#: Stored instead of insights when every result was determined to be in range. States
+#: what the data shows, without interpreting it.
+ALL_IN_RANGE_SUMMARY = "All extracted results fall within their reference ranges."
 
 
 class Insight(BaseModel):
@@ -86,11 +90,13 @@ SYSTEM_PROMPT = (
     "- Base every statement ONLY on the structured results provided. Do not infer, "
     "convert, or invent values, units, or ranges.\n"
     "- The 'abnormal_flag' field is authoritative: it was computed by the system, not by "
-    "you. Do not re-judge whether a value is in range.\n\n"
-    "For a result flagged 'low' or 'high', you may note in plain language that it is "
-    "outside the typical reference range and suggest discussing it with a healthcare "
-    "professional. For an insight, cite the relevant test name(s) in related_tests. If "
-    "nothing is noteworthy, return an empty insights list."
+    "you. Do not re-judge whether a value is in range.\n"
+    "- Do NOT add a 'discuss this with your doctor/healthcare provider' line to your "
+    "insights. A disclaimer saying exactly that is attached to every set of insights; "
+    "repeating it per result is noise.\n\n"
+    "For a result flagged 'low' or 'high', note in plain language what the test measures "
+    "and that this value sits outside the typical reference range. Cite the relevant test "
+    "name(s) in related_tests. If nothing is noteworthy, return an empty insights list."
 )
 
 INSTRUCTION_PREFIX = (
@@ -104,10 +110,11 @@ def generate_insights(ctx: StageContext) -> None:
     extraction = _load_extraction(ctx)
     results = extraction.get("results", [])
 
-    if not results:
-        # Nothing to interpret (e.g. a discharge summary with no lab values). Persist an
-        # empty, disclaimered payload and skip the paid model call.
-        _persist_insights(ctx, {"insights": [], "summary": None, "disclaimer": DISCLAIMER})
+    if not _needs_interpretation(results):
+        # Nothing to interpret: no lab values at all (e.g. a discharge summary), or every
+        # value determined in range. Persist a disclaimered payload, skip the paid call.
+        summary = ALL_IN_RANGE_SUMMARY if results else None
+        _persist_insights(ctx, {"insights": [], "summary": summary, "disclaimer": DISCLAIMER})
         _log(ctx, outcome="succeeded", duration_ms=0)
         return
 
@@ -168,6 +175,16 @@ def generate_insights(ctx: StageContext) -> None:
 
 
 # --- helpers ----------------------------------------------------------------
+
+
+def _needs_interpretation(results: list[dict[str, Any]]) -> bool:
+    """Whether the model is worth paying for: is any result not known to be in range?
+
+    ``abnormal_flag`` is 'low' | 'normal' | 'high' | None, where None means the value or
+    its range could not be parsed. Undetermined is NOT normal — those still go to the
+    model, so a report we could not check never gets described as all-clear.
+    """
+    return any(r.get("abnormal_flag") != "normal" for r in results)
 
 
 def _load_extraction(ctx: StageContext) -> dict[str, Any]:

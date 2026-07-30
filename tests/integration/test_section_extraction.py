@@ -4,10 +4,12 @@ Runs against the live DB and moto S3 with a fake AI provider, so every branch ar
 model call is exercised without a real (paid, non-deterministic) call.
 """
 
+import io
 import uuid
 
-import fitz
 import pytest
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 from sqlalchemy import text
 
 from app.integrations.ai.base import AIProviderError
@@ -27,11 +29,16 @@ SAMPLE_TEXT = (
 
 
 def _pdf(body: str = SAMPLE_TEXT) -> bytes:
-    doc = fitz.open()
-    doc.new_page().insert_text((72, 72), body, fontsize=11)
-    data: bytes = doc.tobytes()
-    doc.close()
-    return data
+    """A real single-page PDF with a text layer, authored with reportlab (dev-only)."""
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    cursor = A4[1] - 72
+    for line in body.splitlines():
+        pdf.drawString(72, cursor, line)
+        cursor -= 14
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
 
 
 def _seed_item(db_session, document_id: int) -> uuid.UUID:

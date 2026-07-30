@@ -3,10 +3,19 @@
 The OCR cases build an image-only PDF by rasterising a text one — that is what a scanner
 or a phone photo produces, and it is the only way to exercise the fallback without
 committing a binary fixture.
+
+Fixtures are written with reportlab (BSD, dev-only). Neither pdfplumber nor pypdfium2
+can *create* a PDF — they read and render — so something has to author the test
+document. reportlab keeps it readable Python rather than an opaque committed blob.
 """
 
-import fitz
+import io
+
+import pypdfium2 as pdfium
 import pytest
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 
 from app.integrations.ai.base import DocumentPayload
 from app.services.ocr import (
@@ -31,27 +40,52 @@ SAMPLE = (
 
 
 def _text_pdf(body: str = SAMPLE, pages: int = 1) -> bytes:
-    doc = fitz.open()
+    """A digital PDF with a real text layer, one line of ``body`` per line."""
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
     for _ in range(pages):
-        page = doc.new_page()
-        page.insert_text((72, 72), body, fontsize=11)
-    data: bytes = doc.tobytes()
-    doc.close()
-    return data
+        cursor = A4[1] - 72
+        for line in body.splitlines() or [""]:
+            pdf.drawString(72, cursor, line)
+            cursor -= 14
+        pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+def _blank_pdf() -> bytes:
+    """One page, nothing drawn on it — a readable document that says nothing."""
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
 
 
 def _scanned_pdf(body: str = SAMPLE, dpi: int = 200) -> bytes:
     """A text PDF rasterised to images — no text layer, so OCR is the only way in."""
-    src = fitz.open(stream=_text_pdf(body), filetype="pdf")
-    out = fitz.open()
-    for page in src:
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
-        new = out.new_page(width=page.rect.width, height=page.rect.height)
-        new.insert_image(new.rect, stream=pixmap.tobytes("png"))
-    data: bytes = out.tobytes()
-    src.close()
-    out.close()
-    return data
+    source = pdfium.PdfDocument(_text_pdf(body))
+    rendered = []
+    try:
+        for index in range(len(source)):
+            page = source[index]
+            try:
+                rendered.append(
+                    (page.render(scale=dpi / 72).to_pil().convert("RGB"), page.get_size())
+                )
+            finally:
+                page.close()
+    finally:
+        source.close()
+
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer)
+    for image, (width, height) in rendered:
+        pdf.setPageSize((width, height))
+        pdf.drawImage(ImageReader(image), 0, 0, width=width, height=height)
+        pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
 
 
 def _payload(data: bytes, content_type: str = "application/pdf") -> DocumentPayload:
@@ -151,12 +185,7 @@ def test_unopenable_image_is_rejected():
 def test_a_pdf_with_no_content_yields_empty_text_not_an_error():
     """An empty page is a readable document that happens to say nothing. The caller
     decides what to do; extraction does not invent a failure."""
-    doc = fitz.open()
-    doc.new_page()
-    data = doc.tobytes()
-    doc.close()
-
-    result = extract_text(_payload(data))
+    result = extract_text(_payload(_blank_pdf()))
     assert result.text == ""
 
 

@@ -32,10 +32,11 @@ exclude = ["^alembic/versions/"]
 module = ["tests.*"]
 disallow_untyped_defs = false
 
-# PyMuPDF and pytesseract ship no stubs and no py.typed marker. They are confined to
-# app/services/ocr.py, which wraps them behind typed dataclasses.
+# None of these ship a py.typed marker. They are confined to app/services/pdf_pages.py,
+# which wraps pypdfium2 behind a bytes-in/bytes-out function, and app/services/ocr.py,
+# which wraps all three behind typed dataclasses.
 [[tool.mypy.overrides]]
-module = ["fitz.*", "pytesseract.*"]
+module = ["pdfplumber.*", "pypdfium2.*", "pytesseract.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

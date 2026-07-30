@@ -2,22 +2,29 @@
 
 import io
 
-from pypdf import PdfReader, PdfWriter
+import pypdfium2 as pdfium
 
 from app.services.pdf_pages import limit_pdf_pages
 
 
 def _pdf(n_pages: int) -> bytes:
-    writer = PdfWriter()
-    for _ in range(n_pages):
-        writer.add_blank_page(width=200, height=200)
-    buffer = io.BytesIO()
-    writer.write(buffer)
+    document = pdfium.PdfDocument.new()
+    try:
+        for _ in range(n_pages):
+            document.new_page(200, 200)
+        buffer = io.BytesIO()
+        document.save(buffer)
+    finally:
+        document.close()
     return buffer.getvalue()
 
 
 def _page_count(data: bytes) -> int:
-    return len(PdfReader(io.BytesIO(data)).pages)
+    document = pdfium.PdfDocument(data)
+    try:
+        return len(document)
+    finally:
+        document.close()
 
 
 def test_trims_multipage_pdf_to_the_limit():

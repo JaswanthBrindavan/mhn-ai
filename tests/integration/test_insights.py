@@ -8,7 +8,7 @@ import uuid
 import pytest
 from sqlalchemy import text
 
-from app.services.insights import DISCLAIMER, generate_insights
+from app.services.insights import ALL_IN_RANGE_SUMMARY, DISCLAIMER, generate_insights
 from app.workers.stagetypes import StageContext, TransientStageError
 from tests.support.ai import FakeAIProvider, structured_response
 
@@ -134,6 +134,43 @@ def test_no_extracted_results_skips_the_model_call(db_session, test_settings):
     log = _logs(db_session, item_id)[0]
     assert log["outcome"] == "succeeded"
     assert log["input_tokens"] == 0  # no model call
+
+
+def test_all_results_in_range_skips_the_model_call(db_session, test_settings):
+    document_id = 103
+    item_id = _seed_item(db_session, document_id)
+    normal = [
+        dict(_extraction_data()["results"][0], abnormal_flag="normal", value="88"),
+        dict(_extraction_data()["results"][0], test_name="Sodium", abnormal_flag="normal"),
+    ]
+    _seed_extraction(db_session, item_id, document_id, _extraction_data(results=normal))
+    ai = FakeAIProvider()
+
+    generate_insights(_context(db_session, test_settings, document_id, item_id, ai))
+
+    # Nothing noteworthy: no paid call, but the report is still recorded as checked.
+    assert ai.calls == []
+    row = _insights_row(db_session, item_id)
+    assert row["data"]["insights"] == []
+    assert row["data"]["summary"] == ALL_IN_RANGE_SUMMARY
+    assert row["data"]["disclaimer"] == DISCLAIMER
+    assert _logs(db_session, item_id)[0]["outcome"] == "succeeded"
+
+
+def test_undetermined_flag_still_calls_the_model(db_session, test_settings):
+    """None means 'could not be checked', which is not the same as in range."""
+    document_id = 104
+    item_id = _seed_item(db_session, document_id)
+    unchecked = [
+        dict(_extraction_data()["results"][0], abnormal_flag="normal"),
+        dict(_extraction_data()["results"][0], test_name="Culture", abnormal_flag=None),
+    ]
+    _seed_extraction(db_session, item_id, document_id, _extraction_data(results=unchecked))
+    ai = FakeAIProvider()
+
+    generate_insights(_context(db_session, test_settings, document_id, item_id, ai))
+
+    assert len(ai.calls) == 1
 
 
 # --- failure handling -------------------------------------------------------
