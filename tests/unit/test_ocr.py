@@ -62,9 +62,27 @@ def _blank_pdf() -> bytes:
     return buffer.getvalue()
 
 
-def _scanned_pdf(body: str = SAMPLE, dpi: int = 200) -> bytes:
-    """A text PDF rasterised to images — no text layer, so OCR is the only way in."""
-    source = pdfium.PdfDocument(_text_pdf(body))
+def _two_column_pdf() -> bytes:
+    """Labels left, values far right — the shape of every report header."""
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    cursor = A4[1] - 72
+    for label, value in (
+        ("Patient Name", "Mr B RAVI KUMAR"),
+        ("Age", "60 Year(s)"),
+        ("Gender", "Male"),
+    ):
+        pdf.drawString(72, cursor, label)
+        pdf.drawString(300, cursor, value)
+        cursor -= 20
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+def _rasterise(data: bytes, dpi: int = 200) -> bytes:
+    """Flatten a PDF to page images — no text layer, so OCR is the only way in."""
+    source = pdfium.PdfDocument(data)
     rendered = []
     try:
         for index in range(len(source)):
@@ -86,6 +104,11 @@ def _scanned_pdf(body: str = SAMPLE, dpi: int = 200) -> bytes:
         pdf.showPage()
     pdf.save()
     return buffer.getvalue()
+
+
+def _scanned_pdf(body: str = SAMPLE, dpi: int = 200) -> bytes:
+    """What a scanner or a phone photo produces from a text document."""
+    return _rasterise(_text_pdf(body), dpi=dpi)
 
 
 def _payload(data: bytes, content_type: str = "application/pdf") -> DocumentPayload:
@@ -143,6 +166,28 @@ def test_ocr_recovers_the_documents_content():
 
     assert "DIAGNOSTIC" in result.text.upper()
     assert "31/08/2021" in result.text
+
+
+@needs_tesseract
+def test_ocr_keeps_the_pages_lines():
+    """One space-separated stream would detach every value from its own label, which is
+    the pairing the text path exists to preserve. OCR must not be the weaker path."""
+    result = extract_text(_payload(_scanned_pdf()))
+
+    lines = [line for line in result.text.splitlines() if line.strip()]
+    assert len(lines) >= 4
+    assert any(line.startswith("Impression") for line in lines)
+
+
+@needs_tesseract
+def test_ocr_marks_column_gaps_the_way_the_text_path_does():
+    """A header reads ``Patient Name   Mr B RAVI KUMAR``, not one run of words."""
+    result = extract_text(_payload(_rasterise(_two_column_pdf())))
+
+    assert "   " in result.text
+    assert any(
+        "Patient Name" in line and "   " in line for line in result.text.splitlines()
+    )
 
 
 @needs_tesseract

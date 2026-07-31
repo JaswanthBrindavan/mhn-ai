@@ -4,12 +4,21 @@ Per page, in order of preference:
 
 1. **pdfplumber** (MIT) reads the embedded text layer *sorted by position on the page*.
    Exact, free, and how most insurance policies and lab reports arrive.
-2. **pypdfium2** (BSD-3/Apache-2.0) reads the same layer unsorted, for a file pdfplumber
-   cannot parse. It is also the rasteriser for step 3, and the library
-   ``pdf_pages.py`` already uses — pdfplumber depends on it, so this is one engine plus a
-   sorting wrapper rather than two libraries.
+2. **pypdfium2** (BSD-3/Apache-2.0) reads the same layer in storage order, for any page
+   pdfplumber returned nothing for — either because it could not parse the file at all,
+   or because that one page carries no text of its own.
 3. **Image-only page, unusable text, or an image file** — rasterise at ``RASTER_DPI`` and
    OCR with Tesseract, keeping the word-level confidence.
+
+Calling pypdfium2 a fallback undersells it: it also opens every document and drives the
+page loop — ``len(pdf)`` is the page count, and pdfplumber's output is indexed into that —
+and it rasterises every page that reaches step 3. It is the file handling throughout;
+pdfplumber is the reading.
+
+Which makes these two text engines, not one: pdfplumber reads through **pdfminer.six**,
+pypdfium2 through **PDFium**. pdfplumber requires pypdfium2 only as its rasteriser
+(``display.py``), never for ``extract_text``, so carrying both does not shrink the
+dependency tree. The justification is the accuracy measured below — not consolidation.
 
 The distinction between 1 and 2 is not cosmetic. A PDF stores characters in whatever
 order the generating software emitted them, which need not be the order a person reads
@@ -99,6 +108,15 @@ _RUN_OF_SPACES = re.compile(r" {3,}")
 #: 52% on a scrambled page against 0% on a healthy one, so the threshold is not delicate.
 _SCRAMBLE_RATIO = 0.25
 _MIN_SHORT_LINES = 8
+
+#: Three spaces — the same column marker ``_collapse_padding`` leaves on the text path,
+#: so a page reads the same to the model whichever path produced it.
+_COLUMN_GAP = "   "
+#: A horizontal gap wider than this many median glyph heights reads as a column break
+#: rather than a word space. Deriving it from the glyph height rather than a pixel count
+#: keeps it correct at any ``RASTER_DPI``; one em sits comfortably above the ~0.3em of a
+#: space and below any real gutter.
+_COLUMN_GAP_EMS = 1.0
 
 
 class TextExtractionError(Exception):
@@ -341,20 +359,56 @@ def _from_image(data: bytes) -> ExtractedText:
 def _ocr_image(image: Image.Image) -> tuple[str, float | None]:
     """Run Tesseract, returning its text and mean word confidence (0-1).
 
-    Word-level output is used rather than plain ``image_to_string`` so the confidence
-    comes back too: a low-confidence read is the signal that a field was missed because
-    the scan was poor, not because the model failed.
+    Word-level output is used rather than plain ``image_to_string`` for two reasons. The
+    confidence comes back with it: a low-confidence read is the signal that a field was
+    missed because the scan was poor, not because the model failed. And Tesseract numbers
+    every word by block, paragraph and line, which is what lets the words be reassembled
+    into the lines and columns the page actually had.
+
+    That reassembly is not decoration. Joining every word with a single space would hand
+    the model a lab report as one undivided stream — name, value, unit and range from one
+    row running straight into the next — which is exactly the pairing the text path
+    exists to preserve. The OCR path is live (a scrambled-glyph report in the sample set
+    OCRs all ten pages), so it has to preserve as much structure as the path it replaces.
     """
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-    words: list[str] = []
-    confidences: list[float] = []
 
-    for word, raw_confidence in zip(data["text"], data["conf"], strict=False):
-        if not word.strip():
-            continue
-        words.append(word)
+    indices = [index for index, word in enumerate(data["text"]) if word.strip()]
+    if not indices:
+        return "", None
+
+    heights = sorted(int(data["height"][index]) for index in indices)
+    gap_threshold = heights[len(heights) // 2] * _COLUMN_GAP_EMS
+
+    confidences: list[float] = []
+    lines: list[str] = []
+    current: list[str] = []
+    current_key: tuple[int, int, int] | None = None
+    previous_right = 0
+
+    for index in indices:
+        key = (
+            int(data["block_num"][index]),
+            int(data["par_num"][index]),
+            int(data["line_num"][index]),
+        )
+        left = int(data["left"][index])
+
+        if key != current_key:
+            if current:
+                lines.append("".join(current))
+            current = []
+            current_key = key
+        elif left - previous_right >= gap_threshold:
+            current.append(_COLUMN_GAP)
+        else:
+            current.append(" ")
+
+        current.append(data["text"][index])
+        previous_right = left + int(data["width"][index])
+
         try:
-            confidence = float(raw_confidence)
+            confidence = float(data["conf"][index])
         except (TypeError, ValueError):
             continue
         # Tesseract reports -1 for words it did not score; excluded rather than
@@ -362,7 +416,10 @@ def _ocr_image(image: Image.Image) -> tuple[str, float | None]:
         if confidence >= 0:
             confidences.append(confidence / 100.0)
 
-    return " ".join(words), _mean(confidences)
+    if current:
+        lines.append("".join(current))
+
+    return "\n".join(lines), _mean(confidences)
 
 
 def _mean(values: list[float]) -> float | None:
@@ -383,3 +440,12 @@ def configure_tesseract_from_env() -> None:
     command = os.getenv("TESSERACT_CMD")
     if command:
         pytesseract.pytesseract.tesseract_cmd = command
+
+
+# Applied on import, because ``pytesseract`` reads this as a module global at call time
+# and every path that OCRs comes through here. Left to the caller it is documented
+# behaviour that silently does nothing until someone remembers to invoke it — and the
+# symptom, a scanned document failing while digital ones work, points nowhere near the
+# cause. Doing it here also means ``tesseract_available()`` answers about the binary the
+# module will actually run.
+configure_tesseract_from_env()

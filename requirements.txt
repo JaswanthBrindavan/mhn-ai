@@ -11,9 +11,10 @@ alembic==1.18.5
 psycopg[binary]==3.3.4
 boto3==1.43.53
 anthropic==0.117.1
-# PDF reading. pypdfium2 (PDFium, BSD-3/Apache-2.0) renders pages and reads text;
-# pdfplumber (MIT) is a layout layer over the same engine — it depends on pypdfium2, so
-# this is one engine plus a sorting wrapper rather than two libraries.
+# PDF reading. pypdfium2 (PDFium, BSD-3/Apache-2.0) renders pages and reads text.
+# pdfplumber (MIT) reads text through pdfminer.six and requires pypdfium2 only as its
+# rasteriser, so these are two text engines rather than one — carrying both is justified
+# by the accuracy below, not by a smaller dependency tree.
 #
 # pdfplumber leads for text because it orders by position on the page rather than by the
 # order the generating software happened to emit. Measured on two real lab reports, 130
