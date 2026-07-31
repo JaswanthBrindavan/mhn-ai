@@ -43,8 +43,11 @@ this service is both the classifier and the router:
    into the `reports` table and write the assembled payload to `reports.content` — the
    insert, the content write, and the delete from `unclassified_files` all happen in one
    transaction, so a document is never in both tables or in neither.
-3. **Anything else** is recorded with its detected section and left in `unclassified_files`
-   for a later sprint to handle.
+3. **If it is `insurance`, `scans_imaging` or `vaccinations`:** transcribe that section's
+   fields into `ai_section_extractions` and finish there — no insights, and **no move**. The
+   results are stored against the document, which stays in `unclassified_files`.
+4. **Anything else** (`prescriptions`, `bills`, `medical_condition`, `unknown`) is recorded
+   with its detected section and left in `unclassified_files` for a later sprint.
 
 Design notes worth knowing before reading the code:
 
@@ -156,7 +159,8 @@ curl -X POST http://localhost:8000/v1/document-processing-runs \
 
 `202 Accepted` returns a `run_id` and a per-document item id. Poll the run for progress —
 each item moves through `pending → queued → processing → classifying → extracting →
-generating_insights → completed`, or ends at `failed`, `rejected`, or `cancelled`:
+generating_insights → completed`, or ends at `failed`, `rejected`, or `cancelled`. A
+non-report section skips `generating_insights` and completes after `extracting`:
 
 ```sh
 curl http://localhost:8000/v1/document-processing-runs/$RUN_ID \
@@ -182,8 +186,8 @@ The remaining routes are `POST /v1/documents/{type}/{id}/ai-result:retry` (retry
 that did not complete) and `DELETE /v1/document-processing-runs/{id}` (cancel unfinished
 items). Interactive docs are at `/docs`.
 
-A document classified into a non-report section reaches `rejected` with that section as the
-reason. That is routing, not a processing error.
+A document classified into a section that is not processed yet reaches `rejected` with that
+section as the reason. That is routing, not a processing error.
 
 ### Running the checks
 

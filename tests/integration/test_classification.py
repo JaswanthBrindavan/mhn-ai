@@ -111,40 +111,27 @@ def test_document_media_type_is_passed_to_the_model(db_session, make_document, a
 # --- rejection --------------------------------------------------------------
 
 
-def test_scan_is_rejected_with_its_section_but_still_recorded(
-    db_session, make_document, aws, test_settings
+@pytest.mark.parametrize("section", ["scans_imaging", "unknown", "bills"])
+def test_a_non_report_section_is_recorded_and_not_rejected_here(
+    db_session, make_document, aws, test_settings, section
 ):
-    document_id = make_document()
-    item_id = _seed_item(db_session, document_id)
-    # A radiology/imaging doc -> scans_imaging, out of this sprint's scope.
-    ai = FakeAIProvider(
-        response=structured_response(
-            classification_payload(section="scans_imaging", title="Chest X-Ray")
-        )
-    )
+    """This stage classifies; it does not route.
 
-    with pytest.raises(RejectStageError) as excinfo:
-        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
-
-    # The reason IS the detected section, so Spring can route it.
-    assert excinfo.value.code == "scans_imaging"
-    # The classification is still recorded (audit), and the log marks it rejected.
-    assert _classification_row(db_session, item_id)["section"] == "scans_imaging"
-    assert _logs(db_session, item_id)[0]["outcome"] == "rejected"
-
-
-def test_unknown_is_rejected(db_session, make_document, aws, test_settings):
+    Whether a section has a pipeline is the processor's decision (SECTION_PIPELINES), so
+    classifying a scan is a *success* here even though the document may go no further.
+    Rejecting in this stage would also report a correct classification as a stage failure.
+    """
     document_id = make_document()
     item_id = _seed_item(db_session, document_id)
     ai = FakeAIProvider(
-        response=structured_response(classification_payload(section="unknown", title="Scan"))
+        response=structured_response(classification_payload(section=section, title="A Document"))
     )
 
-    with pytest.raises(RejectStageError) as excinfo:
-        classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
+    classify_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
-    assert excinfo.value.code == "unknown"
-    assert _logs(db_session, item_id)[0]["error_code"] == "unknown"
+    # Recorded for audit and for the processor to route on, and logged as a success.
+    assert _classification_row(db_session, item_id)["section"] == section
+    assert _logs(db_session, item_id)[0]["outcome"] == "succeeded"
 
 
 def test_missing_s3_object_is_rejected(db_session, make_document, aws, test_settings):

@@ -4,41 +4,27 @@ Runs against the live DB and moto S3 with a fake AI provider, so every branch ar
 model call is exercised without a real (paid, non-deterministic) call.
 """
 
-import io
 import uuid
 
 import pytest
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
 from sqlalchemy import text
 
 from app.integrations.ai.base import AIProviderError
 from app.services.section_extraction import extract_section
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 from tests.support.ai import FakeAIProvider, structured_response
+from tests.support.pdfs import text_pdf
 
 pytestmark = pytest.mark.integration
 
 #: The stage now reads the document's TEXT, so the fixture body must be a real PDF
 #: rather than the placeholder bytes the other stages get away with.
-SAMPLE_TEXT = (
-    "Star Health Insurance\n"
-    "Policy Period 01/10/2019 to 30/09/2020\n"
-    "Co-pay 20%\n"
-)
+SAMPLE_TEXT = "Star Health Insurance\nPolicy Period 01/10/2019 to 30/09/2020\nCo-pay 20%\n"
 
 
 def _pdf(body: str = SAMPLE_TEXT) -> bytes:
     """A real single-page PDF with a text layer, authored with reportlab (dev-only)."""
-    buffer = io.BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=A4)
-    cursor = A4[1] - 72
-    for line in body.splitlines():
-        pdf.drawString(72, cursor, line)
-        cursor -= 14
-    pdf.showPage()
-    pdf.save()
-    return buffer.getvalue()
+    return text_pdf(body)
 
 
 def _seed_item(db_session, document_id: int) -> uuid.UUID:
@@ -168,9 +154,7 @@ def test_scan_extraction_strips_a_study_timestamp(db_session, aws, test_settings
     assert row["data"]["fields"]["findings"] == ["No fracture", "Joint spaces preserved"]
 
 
-def test_vaccination_extraction_allows_no_next_dose(
-    db_session, aws, test_settings, make_document
-):
+def test_vaccination_extraction_allows_no_next_dose(db_session, aws, test_settings, make_document):
     document_id = make_document(body=_pdf())
     item_id = _seed_item(db_session, document_id)
     _seed_classification(db_session, item_id, document_id, "vaccinations")
@@ -224,9 +208,7 @@ def test_rerunning_the_stage_upserts_rather_than_duplicating(
     assert len(_logs(db_session, item_id)) == 1
 
 
-def test_unhandled_section_is_rejected_not_retried(
-    db_session, aws, test_settings, make_document
-):
+def test_unhandled_section_is_rejected_not_retried(db_session, aws, test_settings, make_document):
     """Bills classify correctly but have no extractor — terminal, not a retry loop."""
     document_id = make_document(body=_pdf())
     item_id = _seed_item(db_session, document_id)
@@ -250,9 +232,7 @@ def test_missing_classification_is_transient(db_session, aws, test_settings, mak
         extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
 
-def test_invalid_model_output_is_logged_and_retried(
-    db_session, aws, test_settings, make_document
-):
+def test_invalid_model_output_is_logged_and_retried(db_session, aws, test_settings, make_document):
     """Model output is never repaired — the failure is recorded and the item retries."""
     document_id = make_document(body=_pdf())
     item_id = _seed_item(db_session, document_id)

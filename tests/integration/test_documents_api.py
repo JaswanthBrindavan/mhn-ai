@@ -244,3 +244,53 @@ def test_typed_retry_allows_a_document_that_never_got_classified(api, db_session
 
     assert read.status_code == 409  # refuses to answer under an unverified type
     assert retry.status_code == 202  # but re-queues the work
+
+
+def test_a_section_result_is_readable_under_its_own_type(api, db_session, make_document):
+    """A non-report section writes ai_section_extractions, not ai_report_extractions.
+
+    Without its own field the whole section payload is invisible through the API: the
+    document reads back as classified with a null extraction, and everything the section
+    extractor produced is unreachable.
+    """
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "completed")
+    _seed_classified(db_session, item_id, document_id, "insurance")
+    db_session.execute(
+        text(
+            "INSERT INTO ai_section_extractions (run_item_id, document_id, section, data, "
+            "prompt_version, schema_version) "
+            "VALUES (:i, :d, 'insurance', CAST(:data AS JSONB), 'sec-1', 'sec-1')"
+        ),
+        {
+            "i": item_id,
+            "d": document_id,
+            "data": json.dumps(
+                {
+                    "section": "insurance",
+                    "fields": {"insurer": "Star Health", "co_pay": "20%"},
+                    "flags": [],
+                }
+            ),
+        },
+    )
+    db_session.flush()
+
+    body = api.get(f"/v1/documents/insurance/{document_id}/ai-result").json()
+
+    assert body["section_extraction"]["fields"]["insurer"] == "Star Health"
+    assert body["section_extraction"]["flags"] == []
+    # The report-shaped fields stay null: the two are mutually exclusive.
+    assert body["extraction"] is None
+    assert body["insights"] is None
+
+
+def test_a_report_result_carries_no_section_extraction(api, db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "completed", reports_id=3)
+    _seed_results(db_session, item_id, document_id)
+
+    body = api.get(f"/v1/documents/reports/{document_id}/ai-result").json()
+
+    assert body["extraction"] is not None
+    assert body["section_extraction"] is None
