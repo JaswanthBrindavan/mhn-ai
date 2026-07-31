@@ -12,6 +12,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.results import DocumentType
+
 MAX_DOCUMENTS_PER_RUN = 500
 
 
@@ -60,6 +62,10 @@ class RunItemResponse(BaseModel):
     document_id: int
     #: The reports row created if this document was moved into the reports section.
     reports_id: int | None = None
+    #: Which `/v1/documents/{document_type}/...` route reads this document's result.
+    #: Null until it is classified, and for a section with no addressable type
+    #: (`bills`, `medical_condition`, `unknown` — none of which produce an AI result).
+    document_type: DocumentType | None = None
     status: str
     attempt_count: int
     last_error_code: str | None = None

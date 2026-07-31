@@ -164,16 +164,23 @@ curl http://localhost:8000/v1/document-processing-runs/$RUN_ID \
 ```
 
 Read the result for a single document — its detected section, and, when it was moved into
-`reports`, the created `reports` id plus the extraction and insights:
+`reports`, the created `reports` id plus the extraction and insights. The document's type
+goes in the path, and the route answers only if that is what the document was classified as:
 
 ```sh
-curl http://localhost:8000/v1/documents/101/ai-result \
+curl http://localhost:8000/v1/documents/reports/101/ai-result \
   -H "Authorization: Bearer $MHN_SERVICE_TOKEN"
 ```
 
-The remaining routes are `POST /v1/documents/{id}/ai-result:retry` (retry a document that
-did not complete) and `DELETE /v1/document-processing-runs/{id}` (cancel unfinished items).
-Interactive docs are at `/docs`.
+`{type}` is one of `reports`, `scans`, `insurance`, `vaccinations`, `prescriptions`. It is
+always the section **we detected**, never one the caller declares — every upload arrives
+unclassified, so there is nothing to declare at submit time. Each item in the run response
+carries a `document_type` telling you which URL to call; asking under the wrong type returns
+`409` naming the real section.
+
+The remaining routes are `POST /v1/documents/{type}/{id}/ai-result:retry` (retry a document
+that did not complete) and `DELETE /v1/document-processing-runs/{id}` (cancel unfinished
+items). Interactive docs are at `/docs`.
 
 A document classified into a non-report section reaches `rejected` with that section as the
 reason. That is routing, not a processing error.

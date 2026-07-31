@@ -29,6 +29,7 @@ from app.core.config import Settings
 from app.core.errors import ApiError
 from app.integrations.s3 import ObjectMetadata
 from app.integrations.sqs import PublishError, publish_processing_item
+from app.models.ai_results import AiReportClassification
 from app.models.enums import ACTIVE_STATUSES, CANCELLABLE_STATUSES, RunItemStatus
 from app.models.processing import (
     ACTIVE_STATUS_PREDICATE,
@@ -36,15 +37,18 @@ from app.models.processing import (
     AiProcessingRunItem,
 )
 from app.models.spring import unclassified_files
+from app.schemas.results import DocumentType
 from app.schemas.runs import (
     CancelRunResponse,
     CreateRunRequest,
     CreateRunResponse,
+    RunItemResponse,
     RunProgress,
     RunResponse,
     SubmitOutcome,
     SubmittedItem,
 )
+from app.services.classification import DOCUMENT_TYPE_BY_SECTION
 from app.services.source_validation import (
     SourceObjectUnavailableError,
     ValidationFailure,
@@ -426,6 +430,27 @@ def _publish(
     return published
 
 
+def _document_types(session: Session, item_ids: list[uuid.UUID]) -> dict[uuid.UUID, DocumentType]:
+    """The URL type each classified item is readable under, in one query.
+
+    This is what makes the typed result routes usable: without it a caller would know a
+    document is finished but not which ``/v1/documents/{type}/...`` URL to call. Sections
+    with no addressable type are simply absent from the mapping.
+    """
+    if not item_ids:
+        return {}
+    rows = session.execute(
+        select(AiReportClassification.run_item_id, AiReportClassification.section).where(
+            AiReportClassification.run_item_id.in_(item_ids)
+        )
+    ).all()
+    return {
+        item_id: DOCUMENT_TYPE_BY_SECTION[section]
+        for item_id, section in rows
+        if section in DOCUMENT_TYPE_BY_SECTION
+    }
+
+
 def get_run(session: Session, run_id: uuid.UUID) -> RunResponse:
     run = session.get(AiProcessingRun, run_id)
     if run is None:
@@ -434,6 +459,7 @@ def get_run(session: Session, run_id: uuid.UUID) -> RunResponse:
     counts = Counter(item.status for item in run.items)
     progress = RunProgress(total=len(run.items), **dict(counts))
     finished = not any(item.status in _ACTIVE for item in run.items)
+    types = _document_types(session, [item.id for item in run.items])
 
     return RunResponse(
         run_id=run_id,
@@ -444,7 +470,12 @@ def get_run(session: Session, run_id: uuid.UUID) -> RunResponse:
         updated_at=run.updated_at,
         finished=finished,
         progress=progress,
-        items=run.items,  # coerced by RunItemResponse's from_attributes config
+        items=[
+            RunItemResponse.model_validate(item).model_copy(
+                update={"document_type": types.get(item.id)}
+            )
+            for item in run.items
+        ],
     )
 
 
