@@ -51,10 +51,16 @@ class DocumentAiResult(BaseModel):
     last_error_code: str | None = None
 
     classification: ClassificationResult | None = None
-    #: {"results": [...], "report_date": ...} — present once extraction ran.
+    #: {"results": [...], "report_date": ...} — a REPORT's lab results, once extraction ran.
     extraction: dict[str, Any] | None = None
     #: {"insights": [...], "summary": ..., "disclaimer": ...} — present once insights ran.
     insights: dict[str, Any] | None = None
+    #: {"section": ..., "fields": {...}, "flags": [...]} — a NON-report section's fields
+    #: (insurance, scans/imaging, vaccinations). Mutually exclusive with ``extraction``:
+    #: the two carry different shapes, and which one is populated follows the section.
+    #: ``fields`` is whatever that section's ``SectionSpec`` defines, so it differs per
+    #: section; ``flags`` carries data-quality notes such as ``dates_out_of_order``.
+    section_extraction: dict[str, Any] | None = None
 
 
 class RetryResponse(BaseModel):

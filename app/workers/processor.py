@@ -10,16 +10,26 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.integrations.ai.base import AIProvider
 from app.integrations.sqs import ReceivedMessage, delete_message
+from app.models.ai_results import AiReportClassification
 from app.models.enums import RunItemStatus
 from app.services import assembly, processing
+from app.services.classification import DocumentSection
 from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
-from app.workers.stages import STAGE_SEQUENCE, RejectStageError, StageContext, TransientStageError
+from app.workers.stages import (
+    CLASSIFY_STAGE,
+    SECTION_PIPELINES,
+    RejectStageError,
+    StageContext,
+    StageStep,
+    TransientStageError,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mypy_boto3_s3.client import S3Client
@@ -137,29 +147,80 @@ def _process(
     return outcome
 
 
+def _run_stage(ctx: StageContext, session: Session, step: StageStep) -> bool:
+    """Run one stage. Returns False when the item was cancelled instead."""
+    stage_status, stage_fn = step
+    if processing.is_cancelled(session, ctx.item_id):
+        return False
+    if not processing.advance(session, ctx.item_id, to_status=stage_status, expected=_IN_PROGRESS):
+        # Guard matched nothing: the item was cancelled or moved. Stop cleanly.
+        return False
+    stage_fn(ctx)
+    return True
+
+
+def _classified_section(session: Session, ctx: StageContext) -> DocumentSection:
+    """The section the classification stage just recorded.
+
+    Transient rather than an unhandled error when the row is absent: ``classify_report``
+    persists it before returning, so a gap here means the stage did not really run, and a
+    redelivery re-runs it. Letting ``NoResultFound`` escape would bypass both the reject
+    and the retry paths.
+    """
+    value = session.execute(
+        select(AiReportClassification.section).where(
+            AiReportClassification.run_item_id == ctx.item_id
+        )
+    ).scalar_one_or_none()
+    if value is None:
+        raise TransientStageError("no classification recorded for this item")
+    return DocumentSection(value)
+
+
 def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
-    """Advance through every stage, honouring cancellation between and around them."""
-    for stage_status, stage_fn in STAGE_SEQUENCE:
-        if processing.is_cancelled(session, ctx.item_id):
+    """Classify, then run whatever that section needs, honouring cancellation throughout.
+
+    The pipeline's shape is chosen *after* classification because the section decides it:
+    a report is extracted and interpreted, a section document is transcribed and stops.
+    """
+    if not _run_stage(ctx, session, CLASSIFY_STAGE):
+        return Outcome.CANCELLED
+    # Re-checked here specifically: routing reads the classification row *unguarded*, and a
+    # cancel landing while the stage ran would otherwise be seen as a missing row. The
+    # per-stage checks below cover the rest, and the final move/complete is guarded.
+    if processing.is_cancelled(session, ctx.item_id):
+        return Outcome.CANCELLED
+
+    section = _classified_section(session, ctx)
+    pipeline = SECTION_PIPELINES.get(section)
+    if pipeline is None:
+        # Correctly classified, just not a section this service processes. Routing, not
+        # failure: the document stays in unclassified_files with its section recorded.
+        raise RejectStageError(
+            section.value, f"Document classified as {section.value}, which is not processed"
+        )
+
+    for step in pipeline:
+        if not _run_stage(ctx, session, step):
             return Outcome.CANCELLED
 
-        if not processing.advance(
-            session, ctx.item_id, to_status=stage_status, expected=_IN_PROGRESS
+    if section is DocumentSection.REPORTS:
+        # Assemble the content and move it into reports, recording reports_id and
+        # completing the item in one transaction.
+        content = assembly.build_content(session, ctx.item_id)
+        if processing.move_and_complete(
+            session, ctx.item_id, ctx.document_id, content, expected=_IN_PROGRESS
         ):
-            # Guard matched nothing: the item was cancelled or moved. Stop cleanly.
-            return Outcome.CANCELLED
+            logger.info("item_completed", extra={"item_id": str(ctx.item_id)})
+            return Outcome.COMPLETED
+        # Move guard failed → cancelled between the last stage and here.
+        return Outcome.CANCELLED
 
-        stage_fn(ctx)
-
-    # Every stage passed: this is a report. Assemble its content and move it into the
-    # reports table, recording reports_id and completing the item in one transaction.
-    content = assembly.build_content(session, ctx.item_id)
-    if processing.move_and_complete(
-        session, ctx.item_id, ctx.document_id, content, expected=_IN_PROGRESS
-    ):
-        logger.info("item_completed", extra={"item_id": str(ctx.item_id)})
+    # A non-report section: the extraction is stored and the document stays in
+    # unclassified_files. Filing it is Spring's call — see docs/document-filing-design.md.
+    if processing.complete_item(session, ctx.item_id, expected=_IN_PROGRESS):
+        logger.info("item_completed", extra={"item_id": str(ctx.item_id), "section": section.value})
         return Outcome.COMPLETED
-    # Move guard failed → cancelled between the last stage and here.
     return Outcome.CANCELLED
 
 

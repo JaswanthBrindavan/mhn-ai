@@ -67,8 +67,13 @@ def extract_section(ctx: StageContext) -> None:
         extracted = extract_text(document)
     except TextExtractionError as exc:
         # Unreadable by both the text layer and OCR — no model call is worth making.
-        _log(ctx, outcome="rejected", error_code="text_extraction_failed", detail=str(exc),
-             duration_ms=0)
+        _log(
+            ctx,
+            outcome="rejected",
+            error_code="text_extraction_failed",
+            detail=str(exc),
+            duration_ms=0,
+        )
         raise RejectStageError("text_extraction_failed", str(exc)) from exc
 
     if not extracted.text.strip():
@@ -224,9 +229,7 @@ def _spec_or_reject(section: DocumentSection) -> SectionSpec:
     try:
         return spec_for(section)
     except KeyError as exc:
-        raise RejectStageError(
-            section.value, f"No section extractor for {section.value}"
-        ) from exc
+        raise RejectStageError(section.value, f"No section extractor for {section.value}") from exc
 
 
 def _persist(ctx: StageContext, section: DocumentSection, payload: dict[str, Any]) -> None:

@@ -26,6 +26,7 @@ from app.services.ocr import (
     extract_text,
     tesseract_available,
 )
+from tests.support.pdfs import text_pdf, two_column_pdf
 
 needs_tesseract = pytest.mark.skipif(
     not tesseract_available(), reason="Tesseract binary not installed"
@@ -41,16 +42,7 @@ SAMPLE = (
 
 def _text_pdf(body: str = SAMPLE, pages: int = 1) -> bytes:
     """A digital PDF with a real text layer, one line of ``body`` per line."""
-    buffer = io.BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=A4)
-    for _ in range(pages):
-        cursor = A4[1] - 72
-        for line in body.splitlines() or [""]:
-            pdf.drawString(72, cursor, line)
-            cursor -= 14
-        pdf.showPage()
-    pdf.save()
-    return buffer.getvalue()
+    return text_pdf(body, pages=pages)
 
 
 def _blank_pdf() -> bytes:
@@ -64,20 +56,9 @@ def _blank_pdf() -> bytes:
 
 def _two_column_pdf() -> bytes:
     """Labels left, values far right — the shape of every report header."""
-    buffer = io.BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=A4)
-    cursor = A4[1] - 72
-    for label, value in (
-        ("Patient Name", "Mr B RAVI KUMAR"),
-        ("Age", "60 Year(s)"),
-        ("Gender", "Male"),
-    ):
-        pdf.drawString(72, cursor, label)
-        pdf.drawString(300, cursor, value)
-        cursor -= 20
-    pdf.showPage()
-    pdf.save()
-    return buffer.getvalue()
+    return two_column_pdf(
+        [("Patient Name", "Mr B RAVI KUMAR"), ("Age", "60 Year(s)"), ("Gender", "Male")]
+    )
 
 
 def _rasterise(data: bytes, dpi: int = 200) -> bytes:
@@ -185,9 +166,7 @@ def test_ocr_marks_column_gaps_the_way_the_text_path_does():
     result = extract_text(_payload(_rasterise(_two_column_pdf())))
 
     assert "   " in result.text
-    assert any(
-        "Patient Name" in line and "   " in line for line in result.text.splitlines()
-    )
+    assert any("Patient Name" in line and "   " in line for line in result.text.splitlines())
 
 
 @needs_tesseract

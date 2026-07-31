@@ -13,13 +13,16 @@ from sqlalchemy.orm import Session
 
 from app.integrations.sqs import publish_processing_item, receive_messages
 from app.models.enums import RunItemStatus
+from app.services.classification import DocumentSection
+from app.services.section_specs import SECTION_SPECS
 from app.workers.processor import Outcome, process_message
-from tests.support.ai import FakeAIProvider
+from tests.support.ai import FakeAIProvider, classification_payload, structured_response
+from tests.support.pdfs import text_pdf
 
 pytestmark = pytest.mark.integration
 
 # A processable lab-report classification, so the real classify stage lets the pipeline
-# complete. Monkeypatched-STAGE_SEQUENCE tests replace classify, so `ai` is unused there.
+# complete. Tests that monkeypatch CLASSIFY_STAGE replace classify, so `ai` is unused there.
 _FAKE_AI = FakeAIProvider()
 
 
@@ -73,7 +76,7 @@ def _queue_depth(sqs, queue_url) -> int:
     )
 
 
-def _process(sqs, queue_url, session_factory, test_settings, aws):
+def _process(sqs, queue_url, session_factory, test_settings, aws, *, ai=None):
     s3 = aws[0]
     message = _receive_one(sqs, queue_url)
     return process_message(
@@ -81,7 +84,7 @@ def _process(sqs, queue_url, session_factory, test_settings, aws):
         session_factory=session_factory,
         s3=s3,
         sqs=sqs,
-        ai=_FAKE_AI,
+        ai=ai or _FAKE_AI,
         settings=test_settings,
     )
 
@@ -196,10 +199,7 @@ def test_cancellation_during_a_stage_stops_the_pipeline(
         )
         ctx.session.commit()
 
-    monkeypatch.setattr(
-        "app.workers.processor.STAGE_SEQUENCE",
-        [(S.CLASSIFYING, _cancelling_stage), (S.EXTRACTING, lambda _c: None)],
-    )
+    monkeypatch.setattr("app.workers.processor.CLASSIFY_STAGE", (S.CLASSIFYING, _cancelling_stage))
 
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
@@ -225,7 +225,7 @@ def test_transient_stage_failure_leaves_message_for_redelivery(
     def _flaky(_ctx) -> None:
         raise TransientStageError("provider 503")
 
-    monkeypatch.setattr("app.workers.processor.STAGE_SEQUENCE", [(S.CLASSIFYING, _flaky)])
+    monkeypatch.setattr("app.workers.processor.CLASSIFY_STAGE", (S.CLASSIFYING, _flaky))
 
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
@@ -249,7 +249,7 @@ def test_reject_stage_marks_rejected_and_acks(
     def _reject(_ctx) -> None:
         raise RejectStageError("not_a_report", "Document is not a lab report")
 
-    monkeypatch.setattr("app.workers.processor.STAGE_SEQUENCE", [(S.CLASSIFYING, _reject)])
+    monkeypatch.setattr("app.workers.processor.CLASSIFY_STAGE", (S.CLASSIFYING, _reject))
 
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
@@ -285,3 +285,140 @@ def test_message_giving_up_after_max_attempts_fails_and_acks(
     assert outcome is Outcome.GAVE_UP
     assert _status(db_session, item_id) == RunItemStatus.FAILED.value
     assert _queue_depth(sqs, queue_url) == 0
+
+
+# --- routing: the pipeline's shape depends on the detected section ----------
+
+
+class _ClassifiesAs(FakeAIProvider):
+    """Forces the classification result, leaving every other stage to the schema dispatch.
+
+    Setting a single fixed `response` would not do: one message runs classification *and*
+    whatever stage follows it, and they need different payloads.
+    """
+
+    def __init__(self, section: str) -> None:
+        super().__init__()
+        self.section = section
+
+    def analyze_document(self, **kwargs):
+        default = super().analyze_document(**kwargs)  # records the call
+        if "section" in kwargs["json_schema"].get("properties", {}):
+            return structured_response(classification_payload(section=self.section))
+        return default
+
+
+def _section_row(db_session, item_id):
+    return (
+        db_session.execute(
+            text("SELECT section, data FROM ai_section_extractions WHERE run_item_id = :id"),
+            {"id": item_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+
+def _source_exists(db_session, document_id) -> bool:
+    return (
+        db_session.execute(
+            text("SELECT count(*) FROM unclassified_files WHERE id = :id"), {"id": document_id}
+        ).scalar_one()
+        == 1
+    )
+
+
+@pytest.mark.parametrize("section", ["insurance", "scans_imaging", "vaccinations"])
+def test_a_section_document_is_extracted_then_stops(
+    db_session, make_document, session_factory, test_settings, aws, section
+):
+    """A non-report section runs extract_section and completes — without being moved.
+
+    The document stays in unclassified_files: filing it is a separate decision (see
+    docs/document-filing-design.md), and no reports row must appear for a scan.
+    """
+    _, sqs, queue_url, _ = aws
+    # A real PDF: this path reads the document's text rather than sending the file.
+    document_id = make_document(body=text_pdf("Policy Period 01/10/2019 to 30/09/2020"))
+    run_id = db_session.execute(
+        text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
+    ).scalar_one()
+    item_id = db_session.execute(
+        text(
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status) "
+            "VALUES (:r, :d, 'queued') RETURNING id"
+        ),
+        {"r": run_id, "d": document_id},
+    ).scalar_one()
+    db_session.flush()
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs, queue_url, session_factory, test_settings, aws, ai=_ClassifiesAs(section)
+    )
+
+    assert outcome is Outcome.COMPLETED
+    assert _status(db_session, item_id) == RunItemStatus.COMPLETED.value
+    row = _section_row(db_session, item_id)
+    assert row is not None and row["section"] == section
+    # The stored fields are that section's own, proving the right SectionSpec drove the
+    # call rather than some other section's schema.
+    expected_fields = set(SECTION_SPECS[DocumentSection(section)].json_schema["properties"])
+    assert set(row["data"]["fields"]) == expected_fields
+    # Not moved, and no reports row invented for a non-report.
+    assert _source_exists(db_session, document_id)
+    reports_id = db_session.execute(
+        text("SELECT reports_id FROM ai_processing_run_items WHERE id = :id"), {"id": item_id}
+    ).scalar_one()
+    assert reports_id is None
+    assert _queue_depth(sqs, queue_url) == 0
+
+
+@pytest.mark.parametrize("section", ["bills", "medical_condition", "prescriptions", "unknown"])
+def test_a_section_with_no_pipeline_is_rejected_by_the_router(
+    db_session, make_document, session_factory, test_settings, aws, section
+):
+    """Routing, not failure: no extractor exists, so the document stays where it is."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs, queue_url, session_factory, test_settings, aws, ai=_ClassifiesAs(section)
+    )
+
+    assert outcome is Outcome.REJECTED
+    assert _status(db_session, item_id) == RunItemStatus.REJECTED.value
+    # The detected section is the reason, so the caller can route on it.
+    code = db_session.execute(
+        text("SELECT last_error_code FROM ai_processing_run_items WHERE id = :id"), {"id": item_id}
+    ).scalar_one()
+    assert code == section
+    assert _source_exists(db_session, document_id)
+    # The classification is still recorded even though nothing processed it.
+    assert (
+        db_session.execute(
+            text("SELECT section FROM ai_report_classifications WHERE run_item_id = :id"),
+            {"id": item_id},
+        ).scalar_one()
+        == section
+    )
+
+
+def test_a_report_still_moves_and_a_section_never_does(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The two paths diverge at the end: only a report is moved into `reports`."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
+
+    assert outcome is Outcome.COMPLETED
+    reports_id = db_session.execute(
+        text("SELECT reports_id FROM ai_processing_run_items WHERE id = :id"), {"id": item_id}
+    ).scalar_one()
+    assert reports_id is not None
+    # Moved: the intake row is gone, unlike every section document.
+    assert not _source_exists(db_session, document_id)

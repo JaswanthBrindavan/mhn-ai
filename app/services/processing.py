@@ -256,6 +256,33 @@ def move_and_complete(
     return True
 
 
+def complete_item(session: Session, item_id: UUID, *, expected: set[str]) -> bool:
+    """Complete an item whose work is done but which is NOT moved out of intake.
+
+    A non-report section (insurance, scans/imaging, vaccinations) is transcribed into
+    ``ai_section_extractions`` and stops there: the document stays in
+    ``unclassified_files`` and no section row is created. Filing it is a separate,
+    undecided question — see ``docs/document-filing-design.md`` — and doing it here would
+    duplicate a mover Spring already has, with a different S3 key convention.
+
+    Guarded on ``expected`` like every other transition, so a concurrent cancel wins.
+    A report never comes through here; it completes inside ``move_and_complete`` so the
+    move and the completion commit together.
+    """
+    completed = _rowcount(
+        session,
+        update(AiProcessingRunItem)
+        .where(AiProcessingRunItem.id == item_id, AiProcessingRunItem.status.in_(expected))
+        .values(status=RunItemStatus.COMPLETED.value, completed_at=_now()),
+    )
+    if completed != 1:
+        session.rollback()
+        return False
+    session.commit()
+    logger.info("item_completed_in_place", extra={"item_id": str(item_id)})
+    return True
+
+
 def reject_item(
     session: Session, item_id: UUID, *, code: str, message: str, expected: set[str]
 ) -> bool:

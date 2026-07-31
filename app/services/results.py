@@ -17,6 +17,7 @@ from app.models.ai_results import (
     AiReportClassification,
     AiReportExtraction,
     AiReportInsight,
+    AiSectionExtraction,
 )
 from app.models.enums import ACTIVE_STATUSES, RunItemStatus
 from app.models.processing import AiProcessingRunItem
@@ -113,6 +114,11 @@ def get_document_ai_result(
     insights = session.execute(
         select(AiReportInsight.data).where(AiReportInsight.run_item_id == item.id)
     ).scalar_one_or_none()
+    # A non-report section writes here instead of ai_report_extractions — different shape,
+    # so it gets its own field rather than being squeezed into `extraction`.
+    section_extraction = session.execute(
+        select(AiSectionExtraction.data).where(AiSectionExtraction.run_item_id == item.id)
+    ).scalar_one_or_none()
 
     classification = (
         ClassificationResult(
@@ -135,6 +141,7 @@ def get_document_ai_result(
         classification=classification,
         extraction=extraction_data,
         insights=insights,
+        section_extraction=section_extraction,
     )
 
 

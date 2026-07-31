@@ -2,9 +2,13 @@
 
 Flow: download the source object from ``unclassified_files``, ask the model which
 MyHealthNotion section it belongs to under a fixed schema, validate the JSON with
-Pydantic (never repair it), persist the classification and a process log, then either
-continue the pipeline (it is a report) or reject the item with the detected section as
-the reason.
+Pydantic (never repair it), then persist the classification and a process log.
+
+**This stage classifies; it does not route.** Whether the detected section has a pipeline
+is decided by ``app.workers.processor``, which reads the section this stage recorded and
+looks it up in ``SECTION_PIPELINES``. Rejecting here would mean importing that table,
+which imports this module — and it would also misreport a correct classification of an
+unhandled section as a failure of this stage.
 
 The move into the ``reports`` table (INSERT the row, write ``reports.content``, DELETE the
 ``unclassified_files`` row) happens after extraction and insights, so a document is only
@@ -30,7 +34,7 @@ from app.schemas.results import DocumentType
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
 from app.services.pdf_pages import limit_pdf_pages
 from app.services.source_loading import load_source_document
-from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
+from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +49,8 @@ CLASSIFY_MAX_TOKENS = 2048
 class DocumentSection(StrEnum):
     """A MyHealthNotion section (the ``resource_type_enum`` values), or unknown.
 
-    This is what drives Spring's routing. Only ``REPORTS`` is deep-processed this sprint.
+    This is what drives routing. ``SECTION_PIPELINES`` in app/workers/stages.py decides
+    which of these the service actually processes; the rest are recorded and rejected.
     """
 
     REPORTS = "reports"
@@ -57,10 +62,6 @@ class DocumentSection(StrEnum):
     MEDICAL_CONDITION = "medical_condition"
     UNKNOWN = "unknown"  # cannot confidently place -> stays in unclassified_files
 
-
-#: Only the reports section is moved and deep-processed this sprint. Everything else is
-#: recognised, recorded, and left in unclassified_files for future sprints to route.
-PROCESSABLE_SECTIONS: frozenset[DocumentSection] = frozenset({DocumentSection.REPORTS})
 
 #: URL type -> the section a document must have been classified as to be read under it.
 #:
@@ -149,7 +150,8 @@ INSTRUCTION = "Classify the attached document into one section."
 
 
 def classify_report(ctx: StageContext) -> None:
-    """Stage entrypoint: classify the document, persist, and gate the pipeline."""
+    """Stage entrypoint: classify the document and persist the result. Routing is the
+    caller's job — see the module docstring."""
     document = load_source_document(ctx)
     # The document type is evident from the first pages; send only those to the
     # classifier. Extraction still reads the whole document.
@@ -206,14 +208,9 @@ def classify_report(ctx: StageContext) -> None:
         raise TransientStageError("classification output failed validation") from exc
 
     _persist_classification(ctx, result)
-
-    if result.section not in PROCESSABLE_SECTIONS:
-        # Correctly classified, just not a report this sprint routes/processes. The
-        # detected section is the reason; the document stays in unclassified_files.
-        reason = result.section.value
-        _log(ctx, outcome="rejected", error_code=reason, response=response, duration_ms=duration_ms)
-        raise RejectStageError(reason, f"Document classified as {reason}, not a report")
-
+    # Whether we can *process* this section is the router's decision, not this stage's:
+    # classification succeeded either way, and a stage that rejected here would have to
+    # know the pipeline table — which imports this module. See workers/stages.py.
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
 
 
