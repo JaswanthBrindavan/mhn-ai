@@ -35,6 +35,10 @@ PRICES: dict[str, ModelPrice] = {
     "claude-sonnet-5": ModelPrice(Decimal("3.00"), Decimal("15.00")),
     "claude-sonnet-4-6": ModelPrice(Decimal("3.00"), Decimal("15.00")),
     "claude-haiku-4-5": ModelPrice(Decimal("1.00"), Decimal("5.00")),
+    # Gemini (ai.google.dev/gemini-api/docs/pricing, standard tier, 2026-07-29).
+    "gemini-3.1-flash-lite": ModelPrice(Decimal("0.25"), Decimal("1.50")),
+    "gemini-3.5-flash-lite": ModelPrice(Decimal("0.30"), Decimal("2.50")),
+    "gemini-3.1-flash": ModelPrice(Decimal("0.50"), Decimal("3.00")),
 }
 
 

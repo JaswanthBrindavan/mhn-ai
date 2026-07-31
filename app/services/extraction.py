@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
+from app.integrations.ai.factory import get_stage_provider
 from app.models.ai_results import AiReportExtraction
 from app.services import ideal_ranges, normalization
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
@@ -27,10 +28,15 @@ from app.workers.stagetypes import StageContext, TransientStageError
 logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "ext-2026-07-27"
-SCHEMA_VERSION = "ext-2"
+#: ext-3 widened reference_range from 128 to 512 chars. Same fields, but stored payloads
+#: can now carry a full interpretation scale where they previously could not, so results
+#: are not comparable across the boundary without knowing which side they came from.
+SCHEMA_VERSION = "ext-3"
 STAGE_NAME = "extracting"
 #: Reports can carry many analytes; give the model room but keep it bounded.
-EXTRACT_MAX_TOKENS = 8192
+#: Room for a ~120-result panel. A full-body report has produced 98 distinct results at
+#: ~70 tokens each; 8192 was 82% used on a 100-result document.
+EXTRACT_MAX_TOKENS = 16000
 
 
 class ExtractedLabResult(BaseModel):
@@ -40,7 +46,11 @@ class ExtractedLabResult(BaseModel):
     test_name: str = Field(min_length=1, max_length=256)
     value: str | None = Field(default=None, max_length=128)
     unit: str | None = Field(default=None, max_length=64)
-    reference_range: str | None = Field(default=None, max_length=128)
+    #: 512, not 128: eGFR and HbA1c print a full interpretation scale as the range
+    #: (">= 90 : Normal / 60 - 89 : Mild Decrease / ...", 138-160 chars). At 128 those
+    #: were rejected outright, and a model that truncates them to the first clause passed
+    #: while a faithful one failed — hiding the truncation rather than surfacing it.
+    reference_range: str | None = Field(default=None, max_length=512)
     observed_date: str | None = Field(default=None, max_length=64)
     source_context: str | None = Field(default=None, max_length=512)
 
@@ -117,16 +127,28 @@ SYSTEM_PROMPT = (
     "a discharge summary), return an empty results list. Never invent values or ranges."
 )
 
-INSTRUCTION = "Extract every lab/test result from the attached report as structured data."
+#: Completeness has to be demanded explicitly. Asked only to "extract every result", a model
+#: reading a long multi-panel report will return a *representative sample per section* —
+#: measured at 27 of 99 results on a 17-page report, deterministically, reporting success.
+#: Spelling out "every row, every table, every page, do not summarise" fixes it. The cost of
+#: over-asking is duplicate rows, which `_dedupe_results` removes; the cost of under-asking
+#: is silent omission, which nothing can detect.
+INSTRUCTION = (
+    "Extract every lab/test result from the attached report as structured data. Return EVERY "
+    "row of EVERY results table on EVERY page. Do not summarise, sample, or select "
+    "representative results — completeness is the requirement. Work through the document "
+    "page by page."
+)
 
 
 def extract_report(ctx: StageContext) -> None:
     """Stage entrypoint: extract, normalise deterministically, and persist."""
     document = load_source_document(ctx)
+    provider = get_stage_provider(ctx.settings, ctx.ai, stage=STAGE_NAME)
 
     started = time.perf_counter()
     try:
-        response = ctx.ai.analyze_document(
+        response = provider.analyze_document(
             document=document,
             system=SYSTEM_PROMPT,
             instruction=INSTRUCTION,
@@ -169,8 +191,8 @@ def extract_report(ctx: StageContext) -> None:
         )
         raise TransientStageError("extraction output failed validation") from exc
 
-    # Resolve approved-THP ideal ranges (age-group) when enabled; otherwise behaviour is
-    # exactly as before (report's own reference range drives the flag).
+    # Resolve approved-THP ideal ranges (by age bracket) when enabled; otherwise behaviour
+    # is exactly as before (report's own reference range drives the flag).
     if ctx.settings.ideal_ranges_enabled:
         lookup: ideal_ranges.Lookup | None = ideal_ranges.load_lookup(ctx.session)
         ladder = ideal_ranges.build_group_ladder(result.patient_age, result.patient_gender)
@@ -189,6 +211,43 @@ def extract_report(ctx: StageContext) -> None:
 # --- helpers ----------------------------------------------------------------
 
 
+def _informativeness(row: ExtractedLabResult) -> tuple[int, int, int]:
+    """How much a row tells us, for picking between duplicates. Higher wins."""
+    return (
+        1 if row.reference_range else 0,
+        1 if row.value else 0,
+        1 if row.unit else 0,
+    )
+
+
+def _dedupe_results(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
+    """One row per test name, keeping the most informative and the original order.
+
+    Demanding completeness (see ``INSTRUCTION``) can make a model emit its summary pass AND
+    its full pass, repeating some tests. Measured on a 17-page report: 124 rows for 98
+    distinct tests, where 23 of the 26 duplicated pairs were byte-identical and the other 3
+    differed only by one copy having lost the reference range.
+
+    Deduplicating here rather than prompting harder keeps it deterministic: same input, same
+    output, no model involved in the decision.
+
+    The key drops case and **all** whitespace, not just runs of it: ``BILIRUBIN -DIRECT`` and
+    ``BILIRUBIN - DIRECT`` are one test, as are ``HDL / LDL RATIO`` and ``HDL/LDL RATIO``.
+    Two genuinely different analytes never differ by spacing alone, and the stored
+    ``test_name`` is untouched — this only decides what counts as a repeat.
+    """
+    best: dict[str, ExtractedLabResult] = {}
+    order: list[str] = []
+    for row in rows:
+        key = "".join(row.test_name.lower().split())
+        if key not in best:
+            best[key] = row
+            order.append(key)
+        elif _informativeness(row) > _informativeness(best[key]):
+            best[key] = row
+    return [best[key] for key in order]
+
+
 def _normalize(
     result: DocumentExtraction,
     lookup: ideal_ranges.Lookup | None,
@@ -200,7 +259,7 @@ def _normalize(
     enriched: list[dict[str, Any]] = []
     fallbacks: list[FallbackEntry] = []
 
-    for r in result.results:
+    for r in _dedupe_results(result.results):
         data = r.model_dump()
         if lookup is None:  # feature off — unchanged behaviour, no worklist
             enriched.append(normalization.enrich_result(data, gender=result.patient_gender))

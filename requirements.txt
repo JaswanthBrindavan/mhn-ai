@@ -39,3 +39,7 @@ pdfplumber==0.11.10
 pytesseract==0.3.13
 # pdfplumber requires Pillow>=12.2.0, so this cannot go back to the 11.x line.
 pillow==12.3.0
+
+# Gemini, for running classification and extraction on a cheaper provider
+# (CLASSIFICATION_PROVIDER / EXTRACTION_PROVIDER = gemini).
+google-genai==2.14.0

@@ -63,6 +63,20 @@ class Settings(BaseSettings):
     ai_max_tokens: int = 16000
     anthropic_api_key: str = ""
 
+    # Per-stage provider overrides. Empty = same provider as everything else (the default,
+    # so single-provider deploys are unchanged). Only "gemini" is recognised today.
+    #
+    # Classification picks one label from the first two pages, and extraction transcribes a
+    # table — neither needs a frontier model, and extraction is the most expensive stage
+    # because the whole document goes to the model. Insight generation deliberately has no
+    # override: it reasons about health for a patient to read, and stays on Claude.
+    # Measured: same results, 41% less cost, 20% faster. See docs/ai-provider-comparison.md.
+    classification_provider: str = ""
+    ai_model_classification: str = ""
+    extraction_provider: str = ""
+    ai_model_extraction: str = ""
+    google_api_key: str = ""
+
     # --- Ideal ranges (approved-THP override) -------------------------------
     # When on, extraction overrides the report's reference range with the R&D-approved
     # ideal range for the patient's age group (Spring-owned parameter tables). OFF by
