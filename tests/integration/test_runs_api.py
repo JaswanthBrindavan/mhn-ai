@@ -3,6 +3,7 @@
 import uuid
 
 import pytest
+from sqlalchemy import text
 
 from app.models.enums import RunItemStatus
 
@@ -220,3 +221,74 @@ def _complete(db_session, item_id: str) -> None:
         {"id": uuid.UUID(item_id)},
     )
     db_session.flush()
+
+
+# --- document_type: how a caller knows which typed result URL to call --------
+
+
+def _classify(db_session, item_id, document_id, section) -> None:
+    db_session.execute(
+        text(
+            "INSERT INTO ai_report_classifications (run_item_id, document_id, section, title, "
+            "confidence, prompt_version, schema_version) "
+            "VALUES (:i, :d, :s, 'Doc', 0.9, 'clf-2', 'clf-2')"
+        ),
+        {"i": item_id, "d": document_id, "s": section},
+    )
+    db_session.flush()
+
+
+@pytest.mark.parametrize(
+    ("section", "expected_type"),
+    [
+        ("reports", "reports"),
+        ("scans_imaging", "scans"),  # the section and the URL word differ on purpose
+        ("insurance", "insurance"),
+        ("vaccinations", "vaccinations"),
+        ("prescriptions", "prescriptions"),
+    ],
+)
+def test_run_item_carries_the_type_to_read_it_under(
+    api, make_document, db_session, section, expected_type
+):
+    """The result routes are typed and there is no untyped variant, so the run a caller
+    already polls has to say which type to use. Without this the API is unusable."""
+    document_id = make_document()
+    run_id = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()[
+        "run_id"
+    ]
+    item_id = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]["item_id"]
+    _classify(db_session, uuid.UUID(item_id), document_id, section)
+
+    item = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]
+
+    assert item["document_type"] == expected_type
+    # And that URL is the one that actually answers.
+    assert api.get(f"/v1/documents/{expected_type}/{document_id}/ai-result").status_code == 200
+
+
+def test_run_item_has_no_type_before_classification(api, make_document):
+    document_id = make_document()
+    run_id = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()[
+        "run_id"
+    ]
+
+    item = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]
+
+    assert item["document_type"] is None
+
+
+@pytest.mark.parametrize("section", ["bills", "medical_condition", "unknown"])
+def test_sections_with_no_addressable_type_report_none(api, make_document, db_session, section):
+    """bills is stored not interpreted, medical_condition is entered by hand, unknown is by
+    definition unclassified — none produces a result to read, so none has a URL."""
+    document_id = make_document()
+    run_id = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()[
+        "run_id"
+    ]
+    item_id = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]["item_id"]
+    _classify(db_session, uuid.UUID(item_id), document_id, section)
+
+    item = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]
+
+    assert item["document_type"] is None

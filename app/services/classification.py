@@ -6,9 +6,9 @@ Pydantic (never repair it), persist the classification and a process log, then e
 continue the pipeline (it is a report) or reject the item with the detected section as
 the reason.
 
-The actual move into the ``reports`` table (INSERT the row, write ``reports.content``,
-DELETE the ``unclassified_files`` row) happens in the assembly stage after extraction and
-insights, so a document is only moved once its content is ready — not here.
+The move into the ``reports`` table (INSERT the row, write ``reports.content``, DELETE the
+``unclassified_files`` row) happens after extraction and insights, so a document is only
+moved once its content is ready — not here.
 
 Idempotent: the classification and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
@@ -26,6 +26,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.integrations.ai.base import AIProviderError
 from app.integrations.ai.factory import get_stage_provider
 from app.models.ai_results import AiReportClassification
+from app.schemas.results import DocumentType
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
 from app.services.pdf_pages import limit_pdf_pages
 from app.services.source_loading import load_source_document
@@ -60,6 +61,28 @@ class DocumentSection(StrEnum):
 #: Only the reports section is moved and deep-processed this sprint. Everything else is
 #: recognised, recorded, and left in unclassified_files for future sprints to route.
 PROCESSABLE_SECTIONS: frozenset[DocumentSection] = frozenset({DocumentSection.REPORTS})
+
+#: URL type -> the section a document must have been classified as to be read under it.
+#:
+#: Lives here, beside ``DocumentSection``, because both ``results`` and ``runs`` need it and
+#: ``results`` already imports ``runs`` — putting it in either would make that a cycle.
+#:
+#: The sections with no addressable type are deliberate, not an oversight: ``bills`` is
+#: stored rather than interpreted, ``medical_condition`` is entered by hand, and ``unknown``
+#: is by definition unclassified. None of them produces an AI result to read.
+SECTION_BY_DOCUMENT_TYPE: dict[DocumentType, DocumentSection] = {
+    DocumentType.REPORTS: DocumentSection.REPORTS,
+    DocumentType.SCANS: DocumentSection.SCANS_IMAGING,
+    DocumentType.INSURANCE: DocumentSection.INSURANCE,
+    DocumentType.VACCINATIONS: DocumentSection.VACCINATIONS,
+    DocumentType.PRESCRIPTIONS: DocumentSection.PRESCRIPTIONS,
+}
+
+#: The same mapping keyed by the section string as stored, for going from a classification
+#: back to the URL that reads it.
+DOCUMENT_TYPE_BY_SECTION: dict[str, DocumentType] = {
+    section.value: document_type for document_type, section in SECTION_BY_DOCUMENT_TYPE.items()
+}
 
 
 class DocumentClassification(BaseModel):
@@ -133,7 +156,6 @@ def classify_report(ctx: StageContext) -> None:
     document = replace(
         document, data=limit_pdf_pages(document.data, ctx.settings.classify_max_pages)
     )
-
     # Picking one label off two pages does not need a frontier model; the stage can be
     # pointed at a cheaper provider without touching the rest of the pipeline.
     provider = get_stage_provider(ctx.settings, ctx.ai, stage=STAGE_NAME)

@@ -6,6 +6,7 @@ item's id). Retry re-submits a single not-completed document through the same id
 submission path, so there is one code path for creating and publishing work.
 """
 
+import uuid
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -19,9 +20,15 @@ from app.models.ai_results import (
 )
 from app.models.enums import ACTIVE_STATUSES, RunItemStatus
 from app.models.processing import AiProcessingRunItem
-from app.schemas.results import ClassificationResult, DocumentAiResult, RetryResponse
+from app.schemas.results import (
+    ClassificationResult,
+    DocumentAiResult,
+    DocumentType,
+    RetryResponse,
+)
 from app.schemas.runs import CreateRunRequest
 from app.services import runs as runs_service
+from app.services.classification import SECTION_BY_DOCUMENT_TYPE
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mypy_boto3_s3.client import S3Client
@@ -41,15 +48,66 @@ def _latest_item(session: Session, document_id: int) -> AiProcessingRunItem | No
     ).scalar_one_or_none()
 
 
-def get_document_ai_result(session: Session, document_id: int) -> DocumentAiResult:
+def _classification(session: Session, item_id: uuid.UUID) -> AiReportClassification | None:
+    return session.execute(
+        select(AiReportClassification).where(AiReportClassification.run_item_id == item_id)
+    ).scalar_one_or_none()
+
+
+def _require_type(
+    item: AiProcessingRunItem,
+    clf: AiReportClassification | None,
+    document_type: DocumentType,
+    *,
+    unclassified_ok: bool = False,
+) -> None:
+    """Check the type in the URL against the section the document was classified as.
+
+    A mismatch is always refused. Both refusals are 409 rather than 404: the document and
+    its result exist — it is the *type* in the path that is wrong or not yet known, and
+    Spring must not read either case as "no such document".
+
+    ``unclassified_ok`` covers the case where the document has no classification yet. The
+    two routes want opposite answers, deliberately:
+
+    * **Reading** a result under a typed URL asserts the document *is* that type, so
+      answering with an unverified type would be the disclosure this route exists to
+      prevent. Refused.
+    * **Retrying** returns no document data; it re-queues work. Refusing there would block
+      the commonest retry of all — a document that failed *during* classification, and so
+      has no section precisely because it needs retrying. Allowed, which also keeps retry a
+      single endpoint rather than sending that one case somewhere else.
+    """
+    if clf is None:
+        if unclassified_ok:
+            return
+        raise ApiError(
+            409,
+            "not_classified_yet",
+            "This document has not been classified yet, so its type cannot be confirmed",
+            {"status": item.status},
+        )
+    expected = SECTION_BY_DOCUMENT_TYPE[document_type]
+    if clf.section != expected.value:
+        raise ApiError(
+            409,
+            "section_mismatch",
+            f"This document was classified as '{clf.section}', not '{document_type.value}'",
+            {"detected_section": clf.section, "requested_type": document_type.value},
+        )
+
+
+def get_document_ai_result(
+    session: Session, document_id: int, *, document_type: DocumentType
+) -> DocumentAiResult:
     item = _latest_item(session, document_id)
     if item is None:
         raise ApiError(404, "no_ai_result", "No AI result exists for this document")
 
-    clf = session.execute(
-        select(AiReportClassification).where(AiReportClassification.run_item_id == item.id)
-    ).scalar_one_or_none()
-    extraction = session.execute(
+    clf = _classification(session, item.id)
+    _require_type(item, clf, document_type)
+
+    extraction_data = session.execute(
         select(AiReportExtraction.data).where(AiReportExtraction.run_item_id == item.id)
     ).scalar_one_or_none()
     insights = session.execute(
@@ -75,7 +133,7 @@ def get_document_ai_result(session: Session, document_id: int) -> DocumentAiResu
         reports_id=item.reports_id,
         last_error_code=item.last_error_code,
         classification=classification,
-        extraction=extraction,
+        extraction=extraction_data,
         insights=insights,
     )
 
@@ -88,6 +146,7 @@ def retry_document(
     s3: "S3Client",
     sqs: "SQSClient",
     settings: "Settings",
+    document_type: DocumentType,
 ) -> RetryResponse:
     """Re-run a document that did not complete (failed / rejected / cancelled).
 
@@ -99,6 +158,11 @@ def retry_document(
     item = _latest_item(session, document_id)
     if item is None:
         raise ApiError(404, "no_ai_result", "No AI result exists for this document to retry")
+
+    # The type is checked before the status: a wrong type in the path is the caller
+    # addressing the wrong document, which is worth saying plainly even when the document
+    # also happens to be completed or in flight.
+    _require_type(item, _classification(session, item.id), document_type, unclassified_ok=True)
 
     if item.status in _ACTIVE:
         raise ApiError(

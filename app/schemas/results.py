@@ -6,9 +6,31 @@ extraction and insights payloads are the same JSON stored under ``reports.conten
 """
 
 import uuid
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+class DocumentType(StrEnum):
+    """The document types addressable in a URL path.
+
+    A **URL vocabulary**, deliberately not the same enum as ``DocumentSection``: ``scans``
+    reads better in a path than the section's ``scans_imaging``, and only the types Spring
+    routes are addressable. ``app.services.results.SECTION_BY_DOCUMENT_TYPE`` maps one to
+    the other.
+
+    The type in a path is always the section a document was **classified as**, never a
+    declaration by the caller — every upload lands in ``unclassified_files`` and this
+    service detects the section, so at submit time there is no type to state. Declaring it
+    as a path parameter makes FastAPI reject an unknown type with 422 before any query runs.
+    """
+
+    REPORTS = "reports"
+    SCANS = "scans"
+    INSURANCE = "insurance"
+    VACCINATIONS = "vaccinations"
+    PRESCRIPTIONS = "prescriptions"
 
 
 class ClassificationResult(BaseModel):
