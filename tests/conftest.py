@@ -1,7 +1,7 @@
 import os
 
 # Settings are read at import time, so the environment must be prepared before any
-# app module loads. Tests never touch the developer's real .env values.
+# app module loads.
 os.environ.setdefault(
     "DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/mhn_ai"
 )
@@ -21,7 +21,16 @@ os.environ.setdefault("MHN_SERVICE_TOKEN", "test-service-token-at-least-32-chars
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings
 from app.main import create_app
+
+# Clearing os.environ above is not enough on its own: pydantic-settings also reads the .env
+# *file* for every field an environment variable does not set, so a developer's local
+# CLASSIFICATION_PROVIDER=gemini or IDEAL_RANGES_ENABLED=true would silently decide what the
+# suite asserts. Detaching the file covers every Settings() a test builds — including the
+# ones inside test modules — instead of neutralising one field at a time. Safe here because
+# nothing constructs Settings at import time; get_settings() is called inside create_app().
+Settings.model_config["env_file"] = None
 
 
 @pytest.fixture

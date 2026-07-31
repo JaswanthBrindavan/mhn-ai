@@ -29,3 +29,6 @@ htmlcov/
 .vscode/
 *.swp
 Thumbs.db
+
+# Reference screenshots of the staff THP dashboard (local only, like docs/).
+Current_Thp_dashboard/

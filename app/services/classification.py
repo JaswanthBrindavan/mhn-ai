@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
+from app.integrations.ai.factory import get_stage_provider
 from app.models.ai_results import AiReportClassification
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
 from app.services.pdf_pages import limit_pdf_pages
@@ -133,9 +134,13 @@ def classify_report(ctx: StageContext) -> None:
         document, data=limit_pdf_pages(document.data, ctx.settings.classify_max_pages)
     )
 
+    # Picking one label off two pages does not need a frontier model; the stage can be
+    # pointed at a cheaper provider without touching the rest of the pipeline.
+    provider = get_stage_provider(ctx.settings, ctx.ai, stage=STAGE_NAME)
+
     started = time.perf_counter()
     try:
-        response = ctx.ai.analyze_document(
+        response = provider.analyze_document(
             document=document,
             system=SYSTEM_PROMPT,
             instruction=INSTRUCTION,

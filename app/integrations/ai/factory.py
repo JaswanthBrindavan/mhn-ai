@@ -1,14 +1,36 @@
-"""Construct the configured AI provider.
+"""Construct the configured AI provider(s).
 
-The single place an Anthropic client is built, mirroring the boto3 factory. Model and
-key come from settings; an empty model falls back to the mandated default.
+The single place AI clients are built, mirroring the boto3 factory. Models and keys come
+from settings; an empty model falls back to that provider's mandated default.
+
+**Per-stage providers.** Each stage can run on a different provider, because the stages ask
+for very different things:
+
+* *classifying* — pick one label from the first two pages. A small model's job.
+* *extracting* — transcribe every row of a table. Mechanical, but the most expensive stage,
+  since the whole document goes to the model.
+* *generating_insights* — reason about health in plain language for a patient to read. This
+  is where a stronger model earns its cost, and it deliberately stays on Claude.
+
+An empty override means "same provider as everything else", which is the default and keeps
+single-provider deploys unchanged.
 """
 
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.integrations.ai.anthropic_provider import DEFAULT_MODEL, AnthropicProvider
 from app.integrations.ai.base import AIProvider
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from google import genai
+
+#: Stage name (as used in ``ai_process_logs.stage``) -> the settings fields that override it.
+_STAGE_OVERRIDES = {
+    "classifying": ("classification_provider", "ai_model_classification"),
+    "extracting": ("extraction_provider", "ai_model_extraction"),
+}
 
 
 @lru_cache
@@ -20,3 +42,46 @@ def get_ai_provider() -> AIProvider:
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key or None)
     return AnthropicProvider(client, settings.ai_model or DEFAULT_MODEL)
+
+
+@lru_cache
+def _gemini_client(api_key: str) -> "genai.Client":
+    from google import genai
+
+    return genai.Client(api_key=api_key)
+
+
+def get_gemini_provider(api_key: str, model: str = "") -> AIProvider:
+    """Build a Gemini provider from an explicit key and model.
+
+    The key is a parameter rather than read from global settings so the caller's ``Settings``
+    is the single source of truth — otherwise the missing-key guard below can pass in a
+    process whose environment happens to have a key, which is exactly the situation where it
+    most needs to fire.
+    """
+    from app.integrations.ai.gemini_provider import DEFAULT_MODEL as GEMINI_DEFAULT
+    from app.integrations.ai.gemini_provider import GeminiProvider
+
+    if not api_key:
+        raise RuntimeError(
+            "A stage is configured to use gemini but GOOGLE_API_KEY is not set. Refusing to "
+            "run a stage that cannot authenticate."
+        )
+    return GeminiProvider(_gemini_client(api_key), model or GEMINI_DEFAULT)
+
+
+def get_stage_provider(settings: Settings, default: AIProvider, *, stage: str) -> AIProvider:
+    """The provider a stage should use: its override if configured, else ``default``.
+
+    ``default`` is the provider already injected into the stage, so the ordinary path stays
+    dependency-injected and tests keep control by passing their own. Only an explicit
+    per-stage override diverges from it.
+    """
+    provider_field, model_field = _STAGE_OVERRIDES.get(stage, ("", ""))
+    if not provider_field:
+        return default
+    if getattr(settings, provider_field).strip().lower() == "gemini":
+        return get_gemini_provider(
+            settings.google_api_key.strip(), getattr(settings, model_field).strip()
+        )
+    return default
