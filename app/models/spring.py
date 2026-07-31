@@ -15,7 +15,6 @@ the source ``unclassified_files`` row. It never issues DDL against any Spring ta
 """
 
 from sqlalchemy import (
-    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -25,7 +24,7 @@ from sqlalchemy import (
     String,
     Table,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 
 spring_metadata = MetaData()
 
@@ -61,41 +60,48 @@ reports = Table(
 )
 
 # --- Staff-dashboard THP tables (read-only) ---------------------------------
-# The R&D team curates doctor-approved health parameters (THPs) and their ideal ranges
-# per age group via a staff dashboard; the rows land in these Spring-owned tables and we
-# read them to override a report's printed reference range (see app/services/ideal_ranges).
+# The R&D team curates doctor-approved traditional health parameters (THPs), their ideal
+# ranges per age bracket, and the alternate units a lab might print, via a staff dashboard.
+# The rows land in these Spring-owned tables and we read them to override a report's
+# printed reference range (see app/services/ideal_ranges).
 #
-# DEPENDENCY: these tables do not exist in the Spring base schema yet. The names below are
-# our proposed clean contract (the reference Django app uses parameter_parameter /
-# parameter_parameteridealvalues) and MUST be reconciled with the real Spring migration
-# when it lands. The feature is gated OFF (settings.ideal_ranges_enabled) until then, so a
-# mismatch cannot affect production. Only the columns we read are declared.
+# Shapes follow the Spring migration of 2026-07-30. Only the columns we read are declared:
+# thp_age_range also carries min/low_danger/ideal/high_danger/max, which drive the
+# dashboard's gauge but not our three-value abnormal flag.
 
-#: THP master. Approval predicate (to confirm): status == approved AND approved_by_id set.
-parameters = Table(
-    "parameters",
+#: THP master. ``approved`` is the doctor-approval gate. ``visible`` is NOT declared: the
+#: dashboard labels it "Customer visibility?", so it governs app display, not approval.
+traditional_health_parameters = Table(
+    "traditional_health_parameters",
     spring_metadata,
-    Column("pkid", BigInteger, primary_key=True),
-    Column("name", String(155), nullable=True),
-    Column("status", String(50), nullable=True),
-    Column("approved_by_id", Integer, nullable=True),
+    Column("id", Integer, primary_key=True),
+    Column("name", String(100), nullable=False),
+    #: The unit the parameter's ideal ranges are curated in.
+    Column("units", String(25), nullable=False),
+    Column("approved", Boolean, nullable=True),
+    #: Other names the same parameter appears under on a report.
+    Column("aliases", ARRAY(String(100)), nullable=True),
 )
 
-#: Alternate names for a THP, matched case-insensitively after the exact name.
-parameter_aliases = Table(
-    "parameter_aliases",
+#: Ideal range per age bracket, inclusive on both ends. ``low_warn``/``high_warn`` bound
+#: the dashboard's "Ideal Range"; see _IDEAL_FLOOR in app/services/ideal_ranges.py.
+thp_age_range = Table(
+    "thp_age_range",
     spring_metadata,
-    Column("parameter_id", BigInteger, nullable=False),  # -> parameter_parameter.pkid
-    Column("alias", String(255), nullable=True),
+    Column("thp_id", Integer, nullable=False),
+    Column("age_min", Integer, nullable=False),
+    Column("age_max", Integer, nullable=False),
+    Column("low_warn", Float, nullable=False),
+    Column("high_warn", Float, nullable=False),
 )
 
-#: Ideal range per demographic group (free-text, e.g. "Adult Male" / "Adult All" / "All").
-#: Only the ideal min/max are read — not the warning/danger cascade.
-parameter_ideal_values = Table(
-    "parameter_ideal_values",
+#: Units other than the parameter's own that a report may print, with the conversion into
+#: it: ``base = printed * multiplier + offset_value``.
+thp_alternate_units = Table(
+    "thp_alternate_units",
     spring_metadata,
-    Column("parameter_id", BigInteger, nullable=False),  # -> parameter_parameter.pkid
-    Column("group", String(50), nullable=True),
-    Column("ideal_value_min", Float, nullable=True),
-    Column("ideal_value_max", Float, nullable=True),
+    Column("thp_id", Integer, nullable=False),
+    Column("name", String(100), nullable=False),
+    Column("multiplier", Float, nullable=False),
+    Column("offset_value", Float, nullable=False),
 )
