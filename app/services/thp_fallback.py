@@ -18,12 +18,15 @@ class FallbackEntry:
     """One extracted test for which no approved-THP ideal range applied."""
 
     test_name: str
-    reason: str  # unmatched | unapproved | no_ideal_range
+    reason: str  # unmatched | unapproved | no_ideal_range | unit_mismatch
     matched_parameter: str | None = None
     group_attempted: str | None = None
     patient_age: str | None = None
     patient_gender: str | None = None
     report_reference_range: str | None = None
+    #: What the report printed the value in. The fix for a unit_mismatch row is to add this
+    #: to the parameter's alternate units, so it has to be in the worklist.
+    report_unit: str | None = None
 
 
 def record_fallbacks(ctx: StageContext, entries: list[FallbackEntry]) -> None:
@@ -44,6 +47,7 @@ def record_fallbacks(ctx: StageContext, entries: list[FallbackEntry]) -> None:
                     "patient_age": e.patient_age,
                     "patient_gender": e.patient_gender,
                     "report_reference_range": e.report_reference_range,
+                    "report_unit": e.report_unit,
                 }
                 for e in entries
             ],

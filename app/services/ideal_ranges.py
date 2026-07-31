@@ -1,21 +1,18 @@
-"""Resolve the doctor-approved ideal range for a lab result, by age group.
+"""Resolve the doctor-approved ideal range for a lab result, by the patient's age.
 
-For each extracted test we try to match it to an R&D-approved THP (health parameter)
-and pick the ideal range for the patient's age-group ladder; that range then overrides
-the report's printed reference range for the abnormal-flag calculation. A miss (test not
-a known parameter, parameter not approved, or no ideal range for the group) leaves the
-report's own range in charge and is recorded as an R&D worklist fallback.
+For each extracted test we try to match it to an R&D-approved THP (traditional health
+parameter) and pick the ideal range for the patient's age bracket; that range then
+overrides the report's printed reference range for the abnormal-flag calculation. A miss —
+the test is not a known parameter, the parameter is not approved, no bracket covers the
+age, or the report printed a unit we cannot convert — leaves the report's own range in
+charge and is recorded as an R&D worklist fallback.
 
-All logic here is deterministic Python. The Spring-owned parameter tables are read once
-per document (``load_lookup``); everything else is pure and unit-testable without a DB.
+All logic here is deterministic Python. The Spring-owned THP tables are read once per
+document (``load_lookup``); everything else is pure and unit-testable without a DB.
 
-Ported/adapted from the reference implementation
-``D:\\mhn-ai-main-1\\mhn-ai-main\\source\\utils.py`` (match_parameter / load_ideal_values)
-and the age-group ladder in its ``docs/main-backend-context.md`` §3.
-
-# ponytail: curated cutoffs + first-hit ladder, not a demographics engine. The Spring
-# table names + approval predicate are UNCONFIRMED (feature is flag-gated off) — the two
-# marked constants below are the only things to change when they are.
+# ponytail: three dict lookups over the curated tables, no demographics engine. The one
+# unconfirmed thing left is the direction of thp_alternate_units.multiplier — see
+# ``in_report_unit``.
 """
 
 import re
@@ -24,34 +21,30 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.spring import parameter_aliases, parameter_ideal_values, parameters
+from app.models.spring import thp_age_range, thp_alternate_units, traditional_health_parameters
+from app.services.normalization import canon_unit
 
-# --- approval predicate (TO CONFIRM with Spring/R&D) ------------------------
-#: A THP is usable only when doctor-approved. Reference marks approval with a status
-#: string plus a non-null approver. Both are guesses until the Spring schema is final.
-_APPROVED_STATUS = "approved"
+# --- what counts as "in range" ----------------------------------------------
+# Confirmed with R&D. The seven bounds are six zone edges around a target value:
+#
+#   min ──danger low── low_danger ──warn low── low_warn ══ ideal band ══ high_warn
+#       ──warn high── high_danger ──danger high── max
+#
+# ``min`` is the lower end of the low-danger zone and ``max`` the upper end of the
+# high-danger zone, so every column is a clinical boundary rather than a chart limit. The
+# abnormal flag is computed against (low_warn, high_warn) — the pair the staff dashboard
+# labels "Ideal Range", and the pair its editor sets as "Start of Ideal" and "Start of
+# Warning (High)".
+#
+# ``ideal`` is the target value *inside* that band, not an edge of it — the schema pins it
+# there (low_warn <= ideal <= high_warn) — so nothing here reads it. The danger/warn split
+# is not read either: our flag is three-valued (low/normal/high), and surfacing severity
+# would be a change to the stored payload, not to this lookup.
+_IDEAL_FLOOR = thp_age_range.c.low_warn
+_IDEAL_CEILING = thp_age_range.c.high_warn
 
-
-def _is_approved(status: str | None, approved_by_id: int | None) -> bool:
-    return (status or "").strip().lower() == _APPROVED_STATUS and approved_by_id is not None
-
-
-# --- age parsing + brackets -------------------------------------------------
+# --- age parsing ------------------------------------------------------------
 _AGE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)")
-
-#: Ordered, upper-inclusive age-group cutoffs in YEARS. First hit wins. Keep in sync with
-#: docs/main-backend-context.md §3 (Neonate ≤28d, Infant ≤1y, Toddler ≤3y, Child ≤10y,
-#: Adolescent ≤18y). Adult/Older split at 60 is exclusive/inclusive, handled below.
-_NEONATE_MAX = 28 / 365.25
-_ADULT_MAX_EXCLUSIVE = 60.0
-_AGE_GROUP_CUTOFFS: list[tuple[float, str]] = [
-    (_NEONATE_MAX, "Neonate"),
-    (1.0, "Infant"),
-    (3.0, "Toddler"),
-    (10.0, "Child"),
-    (18.0, "Adolescent"),
-]
-_PEDIATRIC = frozenset({"Neonate", "Infant", "Toddler", "Child", "Adolescent"})
 
 
 def parse_age(raw: str | None) -> float | None:
@@ -75,65 +68,12 @@ def parse_age(raw: str | None) -> float | None:
     return None
 
 
-def normalize_gender(raw: str | None) -> str | None:
-    """'M'/'male'→'Male', 'F'/'female'→'Female', anything else → None."""
-    if not raw:
-        return None
-    g = raw.strip().lower()
-    if g in ("m", "male"):
-        return "Male"
-    if g in ("f", "female"):
-        return "Female"
-    return None
-
-
-def _bracket(age_years: float) -> str:
-    for cutoff, name in _AGE_GROUP_CUTOFFS:
-        if age_years <= cutoff:
-            return name
-    return "Adult" if age_years < _ADULT_MAX_EXCLUSIVE else "Older"
-
-
-def has_demographics(age_raw: str | None, gender_raw: str | None) -> bool:
-    """True when the report gave us something to bracket on. Drives fallback-log noise:
-    a miss with no demographics is the report's gap, not R&D's."""
-    return parse_age(age_raw) is not None or normalize_gender(gender_raw) is not None
-
-
-def build_group_ladder(age_raw: str | None, gender_raw: str | None) -> list[str]:
-    """First-hit-wins list of lowercased group keys to try, most specific first.
-
-    e.g. Adult Male → 'adult male','adult all','all male','all'. Older falls through
-    Adult; pediatric brackets splice a 'Children' aggregate; a missing gender drops the
-    gender-specific tiers; a missing age drops the bracket tiers. Always ends with 'all'
-    (the demographic-agnostic range applies to everyone)."""
-    age = parse_age(age_raw)
-    gender = normalize_gender(gender_raw)
-    bracket = _bracket(age) if age is not None else None
-
-    chain: list[tuple[str, str]] = []
-
-    def add(b: str) -> None:
-        if gender is not None:
-            chain.append((b, gender))
-        chain.append((b, "All"))
-
-    if bracket is not None:
-        add(bracket)
-        if bracket == "Older":
-            add("Adult")  # older adults fall through to the adult range
-        elif bracket in _PEDIATRIC:
-            add("Children")  # pediatric aggregate
-    add("All")
-
-    groups: list[str] = []
-    seen: set[str] = set()
-    for b, g in chain:
-        key = "all" if (b == "All" and g == "All") else f"{b} {g}".lower()
-        if key not in seen:
-            seen.add(key)
-            groups.append(key)
-    return groups
+def match_key(name: str | None) -> str:
+    """Lookup key for a test name, parameter name, alias, or unit: lower-cased with **all**
+    whitespace removed. The curated aliases differ by spacing alone ('hdl/ldl ratio' vs
+    'hdl / ldl ratio'), and so do labs' test names — same convention as
+    ``extraction._dedupe_results``."""
+    return "".join((name or "").lower().split())
 
 
 # --- lookup + resolution ----------------------------------------------------
@@ -141,10 +81,14 @@ def build_group_ladder(age_raw: str | None, gender_raw: str | None) -> list[str]
 class Lookup:
     """One-shot snapshot of the Spring THP tables for a document's resolution."""
 
-    pkid_by_name: dict[str, int]  # lowercased name/alias -> parameter pkid
-    approved: dict[int, bool]  # pkid -> doctor-approved?
-    canonical_name: dict[int, str]  # pkid -> the parameter's own name
-    ideal: dict[tuple[int, str], tuple[float | None, float | None]]  # (pkid, group) -> min,max
+    thp_id_by_name: dict[str, int]  # match_key(name or alias) -> thp id
+    approved: dict[int, bool]  # thp id -> doctor-approved?
+    canonical_name: dict[int, str]  # thp id -> the parameter's own name
+    base_unit: dict[int, str]  # thp id -> canon_unit of the parameter's own unit
+    #: (thp id, canon_unit of a printed unit) -> (multiplier, offset) into the base unit.
+    alt_units: dict[tuple[int, str], tuple[float, float]]
+    #: thp id -> [(age_min, age_max, low, high)], unordered.
+    age_ranges: dict[int, list[tuple[int, int, float, float]]]
 
 
 @dataclass(frozen=True)
@@ -152,62 +96,136 @@ class Resolution:
     bounds: tuple[float | None, float | None] | None
     source: str  # "ideal_range" | "report_range"
     matched_parameter: str | None
-    matched_group: str | None
-    reason: str | None  # None on success; else "unmatched"|"unapproved"|"no_ideal_range"
+    matched_group: str | None  # the age bracket used, e.g. "18-60"
+    #: None on success; else unmatched | unapproved | no_ideal_range | unit_mismatch
+    reason: str | None
 
 
 def load_lookup(session: Session) -> Lookup:
-    """Bulk-read the parameter master, aliases, and ideal values. Exact names win over
-    aliases (matching the reference); all parameters loaded so we can tell an unapproved
-    THP from an unknown one."""
-    pkid_by_name: dict[str, int] = {}
+    """Bulk-read the THP master, its alternate units, and its age brackets.
+
+    Exact parameter names are registered before aliases, so a parameter can never be
+    shadowed by another's alias. Unapproved parameters are loaded too — that is how we tell
+    an unapproved THP from an unknown test.
+    """
+    thp_id_by_name: dict[str, int] = {}
     approved: dict[int, bool] = {}
     canonical_name: dict[int, str] = {}
+    base_unit: dict[int, str] = {}
+    alias_rows: list[tuple[int, str]] = []
 
-    for pkid, name, status, approved_by_id in session.execute(
+    for thp_id, name, units, is_approved, aliases in session.execute(
         select(
-            parameters.c.pkid, parameters.c.name, parameters.c.status, parameters.c.approved_by_id
+            traditional_health_parameters.c.id,
+            traditional_health_parameters.c.name,
+            traditional_health_parameters.c.units,
+            traditional_health_parameters.c.approved,
+            traditional_health_parameters.c.aliases,
         )
     ):
-        approved[pkid] = _is_approved(status, approved_by_id)
+        approved[thp_id] = bool(is_approved)
+        base_unit[thp_id] = canon_unit(units or "")
         if name:
-            canonical_name[pkid] = name
-            pkid_by_name.setdefault(name.strip().lower(), pkid)
+            canonical_name[thp_id] = name
+            thp_id_by_name.setdefault(match_key(name), thp_id)
+        alias_rows.extend((thp_id, alias) for alias in (aliases or ()) if alias)
 
-    for pkid, alias in session.execute(
-        select(parameter_aliases.c.parameter_id, parameter_aliases.c.alias)
-    ):
-        if alias and pkid in approved:
-            pkid_by_name.setdefault(alias.strip().lower(), pkid)
+    for thp_id, alias in alias_rows:
+        thp_id_by_name.setdefault(match_key(alias), thp_id)
 
-    ideal: dict[tuple[int, str], tuple[float | None, float | None]] = {}
-    for pkid, group, lo, hi in session.execute(
+    alt_units: dict[tuple[int, str], tuple[float, float]] = {}
+    for thp_id, name, multiplier, offset in session.execute(
         select(
-            parameter_ideal_values.c.parameter_id,
-            parameter_ideal_values.c.group,
-            parameter_ideal_values.c.ideal_value_min,
-            parameter_ideal_values.c.ideal_value_max,
+            thp_alternate_units.c.thp_id,
+            thp_alternate_units.c.name,
+            thp_alternate_units.c.multiplier,
+            thp_alternate_units.c.offset_value,
         )
     ):
-        if group is not None:
-            ideal[(pkid, group.strip().lower())] = (lo, hi)
+        # A non-positive multiplier cannot be inverted into an ordered pair of bounds, so
+        # such a row is treated as absent (the test falls back to its report range).
+        if name and multiplier and multiplier > 0:
+            alt_units[(thp_id, canon_unit(name))] = (multiplier, offset or 0.0)
 
-    return Lookup(pkid_by_name, approved, canonical_name, ideal)
+    age_ranges: dict[int, list[tuple[int, int, float, float]]] = {}
+    for thp_id, age_min, age_max, low, high in session.execute(
+        select(
+            thp_age_range.c.thp_id,
+            thp_age_range.c.age_min,
+            thp_age_range.c.age_max,
+            _IDEAL_FLOOR,
+            _IDEAL_CEILING,
+        )
+    ):
+        age_ranges.setdefault(thp_id, []).append((age_min, age_max, low, high))
+
+    return Lookup(thp_id_by_name, approved, canonical_name, base_unit, alt_units, age_ranges)
 
 
-def resolve(test_name: str, lookup: Lookup, ladder: list[str]) -> Resolution:
+def pick_bracket(
+    rows: list[tuple[int, int, float, float]], age_years: float | None
+) -> tuple[int, int, float, float] | None:
+    """The most specific age bracket covering ``age_years``, or None.
+
+    Brackets are inclusive on both ends and the schema does not forbid overlaps, so the
+    narrowest span wins (ties broken by the lower bound) — deterministic either way. No age
+    means no bracket: a range curated for adults must not be applied to an unknown age.
+    """
+    if age_years is None:
+        return None
+    hits = [row for row in rows if row[0] <= age_years <= row[1]]
+    if not hits:
+        return None
+    return min(hits, key=lambda row: (row[1] - row[0], row[0]))
+
+
+def in_report_unit(
+    bounds: tuple[float, float], unit: str | None, thp_id: int, lookup: Lookup
+) -> tuple[float, float] | None:
+    """The ideal range expressed in the unit the report printed, or None if it cannot be.
+
+    The range is curated in the parameter's own unit, so a report printing another unit
+    needs converting before the numbers can be compared. Converting the two **bounds** once
+    — rather than the value — keeps every downstream comparison (numeric, censored '< 148',
+    qualitative) working unchanged on the value exactly as printed. The dashboard defines
+    conversion as printed → base (``base = printed * multiplier + offset``), so the inverse
+    is applied here; ``load_lookup`` guarantees a positive multiplier, so the pair stays
+    ordered.
+    """
+    printed = canon_unit(unit or "")
+    # No printed unit contradicts nothing, and plenty of results (ratios, indices, counts)
+    # never print one — assume the parameter's own unit rather than losing the override.
+    if not printed or printed == lookup.base_unit.get(thp_id, ""):
+        return bounds
+    conversion = lookup.alt_units.get((thp_id, printed))
+    if conversion is None:
+        return None
+    multiplier, offset = conversion
+    low, high = bounds
+    return (low - offset) / multiplier, (high - offset) / multiplier
+
+
+def resolve(
+    test_name: str, unit: str | None, age_years: float | None, lookup: Lookup
+) -> Resolution:
     """Best authoritative range for one test, or a report-range fallback with a reason."""
-    pkid = lookup.pkid_by_name.get((test_name or "").strip().lower())
-    if pkid is None:
+    thp_id = lookup.thp_id_by_name.get(match_key(test_name))
+    if thp_id is None:
         return Resolution(None, "report_range", None, None, "unmatched")
-    canonical = lookup.canonical_name.get(pkid, test_name)
-    if not lookup.approved.get(pkid, False):
+    canonical = lookup.canonical_name.get(thp_id, test_name)
+    if not lookup.approved.get(thp_id, False):
         return Resolution(None, "report_range", canonical, None, "unapproved")
-    for group in ladder:
-        rng = lookup.ideal.get((pkid, group))
-        if rng is not None and rng[0] is not None and rng[1] is not None:
-            return Resolution(rng, "ideal_range", canonical, group, None)
-    return Resolution(None, "report_range", canonical, None, "no_ideal_range")
+
+    bracket = pick_bracket(lookup.age_ranges.get(thp_id, []), age_years)
+    if bracket is None:
+        return Resolution(None, "report_range", canonical, None, "no_ideal_range")
+    age_min, age_max, low, high = bracket
+    group = f"{age_min}-{age_max}"
+
+    bounds = in_report_unit((low, high), unit, thp_id, lookup)
+    if bounds is None:
+        return Resolution(None, "report_range", canonical, group, "unit_mismatch")
+    return Resolution(bounds, "ideal_range", canonical, group, None)
 
 
 if __name__ == "__main__":  # pragma: no cover - self-check
@@ -216,45 +234,35 @@ if __name__ == "__main__":  # pragma: no cover - self-check
     assert abs((parse_age("15 days") or 0) - 15 / 365.25) < 1e-9
     assert parse_age("1 year") == 1.0
     assert parse_age("Positive") is None
-    assert _bracket(0.05) == "Neonate"
-    assert _bracket(1.0) == "Infant"
-    assert _bracket(3.0) == "Toddler"
-    assert _bracket(18.0) == "Adolescent"
-    assert _bracket(59.9) == "Adult"
-    assert _bracket(60.0) == "Older"
-    assert normalize_gender("M") == "Male"
-    assert normalize_gender("female") == "Female"
-    assert normalize_gender("?") is None
-    assert build_group_ladder("40", "M") == ["adult male", "adult all", "all male", "all"]
-    assert build_group_ladder("70", "F") == [
-        "older female",
-        "older all",
-        "adult female",
-        "adult all",
-        "all female",
-        "all",
-    ]
-    assert build_group_ladder("5", "M") == [
-        "child male",
-        "child all",
-        "children male",
-        "children all",
-        "all male",
-        "all",
-    ]
-    assert build_group_ladder("40", None) == ["adult all", "all"]
-    assert build_group_ladder(None, None) == ["all"]
+    assert match_key("HDL / LDL Ratio") == match_key("hdl/ldl ratio") == "hdl/ldlratio"
+
+    # Narrowest covering bracket wins; both ends inclusive; no age -> no bracket.
+    _rows = [(0, 150, 1.0, 9.0), (18, 60, 4.0, 6.0), (0, 1, 2.0, 3.0)]
+    assert pick_bracket(_rows, 40) == (18, 60, 4.0, 6.0)
+    assert pick_bracket(_rows, 0.5) == (0, 1, 2.0, 3.0)
+    assert pick_bracket(_rows, 60) == (18, 60, 4.0, 6.0)  # inclusive upper
+    assert pick_bracket(_rows, 70) == (0, 150, 1.0, 9.0)
+    assert pick_bracket(_rows, None) is None
+    assert pick_bracket([], 40) is None
 
     _lk = Lookup(
-        pkid_by_name={"hemoglobin": 1, "hb": 1, "glucose": 2, "esr": 3},
+        thp_id_by_name={"hemoglobin": 1, "hb": 1, "glucose": 2, "esr": 3},
         approved={1: True, 2: False, 3: True},
         canonical_name={1: "Hemoglobin", 2: "Glucose", 3: "ESR"},
-        ideal={(1, "adult male"): (13.0, 17.0), (3, "all"): (0.0, 20.0)},
+        base_unit={1: "g/dl", 2: "mg/dl", 3: "mm/hr"},
+        alt_units={(1, "g/l"): (0.1, 0.0)},  # 130 g/L * 0.1 = 13 g/dL
+        age_ranges={1: [(18, 60, 13.0, 17.0)], 3: [(0, 150, 0.0, 20.0)]},
     )
-    adult_male = build_group_ladder("40", "M")
-    assert resolve("Hemoglobin", _lk, adult_male).bounds == (13.0, 17.0)
-    assert resolve("HB", _lk, adult_male).source == "ideal_range"  # alias
-    assert resolve("Glucose", _lk, adult_male).reason == "unapproved"
-    assert resolve("Unknown Test", _lk, adult_male).reason == "unmatched"
-    assert resolve("Hemoglobin", _lk, build_group_ladder("5", "F")).reason == "no_ideal_range"
-    assert resolve("ESR", _lk, adult_male).bounds == (0.0, 20.0)  # only an 'all' range
+    assert resolve("Hemoglobin", "g/dL", 40, _lk).bounds == (13.0, 17.0)
+    assert resolve("HB", None, 40, _lk).source == "ideal_range"  # alias, no printed unit
+    assert resolve("Glucose", "mg/dL", 40, _lk).reason == "unapproved"
+    assert resolve("Unknown Test", None, 40, _lk).reason == "unmatched"
+    assert resolve("Hemoglobin", "g/dL", 5, _lk).reason == "no_ideal_range"
+    assert resolve("Hemoglobin", "g/dL", None, _lk).reason == "no_ideal_range"
+    assert resolve("ESR", "mm/hr", 40, _lk).bounds == (0.0, 20.0)
+    # A printed unit with a curated conversion: bounds come back in g/L, so the report's
+    # own number is compared as printed.
+    assert resolve("Hemoglobin", "g/L", 40, _lk).bounds == (130.0, 170.0)
+    # A printed unit with no conversion is never guessed at.
+    assert resolve("Hemoglobin", "mmol/L", 40, _lk).reason == "unit_mismatch"
+    assert resolve("Hemoglobin", "mmol/L", 40, _lk).matched_group == "18-60"

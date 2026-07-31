@@ -271,8 +271,10 @@ class AiThpFallback(Base):
     reference range because no approved-THP ideal range applied.
 
     ``reason`` tells R&D what to fix — ``unmatched`` (the test is not a known parameter),
-    ``unapproved`` (the parameter exists but isn't doctor-approved), or ``no_ideal_range``
-    (approved, but no ideal range for the patient's age group). Many rows per run item;
+    ``unapproved`` (the parameter exists but isn't doctor-approved), ``no_ideal_range``
+    (approved, but no age bracket covers this patient), or ``unit_mismatch`` (approved with
+    a bracket, but the report printed a unit that is not the parameter's own and has no
+    curated conversion — add it to the parameter's alternate units). Many rows per run item;
     a re-run replaces this item's rows (delete-then-insert), so there are no duplicates.
     Never surfaced in ``reports.content`` — internal curation signal only.
     """
@@ -296,16 +298,20 @@ class AiThpFallback(Base):
     test_name: Mapped[str] = mapped_column(String(256), nullable=False)
     #: The approved/known parameter this matched, if any (null when reason is unmatched).
     matched_parameter: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    #: The most-specific age-group key we tried (null when there was no demographic to try).
+    #: The age bracket that resolved, e.g. "18-60" (null when none did).
     group_attempted: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    #: unmatched | unapproved | no_ideal_range
+    #: unmatched | unapproved | no_ideal_range | unit_mismatch
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
 
     #: Demographics the report gave us (context for R&D; not identifiers).
     patient_age: Mapped[str | None] = mapped_column(String(32), nullable=True)
     patient_gender: Mapped[str | None] = mapped_column(String(32), nullable=True)
     #: The report's own printed range that we fell back to (for R&D to sanity-check).
-    report_reference_range: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    #: Sized to match ``ExtractedLabResult.reference_range``: printed interpretation scales
+    #: (eGFR, HbA1c) run past 128 characters.
+    report_reference_range: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    #: The unit the report printed, which is what a unit_mismatch row asks R&D to curate.
+    report_unit: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

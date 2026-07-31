@@ -79,10 +79,11 @@ class Settings(BaseSettings):
 
     # --- Ideal ranges (approved-THP override) -------------------------------
     # When on, extraction overrides the report's reference range with the R&D-approved
-    # ideal range for the patient's age group (Spring-owned parameter tables). OFF by
-    # default: those tables do not exist in the Spring DB yet, so enabling before they
-    # land would break the lookup. Flip on only after the tables + approval predicate
-    # are confirmed. See docs/superpowers/specs and app/services/ideal_ranges.py.
+    # ideal range for the patient's age bracket (Spring-owned THP tables:
+    # traditional_health_parameters / thp_age_range / thp_alternate_units). OFF by default:
+    # the tables ship in Spring's migration but are not in every database this service
+    # points at, and an empty master would send every test to the fallback worklist. Flip
+    # on once they exist and carry approved rows. See app/services/ideal_ranges.py.
     ideal_ranges_enabled: bool = False
 
     # --- Service ------------------------------------------------------------

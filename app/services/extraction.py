@@ -195,12 +195,11 @@ def extract_report(ctx: StageContext) -> None:
     # is exactly as before (report's own reference range drives the flag).
     if ctx.settings.ideal_ranges_enabled:
         lookup: ideal_ranges.Lookup | None = ideal_ranges.load_lookup(ctx.session)
-        ladder = ideal_ranges.build_group_ladder(result.patient_age, result.patient_gender)
-        demographics = ideal_ranges.has_demographics(result.patient_age, result.patient_gender)
+        age_years = ideal_ranges.parse_age(result.patient_age)
     else:
-        lookup, ladder, demographics = None, [], False
+        lookup, age_years = None, None
 
-    payload, fallbacks = _normalize(result, lookup, ladder, demographics)
+    payload, fallbacks = _normalize(result, lookup, age_years)
     _persist_extraction(ctx, payload)
     if lookup is not None:
         # Always call (even with no fallbacks) to clear a prior attempt's worklist rows.
@@ -251,8 +250,7 @@ def _dedupe_results(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
 def _normalize(
     result: DocumentExtraction,
     lookup: ideal_ranges.Lookup | None,
-    ladder: list[str],
-    demographics_present: bool,
+    age_years: float | None,
 ) -> tuple[dict[str, Any], list[FallbackEntry]]:
     """Enrich each result deterministically, applying the approved ideal-range override
     when one resolves. Returns the persisted payload and any R&D worklist fallbacks."""
@@ -265,7 +263,7 @@ def _normalize(
             enriched.append(normalization.enrich_result(data, gender=result.patient_gender))
             continue
 
-        res = ideal_ranges.resolve(data["test_name"], lookup, ladder)
+        res = ideal_ranges.resolve(data["test_name"], data.get("unit"), age_years, lookup)
         if res.bounds is not None:
             enriched.append(
                 normalization.enrich_result(
@@ -279,18 +277,20 @@ def _normalize(
             continue
 
         enriched.append(normalization.enrich_result(data, gender=result.patient_gender))
-        # Log real curation gaps (unmatched/unapproved always; no_ideal_range only when the
-        # report actually gave demographics — otherwise the gap is the report's, not R&D's).
-        if res.reason != "no_ideal_range" or demographics_present:
+        # Log real curation gaps (unmatched/unapproved/unit_mismatch always; no_ideal_range
+        # only when the report gave a usable age — otherwise the gap is the report's, not
+        # R&D's, and there is nothing for them to fix).
+        if res.reason != "no_ideal_range" or age_years is not None:
             fallbacks.append(
                 FallbackEntry(
                     test_name=data["test_name"],
                     reason=res.reason or "no_ideal_range",
                     matched_parameter=res.matched_parameter,
-                    group_attempted=ladder[0] if ladder else None,
+                    group_attempted=res.matched_group,
                     patient_age=result.patient_age,
                     patient_gender=result.patient_gender,
                     report_reference_range=data.get("reference_range"),
+                    report_unit=data.get("unit"),
                 )
             )
 

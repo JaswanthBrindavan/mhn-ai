@@ -254,7 +254,7 @@ def convert_unit(test_name: str, value: float | None, unit: str | None) -> tuple
     """Curated conversion to a canonical unit, or None if not covered."""
     if value is None or not unit:
         return None
-    canon = _canon_unit(unit)
+    canon = canon_unit(unit)
 
     if canon == "mg/dl":
         name = (test_name or "").lower()
@@ -315,7 +315,7 @@ def enrich_result(
     }
 
 
-def _canon_unit(unit: str) -> str:
+def canon_unit(unit: str) -> str:
     """Canonicalise a unit string to ASCII so equivalent spellings match: lowercase,
     strip spaces, and fold the micro sign, superscript nine, and multiplication sign."""
     u = unit.strip().lower().replace(" ", "")

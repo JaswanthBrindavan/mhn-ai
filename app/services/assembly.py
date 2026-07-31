@@ -26,6 +26,9 @@ from app.models.ai_results import (
 #: Version of the reports.content["ai"] shape, so consumers can migrate on change.
 #: 1.1 — extraction results gained range_source/matched_parameter/matched_group and the
 #: extraction payload gained patient_age/patient_gender (approved-THP ideal-range override).
+#: The field set is unchanged since; matched_group now carries the THP age bracket ("18-60")
+#: rather than a demographic group name, which no stored payload ever used — the override
+#: has never run outside tests.
 CONTENT_SCHEMA_VERSION = "1.1"
 
 
