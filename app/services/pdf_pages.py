@@ -9,10 +9,18 @@ Detection is by file signature (the ``%PDF`` magic), not the declared MIME type,
 mislabelled upload is still handled correctly. Logs carry page counts and error types
 only — never document content.
 
-Built on ``pypdfium2`` (PDFium, BSD-3/Apache-2.0), the service's single PDF library. It
-was measured against pypdf, PyMuPDF and pdfplumber on the sample reports: fastest of the
-four, the only permissively-licensed one that can also rasterise pages, and the only one
-besides PyMuPDF whose text preserves column order. See ``docs/extraction-cost-options.md``.
+Built on ``pypdfium2`` (PDFium, BSD-3/Apache-2.0), measured against pypdf, PyMuPDF and
+pdfplumber on the sample reports: fastest of the four and the only permissively-licensed
+one that can also rasterise pages. See ``docs/extraction-cost-options.md``.
+
+That benchmark also judged its text column-order-preserving. A later field-level
+measurement disagreed. pypdfium2 always returns *storage* order — the order the
+generating software happened to emit characters in — which usually matches reading order
+and sometimes does not; when it does not, the failure is silent, because every character
+is still present. That is why ``ocr.py`` reads the text layer through pdfplumber, which
+sorts by position, rather than through pypdfium2 — though pypdfium2 still opens the
+document and rasterises pages for OCR there. Trimming is unaffected either way: it copies
+whole pages and never reads their text.
 """
 
 import io

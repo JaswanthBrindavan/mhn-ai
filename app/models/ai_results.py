@@ -1,6 +1,8 @@
 """Result and audit tables written by the worker's AI stages.
 
 ``ai_report_classifications`` holds the classification result (one per run item).
+``ai_section_extractions`` holds the fields transcribed from a non-report section
+(insurance, scans/imaging, vaccinations), one per run item.
 ``ai_process_logs`` records every model call — provider, model, prompt/schema version,
 tokens, estimated cost, duration, outcome, and sanitized failure data — keyed by
 (run_item_id, stage, attempt) so a retry never double-logs a single attempt's cost.
@@ -153,6 +155,55 @@ class AiReportInsight(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class AiSectionExtraction(Base):
+    """Structured extraction for a NON-report section (insurance, scans, vaccinations).
+
+    Kept separate from ``ai_report_extractions`` because the shape differs per section
+    and none of it is lab results: that table's ``data`` is a normalised result set with
+    abnormal flags, this one holds a section's own fields. ``section`` records which
+    shape ``data`` carries, so a reader never has to infer it.
+
+    ``data`` is {"section": ..., "fields": {...}, "flags": [...]} — the validated fields
+    with dates normalised to ISO in Python, plus any data-quality flags (e.g. a policy
+    end date preceding its start). One row per item; a re-run upserts it.
+    """
+
+    __tablename__ = "ai_section_extractions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+        default=uuid.uuid4,
+    )
+    run_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai_processing_run_items.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    #: The source document (an unclassified_files id).
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    #: The resource_type value this extraction is for: insurance | scans_imaging |
+    #: vaccinations. Determines the shape of ``data["fields"]``.
+    section: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (Index("ix_ai_section_extractions_section", "section"),)
 
 
 class AiProcessLog(Base):

@@ -11,6 +11,31 @@ alembic==1.18.5
 psycopg[binary]==3.3.4
 boto3==1.43.53
 anthropic==0.117.1
-# The service's single PDF library (PDFium, BSD-3/Apache-2.0). Chosen over pypdf,
-# PyMuPDF and pdfplumber on measurements — see docs/extraction-cost-options.md.
+# PDF reading. pypdfium2 (PDFium, BSD-3/Apache-2.0) renders pages and reads text.
+# pdfplumber (MIT) reads text through pdfminer.six and requires pypdfium2 only as its
+# rasteriser, so these are two text engines rather than one — carrying both is justified
+# by the accuracy below, not by a smaller dependency tree.
+#
+# pdfplumber leads for text because it orders by position on the page rather than by the
+# order the generating software happened to emit. Measured on two real lab reports, 130
+# fields, scoring a value only when it sits beside its own test name:
+#
+#   engine                  names      values     ranges   all three
+#   pdfplumber+pypdfium2   130/130    130/130    110/110    130/130
+#   pypdfium2 alone        130/130    127/130    105/110    122/130
+#   pymupdf                130/130     40/130     31/110     37/130
+#
+# pypdfium2 alone loses three values and five multi-line reference ranges to storage
+# order; PyMuPDF emits whole rows reversed, so the value precedes its label. The gap
+# includes a Vitamin B12 of 185 against a range of 211-946 — a deficiency that
+# disappears silently. See docs/extraction-cost-options.md for the speed-and-characters
+# benchmark, which measures a different axis and reaches a different conclusion.
 pypdfium2==5.12.1
+pdfplumber==0.11.10
+
+# OCR, for pages with no text layer and pages whose text comes back scrambled.
+# NOTE: pytesseract is a binding only; the Tesseract BINARY must be installed in the
+# image (Debian/Ubuntu: apt-get install -y tesseract-ocr).
+pytesseract==0.3.13
+# pdfplumber requires Pillow>=12.2.0, so this cannot go back to the 11.x line.
+pillow==12.3.0

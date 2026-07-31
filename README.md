@@ -77,7 +77,9 @@ decision and re-authorizes on read.
 - AWS S3 (source documents) + SQS (work queue, with a DLQ)
 - Anthropic Claude (per-stage models: a fast model for classification and extraction, a
   stronger one for insights)
-- pypdfium2 — the single PDF library, used to trim documents for the classifier
+- pypdfium2 — trims documents for the classifier, and rasterises pages for OCR
+- pdfplumber — reads the text layer sorted by position on the page
+- Tesseract (via pytesseract) — OCR for scanned pages, needs the binary in the image
 - Docker Compose
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
