@@ -136,7 +136,7 @@ def get_document_ai_result(
         item_id=item.id,
         run_id=item.run_id,
         status=item.status,
-        reports_id=item.reports_id,
+        section_row_id=item.section_row_id,
         last_error_code=item.last_error_code,
         classification=classification,
         extraction=extraction_data,
@@ -183,7 +183,7 @@ def retry_document(
             409,
             "already_completed",
             "Document already completed; its result is final and the source has been moved",
-            {"reports_id": item.reports_id},
+            {"section_row_id": item.section_row_id},
         )
 
     result = runs_service.create_run(

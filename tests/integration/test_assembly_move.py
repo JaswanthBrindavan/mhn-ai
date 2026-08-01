@@ -1,5 +1,5 @@
 """The assemble & move capstone: build reports.content from the stage results, INSERT the
-reports row, record reports_id, DELETE unclassified_files — atomically and guarded.
+reports row, record section_row_id, DELETE unclassified_files — atomically and guarded.
 """
 
 import json
@@ -88,7 +88,8 @@ def _item(db_session, item_id):
     return (
         db_session.execute(
             text(
-                "SELECT status, reports_id, completed_at FROM ai_processing_run_items WHERE id=:id"
+                "SELECT status, section_row_id, completed_at "
+                "FROM ai_processing_run_items WHERE id=:id"
             ),
             {"id": item_id},
         )
@@ -132,10 +133,10 @@ def test_move_creates_report_records_id_and_deletes_source(db_session, make_docu
     assert ok is True
     row = _item(db_session, item_id)
     assert row["status"] == "completed"
-    assert row["reports_id"] is not None
+    assert row["section_row_id"] is not None
     assert row["completed_at"] is not None
 
-    report = _reports_row(db_session, row["reports_id"])
+    report = _reports_row(db_session, row["section_row_id"])
     assert report is not None
     assert report["content"]["ai"]["classification"]["section"] == "reports"
     # The report carries the source document's fields; the source row is gone.

@@ -2,8 +2,8 @@
 
 A **run** is one submission from Spring (possibly many documents). A **run item** is the
 per-document unit of work and carries all lifecycle state. Its identity is the source
-``unclassified_files`` id (``document_id``); once a document is classified as a report and
-moved into ``reports``, that created row's id is recorded in ``reports_id``.
+``unclassified_files`` id (``document_id``); once a document is filed into its section
+table, that created row's id is recorded in ``section_row_id``.
 
 The run has no denormalised status column: progress is derived by counting item
 statuses at read time. A stored aggregate would need updating from every worker on
@@ -102,9 +102,19 @@ class AiProcessingRunItem(Base):
     # tables are Spring-owned and a constraint from our table would couple their
     # migrations to ours.
     document_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    #: The `reports` row created when this document was moved into the reports section.
-    #: Null until the move happens (only for documents classified as reports).
-    reports_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: The section row created when this document was filed. Null until filing, and for a
+    #: document that is never filed (a mismatch, or a section with no pipeline).
+    section_row_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: Which section table ``section_row_id`` points at. The pair is self-describing, so
+    #: nothing has to re-derive the table from the classification row.
+    filed_section: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: The section the USER chose when uploading, or null for a global upload. Never a
+    #: claim about what the document is — only the classifier decides that. A document
+    #: whose detected section differs from this is rejected without extraction.
+    intended_section: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: The document's current S3 key. Set at submit and updated at filing, so a stage can
+    #: load the source without depending on which table currently owns the document.
+    source_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=RunItemStatus.PENDING.value

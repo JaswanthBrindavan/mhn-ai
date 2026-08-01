@@ -1,8 +1,8 @@
 """Request and response models for document-processing runs.
 
 The submitted unit of work is an uploaded document (an ``unclassified_files`` id).
-``reports_id`` on an item is set only once a document is classified as a report and
-moved into the ``reports`` table.
+``section_row_id`` on an item is set only once a document is classified and filed into
+its section table.
 """
 
 import uuid
@@ -60,8 +60,9 @@ class RunItemResponse(BaseModel):
     #: Exposed as `item_id`; read from the model's `id` attribute.
     item_id: uuid.UUID = Field(validation_alias="id")
     document_id: int
-    #: The reports row created if this document was moved into the reports section.
-    reports_id: int | None = None
+    #: The section row created if this document was filed. Read with `filed_section`.
+    section_row_id: int | None = None
+    filed_section: str | None = None
     #: Which `/v1/documents/{document_type}/...` route reads this document's result.
     #: Null until it is classified, and for a section with no addressable type
     #: (`bills`, `medical_condition`, `unknown` — none of which produce an AI result).

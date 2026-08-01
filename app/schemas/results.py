@@ -1,7 +1,7 @@
 """Response models for a document's AI result and its retry.
 
-The unit is an uploaded document (an ``unclassified_files`` id). ``reports_id`` is set
-only once the document was classified as a report and moved into ``reports``; the
+The unit is an uploaded document (an ``unclassified_files`` id). ``section_row_id`` is set
+only once the document was classified and filed into its section table; the
 extraction and insights payloads are the same JSON stored under ``reports.content``.
 """
 
@@ -46,8 +46,8 @@ class DocumentAiResult(BaseModel):
     run_id: uuid.UUID
     #: Current lifecycle state of the latest processing item for this document.
     status: str
-    #: Set when the document was moved into the reports table.
-    reports_id: int | None = None
+    #: Set when the document was filed into its section table.
+    section_row_id: int | None = None
     last_error_code: str | None = None
 
     classification: ClassificationResult | None = None
