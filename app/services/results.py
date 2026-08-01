@@ -158,10 +158,14 @@ def retry_document(
 ) -> RetryResponse:
     """Re-run a document that did not complete (failed / rejected / cancelled).
 
-    A completed document is left alone — its result is final and its source has already
-    been moved into ``reports``, so there is nothing to reprocess. An in-flight document
-    is already being worked on. Everything else is re-submitted through ``create_run``,
-    which validates the source afresh, creates a new item, and publishes it.
+    A completed document is left alone — its result is final. An in-flight document is
+    already being worked on. Everything else is re-submitted through ``create_run``, which
+    validates the source afresh, creates a new item, and publishes it.
+
+    Whether the document was already filed into its section table makes no difference:
+    filing deletes the intake row, but the item's ``source_key`` still points at the
+    object, so ``create_run`` resolves it either way. A document that failed *after* being
+    filed is precisely the one a retry is for.
     """
     item = _latest_item(session, document_id)
     if item is None:
@@ -183,7 +187,7 @@ def retry_document(
         raise ApiError(
             409,
             "already_completed",
-            "Document already completed; its result is final and the source has been moved",
+            "Document already completed; its result is final",
             {"section_row_id": item.section_row_id},
         )
 

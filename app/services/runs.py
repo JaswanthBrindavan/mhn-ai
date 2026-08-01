@@ -70,14 +70,46 @@ _CANCELLABLE = {status.value for status in CANCELLABLE_STATUSES}
 _VALIDATION_CONCURRENCY = 8
 
 
-def _document_filepaths(session: Session, document_ids: list[int]) -> dict[int, str]:
-    """Existence + source key lookup against unclassified_files. A sanity check."""
-    rows = session.execute(
-        select(unclassified_files.c.id, unclassified_files.c.filepath).where(
-            unclassified_files.c.id.in_(document_ids)
-        )
-    ).all()
-    return {int(row.id): row.filepath for row in rows}
+def _source_keys(session: Session, document_ids: list[int]) -> dict[int, str]:
+    """Where each document's object currently lives. Also the existence check.
+
+    Normally the intake row. A document that has already been filed no longer has one —
+    filing deletes it — so fall back to the key its run item recorded at filing. That
+    fallback is what makes a filed-then-failed document retryable at all; without it the
+    submission 404s on the one document that most needs a second attempt.
+
+    The fallback costs one extra query for the whole batch, and none when nothing in the
+    batch was filed. That matters: a submission may carry 500 documents, and every lookup
+    in this module is deliberately written to stay flat in the batch size.
+
+    ``DISTINCT ON`` takes the *most recent* item per document. A document can be
+    submitted, filed, fail and be retried repeatedly, and an older item still holds the
+    ``unclassified/`` key that filing deleted. Reading that stale key would reject the
+    document permanently as a missing source rather than reprocessing it.
+    """
+    keys = {
+        int(row.id): row.filepath
+        for row in session.execute(
+            select(unclassified_files.c.id, unclassified_files.c.filepath).where(
+                unclassified_files.c.id.in_(document_ids)
+            )
+        ).all()
+    }
+
+    filed = [document_id for document_id in document_ids if document_id not in keys]
+    if filed:
+        rows = session.execute(
+            select(AiProcessingRunItem.document_id, AiProcessingRunItem.source_key)
+            .where(
+                AiProcessingRunItem.document_id.in_(filed),
+                AiProcessingRunItem.source_key.is_not(None),
+            )
+            .distinct(AiProcessingRunItem.document_id)
+            .order_by(AiProcessingRunItem.document_id, AiProcessingRunItem.created_at.desc())
+        ).all()
+        keys.update({int(document_id): key for document_id, key in rows})
+
+    return keys
 
 
 def _active_items(session: Session, document_ids: list[int]) -> dict[int, AiProcessingRunItem]:
@@ -278,7 +310,7 @@ def create_run(
         )
     unique_ids = list(intended)
 
-    filepaths = _document_filepaths(session, unique_ids)
+    filepaths = _source_keys(session, unique_ids)
     missing = [document_id for document_id in unique_ids if document_id not in filepaths]
     if missing:
         raise ApiError(

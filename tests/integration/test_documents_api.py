@@ -2,15 +2,24 @@
 
 import json
 import uuid
+from typing import NamedTuple
 
 import pytest
 from sqlalchemy import text
+
+from .conftest import BUCKET
 
 pytestmark = pytest.mark.integration
 
 
 def _seed_item(
-    db_session, document_id, status, section_row_id=None, intended_section=None
+    db_session,
+    document_id,
+    status,
+    section_row_id=None,
+    intended_section=None,
+    filed_section=None,
+    source_key=None,
 ) -> uuid.UUID:
     run_id = db_session.execute(
         text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
@@ -18,8 +27,9 @@ def _seed_item(
     item_id = db_session.execute(
         text(
             "INSERT INTO ai_processing_run_items "
-            "(run_id, document_id, status, section_row_id, intended_section) "
-            "VALUES (:r, :d, :s, :rep, :sec) RETURNING id"
+            "(run_id, document_id, status, section_row_id, intended_section, "
+            "filed_section, source_key) "
+            "VALUES (:r, :d, :s, :rep, :sec, :filed, :key) RETURNING id"
         ),
         {
             "r": run_id,
@@ -27,10 +37,54 @@ def _seed_item(
             "s": status,
             "rep": section_row_id,
             "sec": intended_section,
+            "filed": filed_section,
+            "key": source_key,
         },
     ).scalar_one()
     db_session.flush()
     return item_id
+
+
+class Filed(NamedTuple):
+    document_id: int
+    item_id: uuid.UUID
+    source_key: str
+
+
+@pytest.fixture
+def filed_failed_item(db_session, aws, seed_user, make_document) -> Filed:
+    """A document filed into `reports`, whose later AI stage then failed.
+
+    The state retry now has to serve, reproduced exactly: filing deleted the intake row
+    and relocated the object under `reports/`, and the only remaining record of where the
+    document lives is the run item's `source_key`.
+
+    The intake row is created and then deleted rather than never created, so the id is one
+    the intake sequence really issued — a made-up id would not prove the lookup falls back
+    rather than merely missing.
+    """
+    key = f"reports/{uuid.uuid4().hex}.pdf"
+    aws[0].put_object(Bucket=BUCKET, Key=key, Body=b"%PDF-1.4 filed report")
+
+    document_id = make_document(upload=False)
+    db_session.execute(text("DELETE FROM unclassified_files WHERE id = :id"), {"id": document_id})
+    section_row_id = db_session.execute(
+        text(
+            "INSERT INTO reports (user_id, created_by, filepath, content) "
+            "VALUES (:u, :u, :k, CAST(:c AS JSONB)) RETURNING id"
+        ),
+        {"u": seed_user, "k": key, "c": json.dumps({"ai": {"state": "classified"}})},
+    ).scalar_one()
+
+    item_id = _seed_item(
+        db_session,
+        document_id,
+        "failed",
+        section_row_id=section_row_id,
+        filed_section="reports",
+        source_key=key,
+    )
+    return Filed(document_id=document_id, item_id=item_id, source_key=key)
 
 
 def _seed_results(db_session, item_id, document_id) -> None:
@@ -150,6 +204,40 @@ def test_retry_a_never_processed_document_is_404(api, make_document):
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "no_ai_result"
+
+
+def test_retry_a_filed_but_failed_document(api, filed_failed_item):
+    """Filing does not end the story: a document filed with classification-only content
+    can be reprocessed in place once whatever failed is fixed. Before the run item's
+    source_key was consulted this 404'd, because filing had deleted the intake row."""
+    response = api.post(f"/v1/documents/reports/{filed_failed_item.document_id}/ai-result:retry")
+
+    assert response.status_code == 202
+    assert response.json()["status"] in {"queued", "pending"}
+
+
+def test_retry_resolves_the_source_from_the_filed_key(api, db_session, filed_failed_item):
+    """The intake row is gone; the source is found through the item's source_key -- and
+    carried onto the new item, or the worker would have nothing to load the document by."""
+    assert filed_failed_item.source_key.startswith("reports/")
+
+    response = api.post(f"/v1/documents/reports/{filed_failed_item.document_id}/ai-result:retry")
+
+    assert response.status_code == 202
+    new_item_id = uuid.UUID(response.json()["item_id"])
+    assert new_item_id != filed_failed_item.item_id
+    new_key = db_session.execute(
+        text("SELECT source_key FROM ai_processing_run_items WHERE id = :id"),
+        {"id": new_item_id},
+    ).scalar_one()
+    assert new_key == filed_failed_item.source_key
+
+
+def test_retry_of_a_document_that_never_existed_is_still_404(api):
+    """The fallback must not turn a genuinely unknown id into work."""
+    response = api.post("/v1/documents/reports/99999999/ai-result:retry")
+
+    assert response.status_code == 404
 
 
 # --- the type in the path ---------------------------------------------------

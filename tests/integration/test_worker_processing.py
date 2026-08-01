@@ -676,6 +676,107 @@ def test_a_redelivery_that_re_enters_filing_does_not_file_twice(
     )
 
 
+# --- retrying a document that was already filed -----------------------------
+
+
+def test_a_filed_but_failed_document_is_reprocessed_in_place_on_retry(
+    api, db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """The whole point of retry after the filing rewrite: extraction re-runs and the filed
+    row's `content` is updated, rather than the document being filed a second time.
+
+    A retry is a *new* run item, so it has no `section_row_id` of its own and the intake row
+    the first pass deleted is not coming back. Without adoption the second pass rejects with
+    `source_document_missing` and the document is stuck at `state: failed` for ever — the
+    API answers 202 and nothing ever finishes.
+    """
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    def _reject(_ctx) -> None:
+        raise RejectStageError("extraction_failed", "Unreadable")
+
+    monkeypatch.setattr(
+        "app.workers.processor.SECTION_PIPELINES",
+        {DocumentSection.REPORTS: [(RunItemStatus.EXTRACTING, _reject)]},
+    )
+    assert _process(sqs, queue_url, session_factory, test_settings, aws) is Outcome.REJECTED
+    filed_row_id = _item(db_session, item_id)["section_row_id"]
+    assert filed_row_id is not None
+    assert _filed_row(db_session, item_id).content["ai"]["state"] == "failed"
+
+    monkeypatch.undo()  # whatever broke extraction is fixed; the retry runs the real pipeline
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    assert response.status_code == 202
+    retry_item_id = uuid.UUID(response.json()["item_id"])
+    assert retry_item_id != item_id
+
+    outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
+
+    assert outcome is Outcome.COMPLETED
+    assert _status(db_session, retry_item_id) == RunItemStatus.COMPLETED.value
+    # The SAME row, adopted and updated in place.
+    retry_item = _item(db_session, retry_item_id)
+    assert retry_item["section_row_id"] == filed_row_id
+    assert retry_item["filed_section"] == "reports"
+    # And no second copy of the document: one row in `reports` for that object.
+    assert (
+        db_session.execute(
+            text("SELECT count(*) FROM reports WHERE filepath = :k"),
+            {"k": retry_item["source_key"]},
+        ).scalar_one()
+        == 1
+    )
+    content = _filed_row(db_session, retry_item_id).content["ai"]
+    assert content["state"] == "complete"
+    assert content["extraction"] is not None
+
+
+def test_a_retry_that_classifies_into_another_section_is_rejected(
+    api, db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """A loud terminal reject, not a re-file. Moving the document again would mean deleting
+    a Spring row we created and copying the object a second time — a lot of machinery for
+    something that should not happen at temperature=0, and data-mangling if it misfires."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    def _reject(_ctx) -> None:
+        raise RejectStageError("extraction_failed", "Unreadable")
+
+    monkeypatch.setattr(
+        "app.workers.processor.SECTION_PIPELINES",
+        {DocumentSection.REPORTS: [(RunItemStatus.EXTRACTING, _reject)]},
+    )
+    _process(sqs, queue_url, session_factory, test_settings, aws)
+    filed_row_id = _item(db_session, item_id)["section_row_id"]
+    assert filed_row_id is not None
+
+    monkeypatch.undo()
+    retry_item_id = uuid.UUID(
+        api.post(f"/v1/documents/reports/{document_id}/ai-result:retry").json()["item_id"]
+    )
+
+    outcome = _process(
+        sqs, queue_url, session_factory, test_settings, aws, ai=_ClassifiesAs("insurance")
+    )
+
+    assert outcome is Outcome.REJECTED
+    retry_item = _item(db_session, retry_item_id)
+    assert retry_item["last_error_code"] == "section_changed_on_retry"
+    assert retry_item["section_row_id"] is None
+    # Neither table gained a row: the original stands, and nothing was filed into insurance.
+    key = {"k": retry_item["source_key"]}
+    assert (
+        db_session.execute(text("SELECT count(*) FROM reports WHERE filepath = :k"), key)
+    ).scalar_one() == 1
+    assert (
+        db_session.execute(text("SELECT count(*) FROM insurance WHERE filepath = :k"), key)
+    ).scalar_one() == 0
+
+
 # --- the stages must survive the intake row disappearing --------------------
 
 
