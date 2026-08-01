@@ -31,12 +31,18 @@ def count_queries():
 def test_query_count_does_not_scale_with_batch_size(api, make_document, count_queries):
     small = [make_document() for _ in range(2)]
     baseline_start = count_queries.count
-    api.post("/v1/document-processing-runs", json={"document_ids": small})
+    api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": d} for d in small]},
+    )
     small_cost = count_queries.count - baseline_start
 
     large = [make_document() for _ in range(12)]
     large_start = count_queries.count
-    api.post("/v1/document-processing-runs", json={"document_ids": large})
+    api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": d} for d in large]},
+    )
     large_cost = count_queries.count - large_start
 
     # Batched lookups and a single multi-row INSERT make submission cost the same

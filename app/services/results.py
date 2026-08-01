@@ -27,9 +27,9 @@ from app.schemas.results import (
     DocumentType,
     RetryResponse,
 )
-from app.schemas.runs import CreateRunRequest
+from app.schemas.runs import CreateRunRequest, SubmittedDocument
 from app.services import runs as runs_service
-from app.services.classification import SECTION_BY_DOCUMENT_TYPE
+from app.services.classification import SECTION_BY_DOCUMENT_TYPE, DocumentSection
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mypy_boto3_s3.client import S3Client
@@ -138,6 +138,7 @@ def get_document_ai_result(
         status=item.status,
         section_row_id=item.section_row_id,
         last_error_code=item.last_error_code,
+        intended_section=item.intended_section,
         classification=classification,
         extraction=extraction_data,
         insights=insights,
@@ -188,7 +189,18 @@ def retry_document(
 
     result = runs_service.create_run(
         session,
-        CreateRunRequest(document_ids=[document_id]),
+        CreateRunRequest(
+            documents=[
+                SubmittedDocument(
+                    document_id=document_id,
+                    # Preserve the user's original choice: without it a retry of a
+                    # mismatched document would be processed as if uploaded globally.
+                    intended_section=(
+                        DocumentSection(item.intended_section) if item.intended_section else None
+                    ),
+                )
+            ]
+        ),
         request_id,
         s3=s3,
         sqs=sqs,

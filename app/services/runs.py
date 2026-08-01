@@ -161,6 +161,8 @@ def _plan_items(
     latest: dict[int, AiProcessingRunItem],
     validated: dict[int, tuple[ObjectMetadata | None, ValidationFailure | None]],
     force_reprocess: bool,
+    intended: dict[int, str | None],
+    source_keys: dict[int, str],
 ) -> _Plan:
     """Pure decision step: no I/O, so the rules are easy to test and to read."""
     reused: dict[int, AiProcessingRunItem] = {}
@@ -201,6 +203,10 @@ def _plan_items(
             "content_hash": meta.etag if meta is not None else None,
             "last_error_code": failure.code if failure is not None else None,
             "last_error_message": failure.message if failure is not None else None,
+            "intended_section": intended.get(document_id),
+            # Set here because the key is already loaded for validation. From now on the
+            # pipeline reads the document through this, not through unclassified_files.
+            "source_key": source_keys.get(document_id),
         }
 
     return _Plan(reused=reused, outcomes=outcomes, new_rows=new_rows)
@@ -261,9 +267,15 @@ def create_run(
     sqs: "SQSClient",
     settings: Settings,
 ) -> CreateRunResponse:
-    # Deduplicate while preserving caller order, so a repeated id in one request
-    # cannot try to create two items and trip the unique index against itself.
-    unique_ids = list(dict.fromkeys(payload.document_ids))
+    # Deduplicate while preserving caller order. First occurrence wins for the intended
+    # section: a repeated id in one request is one document, not two.
+    intended: dict[int, str | None] = {}
+    for document in payload.documents:
+        intended.setdefault(
+            document.document_id,
+            document.intended_section.value if document.intended_section else None,
+        )
+    unique_ids = list(intended)
 
     filepaths = _document_filepaths(session, unique_ids)
     missing = [document_id for document_id in unique_ids if document_id not in filepaths]
@@ -312,7 +324,9 @@ def create_run(
             "Could not verify source files; retry shortly",
         ) from exc
 
-    plan = _plan_items(unique_ids, active, latest, validated, payload.force_reprocess)
+    plan = _plan_items(
+        unique_ids, active, latest, validated, payload.force_reprocess, intended, filepaths
+    )
     created = _insert_new_items(session, run_id, plan.new_rows)
 
     # Rows the insert did not return lost the idempotency race to a concurrent

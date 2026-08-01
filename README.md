@@ -154,7 +154,7 @@ Submit one or many documents by their `unclassified_files` ids:
 curl -X POST http://localhost:8000/v1/document-processing-runs \
   -H "Authorization: Bearer $MHN_SERVICE_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"document_ids": [101, 102]}'
+  -d '{"documents": [{"document_id": 101}, {"document_id": 102}]}'
 ```
 
 `202 Accepted` returns a `run_id` and a per-document item id. Poll the run for progress —

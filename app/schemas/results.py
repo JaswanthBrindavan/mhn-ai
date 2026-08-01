@@ -49,6 +49,8 @@ class DocumentAiResult(BaseModel):
     #: Set when the document was filed into its section table.
     section_row_id: int | None = None
     last_error_code: str | None = None
+    #: The section the user uploaded into, or null for a global upload.
+    intended_section: str | None = None
 
     classification: ClassificationResult | None = None
     #: {"results": [...], "report_date": ...} — a REPORT's lab results, once extraction ran.
