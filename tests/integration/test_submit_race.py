@@ -52,7 +52,10 @@ def test_losing_the_race_on_one_report_keeps_the_rest_of_the_batch(
     )
     db_session.flush()
 
-    response = api.post("/v1/document-processing-runs", json={"document_ids": [first, contended]})
+    response = api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": first}, {"document_id": contended}]},
+    )
 
     assert response.status_code == 202
     body = response.json()
@@ -86,7 +89,8 @@ def test_the_run_itself_survives_the_race(api, make_document, db_session, blind_
     db_session.flush()
 
     run_id = api.post(
-        "/v1/document-processing-runs", json={"document_ids": [first, contended]}
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": first}, {"document_id": contended}]},
     ).json()["run_id"]
 
     fetched = api.get(f"/v1/document-processing-runs/{run_id}")

@@ -15,7 +15,9 @@ from app.integrations.sqs import publish_processing_item, receive_messages
 from app.models.enums import RunItemStatus
 from app.services.classification import DocumentSection
 from app.services.section_specs import SECTION_SPECS
+from app.services.source_loading import load_source_document
 from app.workers.processor import Outcome, process_message
+from app.workers.stagetypes import RejectStageError, StageContext
 from tests.support.ai import FakeAIProvider, classification_payload, structured_response
 from tests.support.pdfs import text_pdf
 
@@ -45,8 +47,11 @@ def _seed_item(
     ).scalar_one()
     item_id = db_session.execute(
         text(
-            "INSERT INTO ai_processing_run_items (run_id, document_id, status) "
-            "VALUES (:r, :rep, :s) RETURNING id"
+            # source_key mirrors what create_run copies onto the item at submit, which is
+            # what the stages load the document through.
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status, source_key) "
+            "VALUES (:r, :rep, :s, (SELECT filepath FROM unclassified_files WHERE id = :rep)) "
+            "RETURNING id"
         ),
         {"r": run_id, "rep": document_id, "s": status},
     ).scalar_one()
@@ -345,8 +350,9 @@ def test_a_section_document_is_extracted_then_stops(
     ).scalar_one()
     item_id = db_session.execute(
         text(
-            "INSERT INTO ai_processing_run_items (run_id, document_id, status) "
-            "VALUES (:r, :d, 'queued') RETURNING id"
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status, source_key) "
+            "VALUES (:r, :d, 'queued', "
+            "(SELECT filepath FROM unclassified_files WHERE id = :d)) RETURNING id"
         ),
         {"r": run_id, "d": document_id},
     ).scalar_one()
@@ -424,3 +430,55 @@ def test_a_report_still_moves_and_a_section_never_does(
     assert section_row_id is not None
     # Moved: the intake row is gone, unlike every section document.
     assert not _source_exists(db_session, document_id)
+
+
+# --- the stages must survive the intake row disappearing --------------------
+
+
+def test_stages_load_the_document_after_the_intake_row_is_gone(
+    db_session, make_document, test_settings, aws
+):
+    """The pipeline must not depend on unclassified_files: filing deletes that row
+    mid-pipeline, and extraction still has to fetch the document afterwards."""
+    document_id = make_document(key="reports/a1b2.pdf")
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+    db_session.execute(text("DELETE FROM unclassified_files WHERE id = :id"), {"id": document_id})
+    db_session.flush()
+
+    ctx = StageContext(
+        item_id=item_id,
+        run_id=run_id,
+        document_id=document_id,
+        source_key="reports/a1b2.pdf",
+        attempt=1,
+        session=db_session,
+        s3=aws[0],
+        ai=_FAKE_AI,
+        settings=test_settings,
+    )
+
+    payload = load_source_document(ctx)
+
+    assert payload.filename == "reports/a1b2.pdf"
+
+
+def test_a_missing_source_key_is_a_permanent_reject(db_session, make_document, test_settings, aws):
+    """Every item gets a source_key at submit, so a gap is an anomaly — never retried."""
+    document_id = make_document()
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+
+    ctx = StageContext(
+        item_id=item_id,
+        run_id=run_id,
+        document_id=document_id,
+        source_key="",
+        attempt=1,
+        session=db_session,
+        s3=aws[0],
+        ai=_FAKE_AI,
+        settings=test_settings,
+    )
+
+    with pytest.raises(RejectStageError) as excinfo:
+        load_source_document(ctx)
+    assert excinfo.value.code == "source_document_missing"

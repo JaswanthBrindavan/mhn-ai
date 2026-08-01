@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from app.services import processing
-from app.services.assembly import CONTENT_SCHEMA_VERSION, build_content
+from app.services.assembly import CONTENT_SCHEMA_VERSION, ContentState, build_content
 
 pytestmark = pytest.mark.integration
 
@@ -31,15 +31,43 @@ def _seed_item(db_session, document_id, status="generating_insights") -> uuid.UU
     return item_id
 
 
-def _seed_stage_rows(db_session, item_id, document_id) -> None:
+def _seed_classification(db_session, item_id, document_id, section="reports") -> None:
     db_session.execute(
         text(
             "INSERT INTO ai_report_classifications (run_item_id, document_id, section, title, "
             "confidence, prompt_version, schema_version) "
-            "VALUES (:i, :d, 'reports', 'Complete Blood Count', 0.97, 'clf-2', 'clf-2')"
+            "VALUES (:i, :d, :s, 'Complete Blood Count', 0.97, 'clf-2', 'clf-2')"
         ),
-        {"i": item_id, "d": document_id},
+        {"i": item_id, "d": document_id, "s": section},
     )
+    db_session.flush()
+
+
+def _seed_section_extraction(db_session, item_id, document_id) -> None:
+    """A non-report section's transcription, as section_extraction.extract_section writes it."""
+    db_session.execute(
+        text(
+            "INSERT INTO ai_section_extractions "
+            "(run_item_id, document_id, section, data, prompt_version, schema_version) "
+            "VALUES (:i, :d, 'insurance', CAST(:data AS JSONB), 'sec-1', 'sec-1')"
+        ),
+        {
+            "i": item_id,
+            "d": document_id,
+            "data": json.dumps(
+                {
+                    "section": "insurance",
+                    "fields": {"insurer": "Star Health", "start_date": "2019-10-01"},
+                    "flags": [],
+                }
+            ),
+        },
+    )
+    db_session.flush()
+
+
+def _seed_stage_rows(db_session, item_id, document_id) -> None:
+    _seed_classification(db_session, item_id, document_id)
     db_session.execute(
         text(
             "INSERT INTO ai_report_extractions "
@@ -106,7 +134,7 @@ def test_build_content_assembles_all_three_stages(db_session, make_document):
     item_id = _seed_item(db_session, document_id)
     _seed_stage_rows(db_session, item_id, document_id)
 
-    content = build_content(db_session, item_id)
+    content = build_content(db_session, item_id, state=ContentState.COMPLETE)
 
     ai = content["ai"]
     assert ai["schema_version"] == CONTENT_SCHEMA_VERSION
@@ -117,6 +145,51 @@ def test_build_content_assembles_all_three_stages(db_session, make_document):
     assert "generated_at" in ai
 
 
+def test_content_at_filing_time_carries_only_the_classification(db_session, make_document):
+    """Written the moment the document is filed, before any extraction has run."""
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, status="classifying")
+    _seed_classification(db_session, item_id, document_id)
+
+    content = build_content(db_session, item_id, state=ContentState.CLASSIFIED)["ai"]
+
+    assert content["state"] == "classified"
+    assert content["schema_version"] == "2.0"
+    assert content["classification"]["section"] == "reports"
+    assert content["extraction"] is None
+    assert content["section_extraction"] is None
+    assert content["insights"] is None
+
+
+def test_completed_report_content_has_extraction_and_insights(db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    _seed_stage_rows(db_session, item_id, document_id)
+
+    content = build_content(db_session, item_id, state=ContentState.COMPLETE)["ai"]
+
+    assert content["state"] == "complete"
+    assert content["extraction"]["results"]
+    assert content["insights"]["disclaimer"]
+    # A report never writes the section-extraction shape.
+    assert content["section_extraction"] is None
+
+
+def test_completed_section_content_has_section_extraction_only(db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, status="extracting")
+    _seed_classification(db_session, item_id, document_id, section="insurance")
+    _seed_section_extraction(db_session, item_id, document_id)
+
+    content = build_content(db_session, item_id, state=ContentState.COMPLETE)["ai"]
+
+    assert content["state"] == "complete"
+    assert content["section_extraction"]["fields"]
+    # Mutually exclusive: the two carry different shapes and must never both be populated.
+    assert content["extraction"] is None
+    assert content["insights"] is None
+
+
 # --- move_and_complete ------------------------------------------------------
 
 
@@ -124,7 +197,7 @@ def test_move_creates_report_records_id_and_deletes_source(db_session, make_docu
     document_id = make_document()
     item_id = _seed_item(db_session, document_id)
     _seed_stage_rows(db_session, item_id, document_id)
-    content = build_content(db_session, item_id)
+    content = build_content(db_session, item_id, state=ContentState.COMPLETE)
 
     ok = processing.move_and_complete(
         db_session, item_id, document_id, content, expected=_IN_PROGRESS
@@ -148,7 +221,7 @@ def test_move_is_rolled_back_when_cancelled(db_session, make_document):
     document_id = make_document()
     item_id = _seed_item(db_session, document_id, status="cancelled")
     _seed_stage_rows(db_session, item_id, document_id)
-    content = build_content(db_session, item_id)
+    content = build_content(db_session, item_id, state=ContentState.COMPLETE)
     src_key = db_session.execute(
         text("SELECT filepath FROM unclassified_files WHERE id=:id"), {"id": document_id}
     ).scalar_one()

@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import text
 
 from app.models.enums import RunItemStatus
+from app.models.processing import AiProcessingRunItem
 
 pytestmark = pytest.mark.integration
 
@@ -16,7 +17,7 @@ pytestmark = pytest.mark.integration
 def test_v1_requires_the_service_token(api):
     response = api.post(
         "/v1/document-processing-runs",
-        json={"document_ids": [1]},
+        json={"documents": [{"document_id": 1}]},
         headers={"Authorization": "Bearer wrong"},
     )
     assert response.status_code == 401
@@ -28,7 +29,9 @@ def test_v1_requires_the_service_token(api):
 def test_submit_creates_a_run_and_items(api, make_document):
     document_id = make_document()
 
-    response = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]})
+    response = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    )
 
     assert response.status_code == 202  # no AI work inline
     body = response.json()
@@ -42,7 +45,10 @@ def test_submit_creates_a_run_and_items(api, make_document):
 
 def test_submit_rejects_unknown_report_ids(api, make_document):
     known = make_document()
-    response = api.post("/v1/document-processing-runs", json={"document_ids": [known, 999_000_111]})
+    response = api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": known}, {"document_id": 999_000_111}]},
+    )
 
     assert response.status_code == 404
     body = response.json()
@@ -54,7 +60,7 @@ def test_duplicate_ids_within_one_request_create_one_item(api, make_document):
     document_id = make_document()
     response = api.post(
         "/v1/document-processing-runs",
-        json={"document_ids": [document_id, document_id, document_id]},
+        json={"documents": [{"document_id": document_id}] * 3},
     )
     assert response.status_code == 202
     assert len(response.json()["items"]) == 1
@@ -62,8 +68,12 @@ def test_duplicate_ids_within_one_request_create_one_item(api, make_document):
 
 def test_resubmitting_an_active_report_reuses_the_item(api, make_document):
     document_id = make_document()
-    first = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()
-    second = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()
+    first = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
+    second = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
 
     assert second["items"][0]["outcome"] == "reused"
     # Same work, not a second pass over the same report.
@@ -73,10 +83,14 @@ def test_resubmitting_an_active_report_reuses_the_item(api, make_document):
 
 def test_completed_report_is_not_reprocessed_without_force(api, make_document, db_session):
     document_id = make_document()
-    first = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()
+    first = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
     _complete(db_session, first["items"][0]["item_id"])
 
-    second = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()
+    second = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
 
     assert second["items"][0]["outcome"] == "already_completed"
     assert second["items"][0]["item_id"] == first["items"][0]["item_id"]
@@ -84,12 +98,14 @@ def test_completed_report_is_not_reprocessed_without_force(api, make_document, d
 
 def test_force_reprocess_creates_a_new_item_for_a_completed_report(api, make_document, db_session):
     document_id = make_document()
-    first = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()
+    first = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
     _complete(db_session, first["items"][0]["item_id"])
 
     second = api.post(
         "/v1/document-processing-runs",
-        json={"document_ids": [document_id], "force_reprocess": True},
+        json={"documents": [{"document_id": document_id}], "force_reprocess": True},
     ).json()
 
     assert second["items"][0]["outcome"] == "created"
@@ -99,10 +115,10 @@ def test_force_reprocess_creates_a_new_item_for_a_completed_report(api, make_doc
 def test_force_reprocess_does_not_duplicate_in_flight_work(api, make_document):
     """force_reprocess concerns finished results, not work already running."""
     document_id = make_document()
-    api.post("/v1/document-processing-runs", json={"document_ids": [document_id]})
+    api.post("/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]})
     second = api.post(
         "/v1/document-processing-runs",
-        json={"document_ids": [document_id], "force_reprocess": True},
+        json={"documents": [{"document_id": document_id}], "force_reprocess": True},
     ).json()
 
     assert second["items"][0]["outcome"] == "reused"
@@ -123,7 +139,10 @@ def test_family_upload_is_accepted(api, make_document, make_user):
 
     response = api.post(
         "/v1/document-processing-runs",
-        json={"document_ids": [document_id], "requested_by_user_id": str(relative)},
+        json={
+            "documents": [{"document_id": document_id}],
+            "requested_by_user_id": str(relative),
+        },
     )
 
     assert response.status_code == 202
@@ -137,7 +156,10 @@ def test_mismatched_requesting_user_still_processes(api, make_document):
     """
     response = api.post(
         "/v1/document-processing-runs",
-        json={"document_ids": [make_document()], "requested_by_user_id": str(uuid.uuid4())},
+        json={
+            "documents": [{"document_id": make_document()}],
+            "requested_by_user_id": str(uuid.uuid4()),
+        },
     )
     assert response.status_code == 202
 
@@ -147,9 +169,10 @@ def test_mismatched_requesting_user_still_processes(api, make_document):
 
 def test_get_run_reports_progress(api, make_document):
     document_ids = [make_document(), make_document()]
-    run_id = api.post("/v1/document-processing-runs", json={"document_ids": document_ids}).json()[
-        "run_id"
-    ]
+    run_id = api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": d} for d in document_ids]},
+    ).json()["run_id"]
 
     body = api.get(f"/v1/document-processing-runs/{run_id}").json()
 
@@ -160,7 +183,9 @@ def test_get_run_reports_progress(api, make_document):
 
 
 def test_get_run_marks_finished_when_all_items_terminal(api, make_document, db_session):
-    run = api.post("/v1/document-processing-runs", json={"document_ids": [make_document()]}).json()
+    run = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": make_document()}]}
+    ).json()
     _complete(db_session, run["items"][0]["item_id"])
 
     body = api.get(f"/v1/document-processing-runs/{run['run_id']}").json()
@@ -179,7 +204,9 @@ def test_get_unknown_run_is_404(api):
 
 
 def test_cancel_marks_in_flight_items_cancelled(api, make_document):
-    run = api.post("/v1/document-processing-runs", json={"document_ids": [make_document()]}).json()
+    run = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": make_document()}]}
+    ).json()
 
     body = api.delete(f"/v1/document-processing-runs/{run['run_id']}").json()
 
@@ -190,7 +217,9 @@ def test_cancel_marks_in_flight_items_cancelled(api, make_document):
 
 
 def test_cancel_leaves_completed_items_alone(api, make_document, db_session):
-    run = api.post("/v1/document-processing-runs", json={"document_ids": [make_document()]}).json()
+    run = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": make_document()}]}
+    ).json()
     item_id = run["items"][0]["item_id"]
     _complete(db_session, item_id)
 
@@ -203,10 +232,14 @@ def test_cancel_leaves_completed_items_alone(api, make_document, db_session):
 def test_cancelled_report_can_be_submitted_again(api, make_document):
     """Cancelled is terminal, so the partial unique index no longer blocks a new item."""
     document_id = make_document()
-    run = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()
+    run = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
     api.delete(f"/v1/document-processing-runs/{run['run_id']}")
 
-    again = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()
+    again = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
     assert again["items"][0]["outcome"] == "created"
 
 
@@ -254,9 +287,9 @@ def test_run_item_carries_the_type_to_read_it_under(
     """The result routes are typed and there is no untyped variant, so the run a caller
     already polls has to say which type to use. Without this the API is unusable."""
     document_id = make_document()
-    run_id = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()[
-        "run_id"
-    ]
+    run_id = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()["run_id"]
     item_id = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]["item_id"]
     _classify(db_session, uuid.UUID(item_id), document_id, section)
 
@@ -269,13 +302,79 @@ def test_run_item_carries_the_type_to_read_it_under(
 
 def test_run_item_has_no_type_before_classification(api, make_document):
     document_id = make_document()
-    run_id = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()[
-        "run_id"
-    ]
+    run_id = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()["run_id"]
 
     item = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]
 
     assert item["document_type"] is None
+
+
+# --- intended_section ---------------------------------------------------------
+#
+# The section the user tapped when uploading, never a claim about what the document
+# actually is — only the classifier decides that.
+
+
+def test_submit_accepts_an_intended_section_and_stores_it(api, make_document, db_session):
+    document_id = make_document()
+
+    response = api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": document_id, "intended_section": "vaccinations"}]},
+    )
+
+    assert response.status_code == 202
+    item_id = response.json()["items"][0]["item_id"]
+    item = db_session.get(AiProcessingRunItem, uuid.UUID(item_id))
+    assert item.intended_section == "vaccinations"
+    # Set at submit so no stage has to read unclassified_files for the key.
+    assert item.source_key is not None
+
+
+def test_submit_defaults_intended_section_to_null_for_a_global_upload(
+    api, make_document, db_session
+):
+    document_id = make_document()
+
+    response = api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": document_id}]},
+    )
+
+    assert response.status_code == 202
+    item_id = response.json()["items"][0]["item_id"]
+    assert db_session.get(AiProcessingRunItem, uuid.UUID(item_id)).intended_section is None
+
+
+def test_submit_rejects_the_old_document_ids_shape(api, make_document):
+    """No compatibility window: Spring has never called this service."""
+    response = api.post(
+        "/v1/document-processing-runs",
+        json={"document_ids": [make_document()]},
+    )
+    assert response.status_code == 422
+
+
+def test_submit_rejects_an_unknown_intended_section(api, make_document):
+    response = api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": make_document(), "intended_section": "cats"}]},
+    )
+    assert response.status_code == 422
+
+
+def test_run_item_reports_the_intended_section(api, make_document):
+    document_id = make_document()
+    created = api.post(
+        "/v1/document-processing-runs",
+        json={"documents": [{"document_id": document_id, "intended_section": "reports"}]},
+    ).json()
+
+    run = api.get(f"/v1/document-processing-runs/{created['run_id']}").json()
+
+    assert run["items"][0]["intended_section"] == "reports"
 
 
 @pytest.mark.parametrize("section", ["bills", "medical_condition", "unknown"])
@@ -283,9 +382,9 @@ def test_sections_with_no_addressable_type_report_none(api, make_document, db_se
     """bills is stored not interpreted, medical_condition is entered by hand, unknown is by
     definition unclassified — none produces a result to read, so none has a URL."""
     document_id = make_document()
-    run_id = api.post("/v1/document-processing-runs", json={"document_ids": [document_id]}).json()[
-        "run_id"
-    ]
+    run_id = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()["run_id"]
     item_id = api.get(f"/v1/document-processing-runs/{run_id}").json()["items"][0]["item_id"]
     _classify(db_session, uuid.UUID(item_id), document_id, section)
 

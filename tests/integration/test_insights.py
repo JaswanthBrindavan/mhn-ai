@@ -65,6 +65,7 @@ def _context(db_session, test_settings, document_id, item_id, ai, attempt=1) -> 
         item_id=item_id,
         run_id=uuid.uuid4(),
         document_id=document_id,
+        source_key="",  # insights reads the stored extraction, never the source object
         attempt=attempt,
         session=db_session,
         s3=None,  # insights never touches S3

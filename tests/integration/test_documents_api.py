@@ -9,16 +9,25 @@ from sqlalchemy import text
 pytestmark = pytest.mark.integration
 
 
-def _seed_item(db_session, document_id, status, section_row_id=None) -> uuid.UUID:
+def _seed_item(
+    db_session, document_id, status, section_row_id=None, intended_section=None
+) -> uuid.UUID:
     run_id = db_session.execute(
         text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
     ).scalar_one()
     item_id = db_session.execute(
         text(
-            "INSERT INTO ai_processing_run_items (run_id, document_id, status, section_row_id) "
-            "VALUES (:r, :d, :s, :rep) RETURNING id"
+            "INSERT INTO ai_processing_run_items "
+            "(run_id, document_id, status, section_row_id, intended_section) "
+            "VALUES (:r, :d, :s, :rep, :sec) RETURNING id"
         ),
-        {"r": run_id, "d": document_id, "s": status, "rep": section_row_id},
+        {
+            "r": run_id,
+            "d": document_id,
+            "s": status,
+            "rep": section_row_id,
+            "sec": intended_section,
+        },
     ).scalar_one()
     db_session.flush()
     return item_id
@@ -91,6 +100,28 @@ def test_retry_a_failed_document_creates_and_queues_a_new_item(api, db_session, 
     assert body["document_id"] == document_id
     assert body["status"] == "queued"  # re-published
     assert uuid.UUID(body["item_id"]) != failed_item  # a fresh attempt
+
+
+def test_retry_preserves_the_original_intended_section(api, db_session, make_document):
+    """A retry must carry the user's original choice forward, or a document rejected for a
+    section mismatch would be reprocessed on retry as if it had been uploaded globally --
+    the mismatch check defeated on the second attempt, with nothing failing to say so."""
+    document_id = make_document()
+    old_item = _seed_item(db_session, document_id, "failed", intended_section="vaccinations")
+
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+
+    assert response.status_code == 202
+    new_item_id = uuid.UUID(response.json()["item_id"])
+    assert new_item_id != old_item  # a fresh attempt, not the seeded one
+
+    # Assert on the NEW item: the old row keeps its value either way, so checking it would
+    # pass even if retry_document dropped the field.
+    new_intended = db_session.execute(
+        text("SELECT intended_section FROM ai_processing_run_items WHERE id = :id"),
+        {"id": new_item_id},
+    ).scalar_one()
+    assert new_intended == "vaccinations"
 
 
 def test_retry_a_completed_document_is_rejected(api, db_session, make_document):

@@ -108,6 +108,9 @@ def _process(
         item_id=item_id,
         run_id=message.run_id,
         document_id=message.document_id,
+        # "" rather than None so the stages take a plain str: load_source_document turns
+        # the empty case into a reject, which is what a missing key means.
+        source_key=claim.source_key or "",
         attempt=claim.attempt,
         session=session,
         s3=s3,
@@ -207,7 +210,7 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     if section is DocumentSection.REPORTS:
         # Assemble the content and move it into reports, recording section_row_id and
         # completing the item in one transaction.
-        content = assembly.build_content(session, ctx.item_id)
+        content = assembly.build_content(session, ctx.item_id, state=assembly.ContentState.COMPLETE)
         if processing.move_and_complete(
             session, ctx.item_id, ctx.document_id, content, expected=_IN_PROGRESS
         ):

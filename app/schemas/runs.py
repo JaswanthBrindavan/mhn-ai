@@ -13,6 +13,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.results import DocumentType
+from app.services.classification import DocumentSection
 
 MAX_DOCUMENTS_PER_RUN = 500
 
@@ -27,15 +28,31 @@ class SubmitOutcome(StrEnum):
     ALREADY_COMPLETED = "already_completed"
 
 
+class SubmittedDocument(BaseModel):
+    """One document in a submission, with the section the user chose (if any)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: int = Field(description="unclassified_files id")
+    intended_section: DocumentSection | None = Field(
+        default=None,
+        description=(
+            "The section the USER uploaded into, or null for a global upload. Never a "
+            "claim about what the document is: if the detected section differs, the "
+            "document is rejected without extraction and stays in unclassified_files."
+        ),
+    )
+
+
 class CreateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    document_ids: Annotated[
-        list[int],
+    documents: Annotated[
+        list[SubmittedDocument],
         Field(
             min_length=1,
             max_length=MAX_DOCUMENTS_PER_RUN,
-            description="unclassified_files ids to classify and process",
+            description="Documents to classify and process",
         ),
     ]
 
@@ -60,6 +77,8 @@ class RunItemResponse(BaseModel):
     #: Exposed as `item_id`; read from the model's `id` attribute.
     item_id: uuid.UUID = Field(validation_alias="id")
     document_id: int
+    #: The section the user uploaded into, or null for a global upload.
+    intended_section: str | None = None
     #: The section row created if this document was filed. Read with `filed_section`.
     section_row_id: int | None = None
     filed_section: str | None = None
