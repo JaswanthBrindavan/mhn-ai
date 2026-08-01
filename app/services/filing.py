@@ -27,6 +27,7 @@ from sqlalchemy import CursorResult, Table, delete, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.integrations.s3 import (
+    SourceObjectMissingError,
     SourceObjectUnavailableError,
     copy_object,
     delete_object,
@@ -44,7 +45,7 @@ from app.models.spring import (
 from app.services.assembly import ContentState, build_content
 from app.services.classification import DocumentSection
 from app.services.s3_keys import key_for_section, preview_key_for
-from app.workers.stagetypes import RejectStageError
+from app.workers.stagetypes import RejectStageError, TransientStageError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mypy_boto3_s3.client import S3Client
@@ -80,8 +81,17 @@ def file_document(
     filed and the intake row and its object are left intact. Already-filed items return their
     existing row id without doing any work, so a redelivered message is safe.
     """
+    # FOR UPDATE, and it matters. Unlike the completion this replaced, the guarded UPDATE
+    # below does not change ``status``, so it is not self-excluding: a second worker on the
+    # same document would re-evaluate the same ``expected`` set, still match, and file the
+    # document a second time — two rows in a Spring-owned table with one ``filepath``, one
+    # of them orphaned and visible to the user. With the lock, the second worker blocks
+    # here, then reads the first's committed ``section_row_id`` and takes the already-filed
+    # return below, carrying on to extraction against the correct row.
     item = session.execute(
-        select(AiProcessingRunItem.section_row_id).where(AiProcessingRunItem.id == item_id)
+        select(AiProcessingRunItem.section_row_id)
+        .where(AiProcessingRunItem.id == item_id)
+        .with_for_update()
     ).one_or_none()
     if item is None:
         return None
@@ -109,11 +119,23 @@ def file_document(
     from_preview = preview_key_for(src.filepath)
 
     # Before the database, so a failure here leaves the original object and the intake row
-    # untouched and the whole thing simply retries.
-    copy_object(s3, bucket, src.filepath, to_key)
-    had_preview = object_exists(s3, bucket, from_preview)
-    if had_preview:
-        copy_object(s3, bucket, from_preview, preview_key_for(to_key))
+    # untouched and the whole thing simply retries. The try wraps ONLY the S3 calls: widening
+    # it would turn a programming error into a "transient" one and re-pay for classification
+    # on every retry until the attempt cap.
+    try:
+        copy_object(s3, bucket, src.filepath, to_key)
+        had_preview = object_exists(s3, bucket, from_preview)
+        if had_preview:
+            copy_object(s3, bucket, from_preview, preview_key_for(to_key))
+    except SourceObjectMissingError as exc:
+        # The realistic case is a user hand-filing the document in Spring between the SELECT
+        # above and this copy. Permanent, not transient: retrying cannot bring it back.
+        # The key stays out of the message — it is only ever internal detail.
+        session.rollback()
+        raise RejectStageError("source_object_missing", "Source file was not found") from exc
+    except SourceObjectUnavailableError as exc:
+        session.rollback()
+        raise TransientStageError(f"source storage unavailable: {exc}") from exc
 
     table = SECTION_TABLES[section]
     row_id = session.execute(
@@ -132,7 +154,13 @@ def file_document(
         "CursorResult[Any]",
         session.execute(
             update(AiProcessingRunItem)
-            .where(AiProcessingRunItem.id == item_id, AiProcessingRunItem.status.in_(expected))
+            .where(
+                AiProcessingRunItem.id == item_id,
+                AiProcessingRunItem.status.in_(expected),
+                # Defence in depth behind the row lock: this UPDATE never overwrites a
+                # filing someone else recorded, whatever the status guard says.
+                AiProcessingRunItem.section_row_id.is_(None),
+            )
             .values(
                 section_row_id=row_id,
                 filed_section=section.value,
@@ -142,8 +170,8 @@ def file_document(
         ),
     ).rowcount
     if filed != 1:
-        # Cancelled or moved underneath us: undo the insert entirely. The copied object is
-        # left behind, which is harmless and gets overwritten if the document is filed later.
+        # Cancelled, moved, or filed underneath us: undo the insert entirely. The copied
+        # object is left behind, harmless and overwritten if the document is filed later.
         session.rollback()
         return None
 

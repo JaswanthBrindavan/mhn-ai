@@ -9,15 +9,19 @@ import uuid
 from typing import NamedTuple
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 
-from app.integrations.s3 import object_exists
+from app.integrations.s3 import (
+    SourceObjectMissingError,
+    SourceObjectUnavailableError,
+    object_exists,
+)
 from app.models.spring import reports, unclassified_files, vaccinations
 from app.services import filing
 from app.services.assembly import ContentState, build_content
 from app.services.classification import DocumentSection
 from app.services.s3_keys import preview_key_for
-from app.workers.stagetypes import RejectStageError
+from app.workers.stagetypes import RejectStageError, TransientStageError
 
 from .conftest import BUCKET
 
@@ -113,6 +117,28 @@ def _item(db_session, item_id):
         .mappings()
         .one()
     )
+
+
+def _reports_count(db_session, seed) -> int:
+    return int(
+        db_session.execute(
+            text("SELECT count(*) FROM reports WHERE filepath = :k"),
+            {"k": "reports/" + seed.source_key.split("/", 1)[1]},
+        ).scalar_one()
+    )
+
+
+def _file(db_session, s3_client, bucket, seed, section, **overrides):
+    kwargs = {
+        "item_id": seed.item_id,
+        "document_id": seed.document_id,
+        "section": section,
+        "content": build_content(db_session, seed.item_id, state=ContentState.CLASSIFIED),
+        "bucket": bucket,
+        "expected": {"classifying"},
+    }
+    kwargs.update(overrides)
+    return filing.file_document(db_session, s3_client, **kwargs)
 
 
 def test_filing_creates_the_section_row_and_moves_the_object(
@@ -379,3 +405,92 @@ def test_vaccination_next_due_on_comes_from_the_extraction(
 def test_extra_columns_is_empty_for_a_non_vaccination_section(db_session, classified_item) -> None:
     seed = classified_item(DocumentSection.REPORTS)
     assert filing.extra_columns(db_session, seed.item_id, DocumentSection.REPORTS) == {}
+
+
+# --- concurrency: one document, one section row -----------------------------
+
+
+def test_the_already_filed_check_takes_a_row_lock(
+    db_connection, db_session, s3_client, bucket, classified_item
+) -> None:
+    """Without FOR UPDATE the guarded UPDATE is not self-excluding (it leaves `status`
+    alone), so two workers on one document would both file it. Pins the lock itself,
+    because the interleaving it prevents needs two connections to reproduce."""
+    statements: list[str] = []
+
+    @event.listens_for(db_connection, "before_cursor_execute")
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    try:
+        seed = classified_item(DocumentSection.REPORTS)
+        statements.clear()
+        _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+    finally:
+        event.remove(db_connection, "before_cursor_execute", _capture)
+
+    locking = [s for s in statements if "FOR UPDATE" in s and "ai_processing_run_items" in s]
+    assert locking, "the already-filed check must SELECT ... FOR UPDATE"
+
+
+def test_a_rival_filing_recorded_first_is_never_overwritten(
+    db_session, s3_client, bucket, classified_item, monkeypatch
+) -> None:
+    """The UPDATE guard's `section_row_id IS NULL` half. Stands in for a second worker
+    having filed and committed while we were copying: we must file nothing."""
+    seed = classified_item(DocumentSection.REPORTS)
+
+    def _rival_files_it(*_args, **_kwargs) -> bool:
+        # Runs after our SELECT and before the guarded UPDATE.
+        db_session.execute(
+            text("UPDATE ai_processing_run_items SET section_row_id = 999999 WHERE id = :i"),
+            {"i": seed.item_id},
+        )
+        return False
+
+    monkeypatch.setattr(filing, "object_exists", _rival_files_it)
+
+    row_id = _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    assert row_id is None
+    assert _reports_count(db_session, seed) == 0
+
+
+# --- S3 failures obey the stage error contract ------------------------------
+
+
+def test_a_vanished_object_during_filing_is_a_permanent_reject(
+    db_session, s3_client, bucket, classified_item, monkeypatch
+) -> None:
+    """A user hand-filing in Spring mid-copy. Retrying cannot bring it back, and each
+    retry re-pays for classification, so it must be terminal — not a bare exception."""
+    seed = classified_item(DocumentSection.REPORTS)
+
+    def _gone(*_args, **_kwargs) -> None:
+        raise SourceObjectMissingError("unclassified/secret-key.pdf")
+
+    monkeypatch.setattr(filing, "copy_object", _gone)
+
+    with pytest.raises(RejectStageError) as exc:
+        _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    assert exc.value.code == "source_object_missing"
+    # Keys are internal detail and never travel in an error body.
+    assert "secret-key" not in exc.value.message
+    assert _reports_count(db_session, seed) == 0
+
+
+def test_s3_being_unreachable_during_filing_is_transient(
+    db_session, s3_client, bucket, classified_item, monkeypatch
+) -> None:
+    seed = classified_item(DocumentSection.REPORTS)
+
+    def _blip(*_args, **_kwargs) -> None:
+        raise SourceObjectUnavailableError("SlowDown")
+
+    monkeypatch.setattr(filing, "copy_object", _blip)
+
+    with pytest.raises(TransientStageError):
+        _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    assert _reports_count(db_session, seed) == 0
