@@ -10,6 +10,7 @@ from sqlalchemy import text
 from app.services import extraction
 from app.services.extraction import extract_report
 from app.workers.stagetypes import StageContext, TransientStageError
+from tests.integration.conftest import document_key
 from tests.support.ai import FakeAIProvider, extraction_payload, structured_response
 
 pytestmark = pytest.mark.integration
@@ -35,6 +36,7 @@ def _context(db_session, aws, test_settings, document_id, item_id, ai, attempt=1
         item_id=item_id,
         run_id=uuid.uuid4(),
         document_id=document_id,
+        source_key=document_key(db_session, document_id),
         attempt=attempt,
         session=db_session,
         s3=aws[0],

@@ -108,6 +108,9 @@ def _process(
         item_id=item_id,
         run_id=message.run_id,
         document_id=message.document_id,
+        # "" rather than None so the stages take a plain str: load_source_document turns
+        # the empty case into a reject, which is what a missing key means.
+        source_key=claim.source_key or "",
         attempt=claim.attempt,
         session=session,
         s3=s3,

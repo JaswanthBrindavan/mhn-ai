@@ -59,6 +59,9 @@ class Claim:
     outcome: ClaimOutcome
     run_id: UUID | None = None
     document_id: int | None = None
+    #: The document's current S3 key, carried to the stages so they never have to look it
+    #: up in ``unclassified_files`` — filing deletes that row mid-pipeline.
+    source_key: str | None = None
     attempt: int = 0
 
 
@@ -94,6 +97,7 @@ def claim_item(session: Session, item_id: UUID, *, max_attempts: int) -> Claim:
             AiProcessingRunItem.status,
             AiProcessingRunItem.run_id,
             AiProcessingRunItem.document_id,
+            AiProcessingRunItem.source_key,
             AiProcessingRunItem.attempt_count,
             AiProcessingRunItem.started_at,
         )
@@ -108,7 +112,12 @@ def claim_item(session: Session, item_id: UUID, *, max_attempts: int) -> Claim:
     status = item.status
     if status in _TERMINAL:
         session.rollback()
-        return Claim(ClaimOutcome.SKIP_TERMINAL, run_id=item.run_id, document_id=item.document_id)
+        return Claim(
+            ClaimOutcome.SKIP_TERMINAL,
+            run_id=item.run_id,
+            document_id=item.document_id,
+            source_key=item.source_key,
+        )
 
     if item.attempt_count >= max_attempts:
         # Out of retries. Record a terminal failure so the message can be dropped
@@ -128,7 +137,12 @@ def claim_item(session: Session, item_id: UUID, *, max_attempts: int) -> Claim:
             "item_gave_up",
             extra={"item_id": str(item_id), "attempts": item.attempt_count},
         )
-        return Claim(ClaimOutcome.GAVE_UP, run_id=item.run_id, document_id=item.document_id)
+        return Claim(
+            ClaimOutcome.GAVE_UP,
+            run_id=item.run_id,
+            document_id=item.document_id,
+            source_key=item.source_key,
+        )
 
     attempt = item.attempt_count + 1
     session.execute(
@@ -148,6 +162,7 @@ def claim_item(session: Session, item_id: UUID, *, max_attempts: int) -> Claim:
         ClaimOutcome.PROCEED,
         run_id=item.run_id,
         document_id=item.document_id,
+        source_key=item.source_key,
         attempt=attempt,
     )
 

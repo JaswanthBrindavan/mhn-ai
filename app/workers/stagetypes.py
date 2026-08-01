@@ -37,6 +37,9 @@ class StageContext:
     item_id: UUID
     run_id: UUID
     document_id: int
+    #: The document's current S3 key. Read from the run item, NOT from unclassified_files:
+    #: filing deletes that row mid-pipeline and later stages still need the object.
+    source_key: str
     #: The processing attempt this run belongs to, for per-attempt cost logging.
     attempt: int
     session: Session

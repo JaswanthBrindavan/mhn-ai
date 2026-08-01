@@ -124,6 +124,18 @@ def test_settings(aws) -> Settings:
     )
 
 
+def document_key(session: Session, document_id: int) -> str:
+    """The S3 key a document was seeded with, or "" if it has no intake row.
+
+    Stage tests build a `StageContext` directly, so they need the key the real pipeline
+    would have copied onto the run item at submit time.
+    """
+    key = session.execute(
+        text("SELECT filepath FROM unclassified_files WHERE id = :id"), {"id": document_id}
+    ).scalar_one_or_none()
+    return str(key) if key else ""
+
+
 @pytest.fixture
 def make_document(db_session: Session, seed_user: uuid.UUID, aws):
     """Create an `unclassified_files` row AND its S3 object, and return its id.
@@ -140,8 +152,9 @@ def make_document(db_session: Session, seed_user: uuid.UUID, aws):
         content_type: str = "application/pdf",
         suffix: str = ".pdf",
         upload: bool = True,
+        key: str | None = None,
     ) -> int:
-        key = f"uploads/test/{uuid.uuid4().hex}{suffix}"
+        key = key or f"uploads/test/{uuid.uuid4().hex}{suffix}"
         if upload:
             s3.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
         document_id = db_session.execute(
