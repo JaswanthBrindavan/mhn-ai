@@ -35,27 +35,41 @@
 
 Users upload medical documents through the MyHealthNotion app. Spring stores each upload
 in the `unclassified_files` table and calls this service with the document ids. From there
-this service is both the classifier and the router:
+this service is the classifier, the router **and the filer**:
 
 1. **Classify** the document into an app section — `reports`, `scans_imaging`,
    `prescriptions`, `insurance`, `bills`, `vaccinations`, `medical_condition`, or `unknown`.
-2. **If it is a report:** extract the lab results, generate insights, then move the document
-   into the `reports` table and write the assembled payload to `reports.content` — the
-   insert, the content write, and the delete from `unclassified_files` all happen in one
-   transaction, so a document is never in both tables or in neither.
-3. **If it is `insurance`, `scans_imaging` or `vaccinations`:** transcribe that section's
-   fields into `ai_section_extractions` and finish there — no insights, and **no move**. The
-   results are stored against the document, which stays in `unclassified_files`.
-4. **Anything else** (`prescriptions`, `bills`, `medical_condition`, `unknown`) is recorded
-   with its detected section and left in `unclassified_files` for a later sprint.
+2. **File it, straight after classification**, into `reports`, `scans_imaging`, `insurance`
+   or `vaccinations`. Filing copies the S3 object from `unclassified/<name>` to
+   `<section>/<name>` (and its preview to `<section>_preview/<name>`), then in one
+   transaction inserts the section row, records it on the run item and deletes the
+   `unclassified_files` row; the original object is deleted only after that commit. The row
+   is created with `content.ai.state == "classified"`, so a user who tapped a section sees
+   their document there in seconds rather than after the whole pipeline.
+3. **Then run what that section needs.** A report is extracted and given insights; an
+   insurance policy, scan or vaccination certificate has its fields transcribed and stops
+   there — there is nothing clinical to interpret. Either way the filed row's `content` is
+   updated to `state == "complete"` at the end.
+4. **`prescriptions`, `bills`, `medical_condition` and `unknown` are not filed.** They are
+   recorded with their detected section, reach `rejected`, and stay in `unclassified_files`.
+   `bills` and `medical_condition` are manual-upload-only by product decision;
+   `prescriptions` gets its extractor in a later sprint.
+
+A submitted document may carry an `intended_section` — the section the **user uploaded
+into**, never a claim about what the document is. If the detected section disagrees with it,
+the document is rejected after classification with `section_mismatch`: not filed, not
+extracted, and left in `unclassified_files` with its S3 object untouched.
 
 Design notes worth knowing before reading the code:
 
 - **The API never does AI work inline.** `POST` persists the run, publishes to SQS, and
   returns `202 Accepted`. Workers do the processing and scale independently.
 - **SQS is at-least-once, so everything is idempotent.** A partial unique index allows one
-  in-flight item per document, stages upsert their results, and the move is atomic — a
-  redelivered message can only redo work, never duplicate it.
+  in-flight item per document, stages upsert their results, and filing is a no-op once the
+  run item carries a section row id — a redelivered message can only redo work, never
+  duplicate it. S3 has no transactions, so the object is copied *before* the database
+  transaction and the original deleted *after* it: a crash can leave an orphan object, never
+  a live row pointing at a deleted one.
 - **The model transcribes; Python decides.** Abnormal/out-of-range flags and unit conversion
   are deterministic application code, never model arithmetic. Model output is validated with
   Pydantic and never silently repaired. Where a reading is genuinely ambiguous — a censored
@@ -148,13 +162,15 @@ decision and re-authorizes on read.
 Every `/v1` route requires the service token as a bearer credential. `/health` and `/ready`
 are unauthenticated so probes keep working.
 
-Submit one or many documents by their `unclassified_files` ids:
+Submit one or many documents by their `unclassified_files` ids. `intended_section` is
+optional and defaults to null, meaning a global upload:
 
 ```sh
 curl -X POST http://localhost:8000/v1/document-processing-runs \
   -H "Authorization: Bearer $MHN_SERVICE_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"documents": [{"document_id": 101}, {"document_id": 102}]}'
+  -d '{"documents": [{"document_id": 101},
+                     {"document_id": 102, "intended_section": "vaccinations"}]}'
 ```
 
 `202 Accepted` returns a `run_id` and a per-document item id. Poll the run for progress —
@@ -167,9 +183,10 @@ curl http://localhost:8000/v1/document-processing-runs/$RUN_ID \
   -H "Authorization: Bearer $MHN_SERVICE_TOKEN"
 ```
 
-Read the result for a single document — its detected section, and, when it was moved into
-`reports`, the created `reports` id plus the extraction and insights. The document's type
-goes in the path, and the route answers only if that is what the document was classified as:
+Read the result for a single document — its detected section, the `section_row_id` of the
+row it was filed into, and the extraction plus (for reports) the insights. The document's
+type goes in the path, and the route answers only if that is what the document was
+classified as:
 
 ```sh
 curl http://localhost:8000/v1/documents/reports/101/ai-result \
@@ -186,8 +203,19 @@ The remaining routes are `POST /v1/documents/{type}/{id}/ai-result:retry` (retry
 that did not complete) and `DELETE /v1/document-processing-runs/{id}` (cancel unfinished
 items). Interactive docs are at `/docs`.
 
-A document classified into a section that is not processed yet reaches `rejected` with that
-section as the reason. That is routing, not a processing error.
+`rejected` is routing, not a processing error, and `last_error_code` says which kind:
+
+- the detected section (`bills`, `prescriptions`, `unknown`, …) — correctly classified into
+  a section this service does not file or process;
+- `section_mismatch` — the user uploaded into one section and the document belongs to
+  another; nothing was filed and nothing was extracted;
+- `section_changed_on_retry` — a retry of an already-filed document now classifies as a
+  different section. Terminal on purpose: re-filing would mean deleting a row we created and
+  moving the object a second time, and at `temperature=0` a classification that flips is an
+  anomaly worth surfacing.
+
+A document that failed *after* being filed can be retried in place: extraction re-runs and
+updates the existing row's `content`.
 
 ### Running the checks
 
@@ -200,7 +228,8 @@ pytest                      # add -m "not integration" to skip the DB-backed tes
 
 Integration tests run against a live database inside a rolled-back transaction, with moto
 standing in for S3/SQS and a fake provider standing in for the AI calls. No test spends
-money and no test writes to Spring-owned tables.
+money, and the rows the filing tests write into Spring-owned tables are rolled back with
+everything else — no test issues DDL against them.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -208,15 +237,19 @@ money and no test writes to Spring-owned tables.
 
 - [x] Upload classification into all app sections
 - [x] Reports pipeline: extraction, deterministic normalization, insights
-- [x] Atomic move into `reports` with the assembled `content` payload
+- [x] Section extraction for `scans_imaging`, `insurance` and `vaccinations`
+- [x] Auto-filing into `reports` / `scans_imaging` / `insurance` / `vaccinations` at
+      classification, S3 object relocated to the section prefix, `content` updated when the
+      pipeline finishes
 - [x] Parallel workers with bounded concurrency, retries, and a DLQ
 - [x] Per-stage models and AI cost/token logging
 - [x] Approved-THP age-group ideal-range override (behind `IDEAL_RANGES_ENABLED`, off until
       the Spring parameter tables and the approval predicate are confirmed)
 - [x] Reference-range parsing for the shapes labs actually print, and flags for non-numeric
       results (censored, present/absent, qualitative)
-- [ ] Additional sections (scans/imaging, prescriptions, insurance) via a section-dispatch
-      table — reusing the one worker and one queue, not adding new ones
+- [ ] `prescriptions`: an extractor and a drug cross-check, which registers its pipeline
+      through the same section-dispatch table — one worker, one queue, no new ones
+- [ ] Foreign keys we leave null on the filed row: `hospital`, and `insurance.provider`
 - [ ] Stale-item reaper for interrupted work
 - [ ] Production hardening: managed database, secrets manager, network isolation, CI/CD,
       observability, and DLQ alerting

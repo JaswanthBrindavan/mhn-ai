@@ -276,6 +276,44 @@ def test_filing_a_vanished_document_is_a_permanent_reject(
     assert _item(db_session, seed.item_id)["section_row_id"] is None
 
 
+def test_an_earlier_unfiled_attempt_is_not_mistaken_for_a_prior_filing(
+    db_session, s3_client, bucket, classified_item
+) -> None:
+    """Adoption looks for a prior item that actually *filed* something.
+
+    A document can have failed before filing and been retried, so an earlier item exists
+    with a null `section_row_id`. Matching that one would report `section_changed_on_retry`
+    (its `filed_section` is null) instead of the truth — that nothing was ever filed.
+    """
+    seed = classified_item(DocumentSection.REPORTS)
+    db_session.execute(
+        text(
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status, source_key) "
+            "SELECT run_id, document_id, 'failed', source_key FROM ai_processing_run_items "
+            "WHERE id = :id"
+        ),
+        {"id": seed.item_id},
+    )
+    db_session.execute(
+        unclassified_files.delete().where(unclassified_files.c.id == seed.document_id)
+    )
+    db_session.commit()
+
+    with pytest.raises(RejectStageError) as exc:
+        filing.file_document(
+            db_session,
+            s3_client,
+            item_id=seed.item_id,
+            document_id=seed.document_id,
+            section=DocumentSection.REPORTS,
+            content={},
+            bucket=bucket,
+            expected={"classifying"},
+        )
+
+    assert exc.value.code == "source_document_missing"
+
+
 def test_a_cancel_during_filing_wins_and_files_nothing(
     db_session, s3_client, bucket, classified_item
 ) -> None:

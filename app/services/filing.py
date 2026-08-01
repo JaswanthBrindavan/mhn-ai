@@ -80,6 +80,14 @@ def file_document(
     nothing because the item was cancelled or moved underneath us. In both cases nothing is
     filed and the intake row and its object are left intact. Already-filed items return their
     existing row id without doing any work, so a redelivered message is safe.
+
+    **A missing intake row is not automatically an error.** A document that was filed and
+    then failed a later stage can be retried, and the retry is a *new* run item — one with
+    no ``section_row_id`` of its own, for a document whose intake row filing already
+    deleted. That case is served by adopting the row a previous item filed (see
+    ``_adopt_prior_filing``) so the stages update it in place, which is what "reprocessed in
+    place" means. Only a document with no prior filed item at all is the genuine
+    "something else filed it" case and rejected.
     """
     # FOR UPDATE, and it matters. Unlike the completion this replaced, the guarded UPDATE
     # below does not change ``status``, so it is not self-excluding: a second worker on the
@@ -107,13 +115,10 @@ def file_document(
         ).where(unclassified_files.c.id == document_id)
     ).one_or_none()
     if src is None:
-        # Something else filed it (Spring's manual mover, or a lost race). Never fabricate
-        # a section row: that would give the user the same document twice.
-        session.rollback()
-        logger.warning(
-            "filing_source_missing", extra={"item_id": str(item_id), "document_id": document_id}
+        # A retry of an already-filed document, or something else filed it.
+        return _adopt_prior_filing(
+            session, item_id=item_id, document_id=document_id, section=section, expected=expected
         )
-        raise RejectStageError("source_document_missing", "Source document no longer exists")
 
     to_key = key_for_section(src.filepath, section.value)
     from_preview = preview_key_for(src.filepath)
@@ -188,6 +193,90 @@ def file_document(
         extra={"item_id": str(item_id), "section": section.value, "section_row_id": row_id},
     )
     return int(row_id)
+
+
+def _adopt_prior_filing(
+    session: Session,
+    *,
+    item_id: UUID,
+    document_id: int,
+    section: DocumentSection,
+    expected: set[str],
+) -> int | None:
+    """Point this item at the row a previous item already filed this document into.
+
+    Reached only when the intake row is gone and *this* item has not filed anything, which
+    is what a retry of a filed-but-failed document looks like: ``create_run`` made a fresh
+    item, resolved its ``source_key`` from the old one, and the document itself is already
+    sitting in its section table. Adopting that row lets the stages re-run and UPDATE its
+    ``content`` in place. This is not the "never fabricate a section row" case the reject
+    below guards — nothing is created, so the user cannot end up with the document twice.
+
+    A section that has *changed* since the first pass is refused loudly rather than
+    re-filed. Re-filing would mean deleting a Spring row we created and moving the object a
+    second time; at ``temperature=0`` a classification that flips is an anomaly worth
+    surfacing, not something to paper over by rewriting data.
+    """
+    prior = session.execute(
+        select(AiProcessingRunItem.section_row_id, AiProcessingRunItem.filed_section)
+        .where(
+            AiProcessingRunItem.document_id == document_id,
+            AiProcessingRunItem.id != item_id,
+            AiProcessingRunItem.section_row_id.is_not(None),
+        )
+        .order_by(AiProcessingRunItem.created_at.desc())
+        .limit(1)
+    ).one_or_none()
+
+    if prior is None:
+        # Something else filed it (Spring's manual mover, or a lost race). Never fabricate
+        # a section row: that would give the user the same document twice.
+        session.rollback()
+        logger.warning(
+            "filing_source_missing", extra={"item_id": str(item_id), "document_id": document_id}
+        )
+        raise RejectStageError("source_document_missing", "Source document no longer exists")
+
+    if prior.filed_section != section.value:
+        session.rollback()
+        logger.warning(
+            "filing_section_changed",
+            extra={
+                "item_id": str(item_id),
+                "filed_section": prior.filed_section,
+                "detected_section": section.value,
+            },
+        )
+        raise RejectStageError(
+            "section_changed_on_retry",
+            f"Already filed as {prior.filed_section} but now classified as {section.value}",
+        )
+
+    adopted = cast(
+        "CursorResult[Any]",
+        session.execute(
+            update(AiProcessingRunItem)
+            .where(AiProcessingRunItem.id == item_id, AiProcessingRunItem.status.in_(expected))
+            # source_key is left alone: create_run already copied the filed key onto this
+            # item, so it points at the relocated object.
+            .values(section_row_id=prior.section_row_id, filed_section=prior.filed_section)
+        ),
+    ).rowcount
+    if adopted != 1:
+        # Cancelled or moved underneath us, exactly as on the normal path.
+        session.rollback()
+        return None
+
+    session.commit()
+    logger.info(
+        "filing_adopted",
+        extra={
+            "item_id": str(item_id),
+            "section": section.value,
+            "section_row_id": prior.section_row_id,
+        },
+    )
+    return int(prior.section_row_id)
 
 
 def write_content(
