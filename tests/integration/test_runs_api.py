@@ -1,5 +1,6 @@
 """Run submission, progress, and cancellation against the live database."""
 
+import json
 import uuid
 
 import pytest
@@ -229,6 +230,46 @@ def test_cancel_leaves_completed_items_alone(api, make_document, db_session):
     assert body["unaffected_item_ids"] == [item_id]
 
 
+def test_cancelling_a_filed_document_stamps_its_content_failed(api, make_document, db_session):
+    """No worker will do this. The item may be cancelled while its message sits on the
+    queue after a transient failure, and the redelivery skips a cancelled item at claim
+    time without ever entering the pipeline — so the filed row would keep saying
+    `classified` and the app would show it as processing for ever."""
+    document_id = make_document()
+    run = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
+    item_id = run["items"][0]["item_id"]
+    row_id = _file_into_reports(db_session, item_id, document_id)
+
+    api.delete(f"/v1/document-processing-runs/{run['run_id']}")
+
+    content = db_session.execute(
+        text("SELECT content FROM reports WHERE id = :id"), {"id": row_id}
+    ).scalar_one()
+    assert content["ai"]["state"] == "failed"
+
+
+def test_cancelling_does_not_overwrite_a_completed_document_s_content(
+    api, make_document, db_session
+):
+    """The guard on the stamping: `completed` is not cancellable, so good content stands."""
+    document_id = make_document()
+    run = api.post(
+        "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}
+    ).json()
+    item_id = run["items"][0]["item_id"]
+    row_id = _file_into_reports(db_session, item_id, document_id, state="complete")
+    _complete(db_session, item_id)
+
+    api.delete(f"/v1/document-processing-runs/{run['run_id']}")
+
+    content = db_session.execute(
+        text("SELECT content FROM reports WHERE id = :id"), {"id": row_id}
+    ).scalar_one()
+    assert content["ai"]["state"] == "complete"
+
+
 def test_cancelled_report_can_be_submitted_again(api, make_document):
     """Cancelled is terminal, so the partial unique index no longer blocks a new item."""
     document_id = make_document()
@@ -247,13 +288,33 @@ def test_cancelled_report_can_be_submitted_again(api, make_document):
 
 
 def _complete(db_session, item_id: str) -> None:
-    from sqlalchemy import text
-
     db_session.execute(
         text("UPDATE ai_processing_run_items SET status = 'completed' WHERE id = :id"),
         {"id": uuid.UUID(item_id)},
     )
     db_session.flush()
+
+
+def _file_into_reports(db_session, item_id: str, document_id: int, *, state="classified") -> int:
+    """Put the item in the state the pipeline leaves it in after filing: a `reports` row
+    carrying `content`, recorded on the item, and the intake row gone."""
+    row_id = db_session.execute(
+        text(
+            "INSERT INTO reports (user_id, filepath, created_by, content) "
+            "SELECT user_id, 'reports/filed.pdf', created_by, CAST(:c AS JSONB) "
+            "FROM unclassified_files WHERE id = :d RETURNING id"
+        ),
+        {"d": document_id, "c": json.dumps({"ai": {"state": state}})},
+    ).scalar_one()
+    db_session.execute(
+        text(
+            "UPDATE ai_processing_run_items SET section_row_id = :s, filed_section = 'reports', "
+            "source_key = 'reports/filed.pdf' WHERE id = :id"
+        ),
+        {"s": row_id, "id": uuid.UUID(item_id)},
+    )
+    db_session.flush()
+    return int(row_id)
 
 
 # --- document_type: how a caller knows which typed result URL to call --------
