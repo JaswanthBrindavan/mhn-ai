@@ -210,7 +210,7 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     if section is DocumentSection.REPORTS:
         # Assemble the content and move it into reports, recording section_row_id and
         # completing the item in one transaction.
-        content = assembly.build_content(session, ctx.item_id)
+        content = assembly.build_content(session, ctx.item_id, state=assembly.ContentState.COMPLETE)
         if processing.move_and_complete(
             session, ctx.item_id, ctx.document_id, content, expected=_IN_PROGRESS
         ):
