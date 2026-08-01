@@ -6,7 +6,7 @@ document is moved. The AI payload lives under a dedicated ``ai`` key so any keys
 also writes on that row are never clobbered.
 
 Pure read + shape: no writes here. The transactional move (INSERT ``reports``, record
-``reports_id``, DELETE ``unclassified_files``, mark completed) is in
+``section_row_id``, DELETE ``unclassified_files``, mark completed) is in
 ``app.services.processing.move_and_complete``.
 """
 

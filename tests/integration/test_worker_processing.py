@@ -367,10 +367,11 @@ def test_a_section_document_is_extracted_then_stops(
     assert set(row["data"]["fields"]) == expected_fields
     # Not moved, and no reports row invented for a non-report.
     assert _source_exists(db_session, document_id)
-    reports_id = db_session.execute(
-        text("SELECT reports_id FROM ai_processing_run_items WHERE id = :id"), {"id": item_id}
+    section_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :id"),
+        {"id": item_id},
     ).scalar_one()
-    assert reports_id is None
+    assert section_row_id is None
     assert _queue_depth(sqs, queue_url) == 0
 
 
@@ -416,9 +417,10 @@ def test_a_report_still_moves_and_a_section_never_does(
     outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
 
     assert outcome is Outcome.COMPLETED
-    reports_id = db_session.execute(
-        text("SELECT reports_id FROM ai_processing_run_items WHERE id = :id"), {"id": item_id}
+    section_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :id"),
+        {"id": item_id},
     ).scalar_one()
-    assert reports_id is not None
+    assert section_row_id is not None
     # Moved: the intake row is gone, unlike every section document.
     assert not _source_exists(db_session, document_id)

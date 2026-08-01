@@ -9,16 +9,16 @@ from sqlalchemy import text
 pytestmark = pytest.mark.integration
 
 
-def _seed_item(db_session, document_id, status, reports_id=None) -> uuid.UUID:
+def _seed_item(db_session, document_id, status, section_row_id=None) -> uuid.UUID:
     run_id = db_session.execute(
         text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
     ).scalar_one()
     item_id = db_session.execute(
         text(
-            "INSERT INTO ai_processing_run_items (run_id, document_id, status, reports_id) "
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status, section_row_id) "
             "VALUES (:r, :d, :s, :rep) RETURNING id"
         ),
-        {"r": run_id, "d": document_id, "s": status, "rep": reports_id},
+        {"r": run_id, "d": document_id, "s": status, "rep": section_row_id},
     ).scalar_one()
     db_session.flush()
     return item_id
@@ -63,7 +63,7 @@ def _seed_results(db_session, item_id, document_id) -> None:
 
 def test_get_ai_result_returns_all_stages(api, db_session, make_document):
     document_id = make_document()
-    item_id = _seed_item(db_session, document_id, "completed", reports_id=77)
+    item_id = _seed_item(db_session, document_id, "completed", section_row_id=77)
     _seed_results(db_session, item_id, document_id)
 
     response = api.get(f"/v1/documents/reports/{document_id}/ai-result")
@@ -71,7 +71,7 @@ def test_get_ai_result_returns_all_stages(api, db_session, make_document):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "completed"
-    assert body["reports_id"] == 77
+    assert body["section_row_id"] == 77
     assert body["classification"]["section"] == "reports"
     assert body["extraction"]["results"][0]["test_name"] == "Glucose"
     assert body["insights"]["disclaimer"] == "info only"
@@ -95,7 +95,7 @@ def test_retry_a_failed_document_creates_and_queues_a_new_item(api, db_session, 
 
 def test_retry_a_completed_document_is_rejected(api, db_session, make_document):
     document_id = make_document()
-    _seed_item(db_session, document_id, "completed", reports_id=5)
+    _seed_item(db_session, document_id, "completed", section_row_id=5)
 
     response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
 
@@ -141,14 +141,14 @@ def _seed_classified(db_session, item_id, document_id, section) -> None:
 
 def test_typed_route_returns_the_result_when_the_type_matches(api, db_session, make_document):
     document_id = make_document()
-    item_id = _seed_item(db_session, document_id, "completed", reports_id=77)
+    item_id = _seed_item(db_session, document_id, "completed", section_row_id=77)
     _seed_results(db_session, item_id, document_id)
 
     response = api.get(f"/v1/documents/reports/{document_id}/ai-result")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["reports_id"] == 77
+    assert body["section_row_id"] == 77
     assert body["classification"]["section"] == "reports"
     assert body["extraction"]["results"][0]["test_name"] == "Glucose"
 
@@ -175,7 +175,7 @@ def test_every_typed_route_matches_its_section(api, db_session, make_document, s
 
 def test_typed_route_refuses_a_document_of_another_type(api, db_session, make_document):
     document_id = make_document()
-    item_id = _seed_item(db_session, document_id, "completed", reports_id=9)
+    item_id = _seed_item(db_session, document_id, "completed", section_row_id=9)
     _seed_results(db_session, item_id, document_id)  # classified as 'reports'
 
     response = api.get(f"/v1/documents/insurance/{document_id}/ai-result")
@@ -287,7 +287,7 @@ def test_a_section_result_is_readable_under_its_own_type(api, db_session, make_d
 
 def test_a_report_result_carries_no_section_extraction(api, db_session, make_document):
     document_id = make_document()
-    item_id = _seed_item(db_session, document_id, "completed", reports_id=3)
+    item_id = _seed_item(db_session, document_id, "completed", section_row_id=3)
     _seed_results(db_session, item_id, document_id)
 
     body = api.get(f"/v1/documents/reports/{document_id}/ai-result").json()

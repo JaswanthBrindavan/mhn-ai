@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import text
 
 from app.core.db import engine
+from app.models.processing import AiProcessingRun, AiProcessingRunItem
 
 pytestmark = pytest.mark.integration
 
@@ -53,3 +54,23 @@ def test_ready_endpoint_reports_up_against_live_database(api):
     assert checks["database"]["status"] == "up"
     assert checks["s3"]["status"] == "up"
     assert checks["sqs"]["status"] == "up"
+
+
+def test_run_item_carries_the_auto_filing_columns(db_session) -> None:
+    """The four columns filing depends on exist and default to NULL.
+
+    section_row_id replaces reports_id because the filed row is no longer always a report;
+    filed_section says which table it is in; source_key is how stages find the document
+    after the intake row is deleted.
+    """
+    run = AiProcessingRun(caller="spring")
+    db_session.add(run)
+    db_session.flush()
+    item = AiProcessingRunItem(run_id=run.id, document_id=1, status="pending")
+    db_session.add(item)
+    db_session.flush()
+
+    assert item.section_row_id is None
+    assert item.filed_section is None
+    assert item.intended_section is None
+    assert item.source_key is None

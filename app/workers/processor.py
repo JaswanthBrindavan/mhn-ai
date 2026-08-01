@@ -205,7 +205,7 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
             return Outcome.CANCELLED
 
     if section is DocumentSection.REPORTS:
-        # Assemble the content and move it into reports, recording reports_id and
+        # Assemble the content and move it into reports, recording section_row_id and
         # completing the item in one transaction.
         content = assembly.build_content(session, ctx.item_id)
         if processing.move_and_complete(

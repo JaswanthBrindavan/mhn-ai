@@ -191,7 +191,7 @@ def move_and_complete(
     """Atomically move a classified report into ``reports`` and complete the item.
 
     In ONE transaction: read the source document's fields, INSERT a ``reports`` row with
-    the assembled ``content``, record ``reports_id`` and mark the item completed (guarded
+    the assembled ``content``, record ``section_row_id`` and mark the item completed (guarded
     on ``expected``, so a concurrent cancel wins), then DELETE the source
     ``unclassified_files`` row. Returns False when the guard matches nothing — the whole
     transaction rolls back, so no ``reports`` row is left orphaned and no source row is
@@ -239,7 +239,7 @@ def move_and_complete(
         .values(
             status=RunItemStatus.COMPLETED.value,
             completed_at=_now(),
-            reports_id=reports_id,
+            section_row_id=reports_id,
         ),
     )
     if moved != 1:
