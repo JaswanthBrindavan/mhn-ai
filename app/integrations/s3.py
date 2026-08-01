@@ -1,8 +1,12 @@
-"""Read-only access to source report files in S3.
+"""Access to source document files in S3.
 
-This service needs ``s3:GetObject`` and ``s3:HeadObject`` and nothing more. It never
-writes, deletes, or changes ACLs, and never makes an object public. Buckets and keys are
-internal detail: they must not appear in API responses.
+Read: ``s3:GetObject`` and ``s3:HeadObject``. Write: ``s3:PutObject`` and
+``s3:DeleteObject``, used **only** by the filing step, which relocates a classified
+document from the ``unclassified/`` prefix into its section's prefix (copy, then delete the
+original after the database commit — see ``app.services.filing``).
+
+It still never changes ACLs and never makes an object public. Buckets and keys are internal
+detail: they must not appear in API responses.
 """
 
 import logging
@@ -100,3 +104,45 @@ def get_object(client: "S3Client", bucket: str, key: str) -> ObjectContent:
         etag=etag.strip('"') if etag else None,
     )
     return ObjectContent(metadata=metadata, data=data)
+
+
+def copy_object(client: "S3Client", bucket: str, from_key: str, to_key: str) -> None:
+    """Server-side copy within the bucket. Idempotent: re-copying overwrites the same key.
+
+    Same missing/transient split as ``get_object``, so a redelivered filing retries a blip
+    and permanently rejects a document whose source has genuinely gone.
+    """
+    try:
+        client.copy_object(
+            Bucket=bucket, Key=to_key, CopySource={"Bucket": bucket, "Key": from_key}
+        )
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in _MISSING_CODES or code in _DENIED_CODES or status in (403, 404):
+            raise SourceObjectMissingError(from_key) from exc
+        logger.warning("s3_copy_object_failed", extra={"error_code": code, "http_status": status})
+        raise SourceObjectUnavailableError(code) from exc
+    except Exception as exc:
+        raise SourceObjectUnavailableError(str(type(exc).__name__)) from exc
+
+
+def delete_object(client: "S3Client", bucket: str, key: str) -> None:
+    """Delete an object. A missing key is not an error — S3 treats DELETE as idempotent."""
+    try:
+        client.delete_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        logger.warning("s3_delete_object_failed", extra={"error_code": code})
+        raise SourceObjectUnavailableError(code) from exc
+    except Exception as exc:
+        raise SourceObjectUnavailableError(str(type(exc).__name__)) from exc
+
+
+def object_exists(client: "S3Client", bucket: str, key: str) -> bool:
+    """Whether an object is there, without raising — used to treat a preview as optional."""
+    try:
+        head_object(client, bucket, key)
+    except SourceObjectMissingError:
+        return False
+    return True

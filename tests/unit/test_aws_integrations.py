@@ -10,7 +10,10 @@ from moto import mock_aws
 from app.integrations.s3 import (
     SourceObjectMissingError,
     SourceObjectUnavailableError,
+    copy_object,
+    delete_object,
     head_object,
+    object_exists,
 )
 from app.integrations.sqs import (
     MESSAGE_SCHEMA_VERSION,
@@ -75,6 +78,43 @@ def test_connection_failure_is_transient(s3):
 
     with pytest.raises(SourceObjectUnavailableError):
         head_object(Boom(), BUCKET, "reports/a.pdf")  # type: ignore[arg-type]
+
+
+def test_copy_object_duplicates_the_object(s3):
+    s3.put_object(Bucket=BUCKET, Key="unclassified/a1b2", Body=b"pdf-bytes")
+
+    copy_object(s3, BUCKET, "unclassified/a1b2", "reports/a1b2")
+
+    assert s3.get_object(Bucket=BUCKET, Key="reports/a1b2")["Body"].read() == b"pdf-bytes"
+    # The source is untouched: deleting it is a separate, later step.
+    assert s3.get_object(Bucket=BUCKET, Key="unclassified/a1b2")["Body"].read() == b"pdf-bytes"
+
+
+def test_copy_object_missing_source_is_permanent(s3):
+    with pytest.raises(SourceObjectMissingError):
+        copy_object(s3, BUCKET, "unclassified/gone", "reports/gone")
+
+
+def test_copy_object_is_idempotent(s3):
+    """A redelivered filing re-copies over the same key rather than failing."""
+    s3.put_object(Bucket=BUCKET, Key="unclassified/a1b2", Body=b"pdf-bytes")
+    copy_object(s3, BUCKET, "unclassified/a1b2", "reports/a1b2")
+    copy_object(s3, BUCKET, "unclassified/a1b2", "reports/a1b2")
+    assert s3.get_object(Bucket=BUCKET, Key="reports/a1b2")["Body"].read() == b"pdf-bytes"
+
+
+def test_object_exists(s3):
+    s3.put_object(Bucket=BUCKET, Key="unclassified_preview/a1b2", Body=b"png")
+    assert object_exists(s3, BUCKET, "unclassified_preview/a1b2") is True
+    assert object_exists(s3, BUCKET, "unclassified_preview/nope") is False
+
+
+def test_delete_object_removes_it_and_tolerates_absence(s3):
+    s3.put_object(Bucket=BUCKET, Key="unclassified/a1b2", Body=b"pdf-bytes")
+    delete_object(s3, BUCKET, "unclassified/a1b2")
+    assert object_exists(s3, BUCKET, "unclassified/a1b2") is False
+    # S3 delete is a no-op on a missing key; a redelivered filing must not fail here.
+    delete_object(s3, BUCKET, "unclassified/a1b2")
 
 
 # --- SQS --------------------------------------------------------------------
