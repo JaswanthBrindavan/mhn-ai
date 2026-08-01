@@ -7,9 +7,9 @@ pipeline ends — so the payload carries an explicit ``state`` saying which mome
 AI payload lives under a dedicated ``ai`` key so any keys Spring also writes on that row are
 never clobbered.
 
-Pure read + shape: no writes here. The transactional move (INSERT ``reports``, record
-``section_row_id``, DELETE ``unclassified_files``, mark completed) is in
-``app.services.processing.move_and_complete``.
+Pure read + shape: no writes here. The transactional filing move (INSERT the section row,
+record ``section_row_id``, DELETE ``unclassified_files``) and the later ``content`` update
+both live in ``app.services.filing``.
 """
 
 from datetime import UTC, datetime

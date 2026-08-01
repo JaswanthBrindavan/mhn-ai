@@ -8,10 +8,12 @@ off ``Base.metadata`` makes that structurally impossible rather than merely disc
 Only the columns this service uses are declared. That is intentional: a partial
 declaration cannot drift into being mistaken for the authoritative schema.
 
-**Row access, not schema.** These are read-only for the source document
-(``unclassified_files``) except for the documented move: when a document is classified as
-a report, the service INSERTs a ``reports`` row, writes ``reports.content``, and DELETEs
-the source ``unclassified_files`` row. It never issues DDL against any Spring table.
+**Row access, not schema.** ``unclassified_files`` is read-only except for the documented
+filing move: once a document is classified into a section this service processes, it
+INSERTs a row into **that section's table** (``reports``, ``scans_imaging``, ``insurance``
+or ``vaccinations``), writes the row's ``content``, and DELETEs the source
+``unclassified_files`` row. The THP tables below are read-only. It never issues DDL against
+any Spring table.
 """
 
 from sqlalchemy import (
@@ -57,6 +59,45 @@ reports = Table(
     Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+)
+
+#: The scans/imaging section. INSERTed into when a scan is filed; read otherwise.
+scans_imaging = Table(
+    "scans_imaging",
+    spring_metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", UUID(as_uuid=True), nullable=False),
+    Column("created_by", UUID(as_uuid=True), nullable=True),
+    Column("filepath", String(500), nullable=False),
+    Column("content", JSONB, nullable=True),
+    Column("private", Boolean, nullable=True),
+)
+
+#: The insurance section. NOTE: its FK column is `provider` (-> insurance_provider), not
+#: `hospital`. We leave it null — resolving a provider name to an id is separate work.
+insurance = Table(
+    "insurance",
+    spring_metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", UUID(as_uuid=True), nullable=False),
+    Column("created_by", UUID(as_uuid=True), nullable=True),
+    Column("filepath", String(500), nullable=True),
+    Column("content", JSONB, nullable=True),
+    Column("private", Boolean, nullable=True),
+)
+
+#: The vaccinations section. `next_due_on` drives Spring's "vaccination due" index and is
+#: the one extra column we can fill, from the extracted next_due_date.
+vaccinations = Table(
+    "vaccinations",
+    spring_metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", UUID(as_uuid=True), nullable=False),
+    Column("created_by", UUID(as_uuid=True), nullable=True),
+    Column("filepath", String(500), nullable=False),
+    Column("content", JSONB, nullable=True),
+    Column("private", Boolean, nullable=True),
+    Column("next_due_on", DateTime(timezone=True), nullable=True),
 )
 
 # --- Staff-dashboard THP tables (read-only) ---------------------------------

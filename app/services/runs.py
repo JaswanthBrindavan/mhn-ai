@@ -48,6 +48,7 @@ from app.schemas.runs import (
     SubmitOutcome,
     SubmittedItem,
 )
+from app.services import filing
 from app.services.classification import DOCUMENT_TYPE_BY_SECTION
 from app.services.source_validation import (
     SourceObjectUnavailableError,
@@ -507,17 +508,32 @@ def cancel_run(session: Session, run_id: uuid.UUID) -> CancelRunResponse:
     unaffected = [item.id for item in run.items if item.status not in _CANCELLABLE]
 
     if cancellable:
-        session.execute(
-            update(AiProcessingRunItem)
-            .where(
-                AiProcessingRunItem.id.in_(cancellable),
-                # Re-check inside the UPDATE: an item may have advanced to a terminal
-                # state between the read above and this write.
-                AiProcessingRunItem.status.in_(_CANCELLABLE),
+        cancelled = (
+            session.execute(
+                update(AiProcessingRunItem)
+                .where(
+                    AiProcessingRunItem.id.in_(cancellable),
+                    # Re-check inside the UPDATE: an item may have advanced to a terminal
+                    # state between the read above and this write.
+                    AiProcessingRunItem.status.in_(_CANCELLABLE),
+                )
+                .values(status=RunItemStatus.CANCELLED.value)
+                .returning(AiProcessingRunItem.id)
             )
-            .values(status=RunItemStatus.CANCELLED.value)
+            .scalars()
+            .all()
         )
         session.commit()
+        # A document filed mid-pipeline keeps `content.ai.state == "classified"` until
+        # something says otherwise, and the app reads that as "still processing". No worker
+        # will do it here: the one holding this item may be between deliveries (a transient
+        # failure left the message on the queue), and when it is redelivered `claim_item`
+        # skips a cancelled item without entering the pipeline at all.
+        #
+        # RETURNING, not `cancellable`: an item that raced to `completed` between the read
+        # and the UPDATE is not in this set, so its finished content is never overwritten.
+        for item_id in cancelled:
+            filing.mark_content_failed(session, item_id)
 
     return CancelRunResponse(
         run_id=run_id,

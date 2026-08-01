@@ -4,13 +4,18 @@ Classification is the shared first stage — every document is classified before
 else is decided, because the section is what decides the rest. After it, the pipeline's
 *shape* depends on the answer:
 
-* ``reports``            -> extract lab results, generate insights, then move into ``reports``
+* ``reports``            -> extract lab results, generate insights
 * ``insurance`` / ``scans_imaging`` / ``vaccinations``
                          -> transcribe the section's fields, and stop
 * anything else          -> rejected; the document stays in ``unclassified_files``
 
 That is why this is a table rather than a list: a report and an insurance policy do not
 run the same stages, and a flat sequence cannot express "stop here for this kind".
+
+Filing the document into its section table and updating that row's ``content`` are **not**
+stages: they bracket the table above, in ``processor._run_pipeline``. Filing happens
+straight after classification so the document appears in its section within seconds, and
+the content update happens once the section's stages have finished.
 
 Shared types (``StageContext``, ``TransientStageError``, ``RejectStageError``) live in
 ``app.workers.stagetypes`` and are re-exported here for existing importers. Stages must

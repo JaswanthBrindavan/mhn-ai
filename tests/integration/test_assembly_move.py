@@ -1,5 +1,5 @@
-"""The assemble & move capstone: build reports.content from the stage results, INSERT the
-reports row, record section_row_id, DELETE unclassified_files — atomically and guarded.
+"""Assembling a filed document's `content` from the per-stage results, and closing the
+item afterwards. The filing move itself lives in test_filing.py.
 """
 
 import json
@@ -95,23 +95,6 @@ def _seed_stage_rows(db_session, item_id, document_id) -> None:
     db_session.flush()
 
 
-def _reports_row(db_session, reports_id):
-    return (
-        db_session.execute(text("SELECT * FROM reports WHERE id = :id"), {"id": reports_id})
-        .mappings()
-        .one_or_none()
-    )
-
-
-def _unclassified_exists(db_session, document_id) -> bool:
-    return (
-        db_session.execute(
-            text("SELECT 1 FROM unclassified_files WHERE id = :id"), {"id": document_id}
-        ).scalar_one_or_none()
-        is not None
-    )
-
-
 def _item(db_session, item_id):
     return (
         db_session.execute(
@@ -190,53 +173,31 @@ def test_completed_section_content_has_section_extraction_only(db_session, make_
     assert content["insights"] is None
 
 
-# --- move_and_complete ------------------------------------------------------
+# --- completing the item ----------------------------------------------------
+# Filing itself (INSERT the section row, record section_row_id, DELETE the intake row) is
+# `app.services.filing` and is covered by test_filing.py. What is left here is the item's
+# own completion, which happens after the filed row's content has been updated.
 
 
-def test_move_creates_report_records_id_and_deletes_source(db_session, make_document):
+def test_complete_item_closes_the_item_after_its_content_was_written(db_session, make_document):
     document_id = make_document()
     item_id = _seed_item(db_session, document_id)
     _seed_stage_rows(db_session, item_id, document_id)
-    content = build_content(db_session, item_id, state=ContentState.COMPLETE)
 
-    ok = processing.move_and_complete(
-        db_session, item_id, document_id, content, expected=_IN_PROGRESS
-    )
+    assert processing.complete_item(db_session, item_id, expected=_IN_PROGRESS) is True
 
-    assert ok is True
     row = _item(db_session, item_id)
     assert row["status"] == "completed"
-    assert row["section_row_id"] is not None
     assert row["completed_at"] is not None
 
-    report = _reports_row(db_session, row["section_row_id"])
-    assert report is not None
-    assert report["content"]["ai"]["classification"]["section"] == "reports"
-    # The report carries the source document's fields; the source row is gone.
-    assert report["filepath"]  # copied from unclassified_files
-    assert _unclassified_exists(db_session, document_id) is False
 
-
-def test_move_is_rolled_back_when_cancelled(db_session, make_document):
+def test_complete_item_is_refused_when_the_item_was_cancelled(db_session, make_document):
+    """The guard is how a cancel interrupts a running pipeline: the worker must not
+    overwrite `cancelled` with `completed`."""
     document_id = make_document()
     item_id = _seed_item(db_session, document_id, status="cancelled")
-    _seed_stage_rows(db_session, item_id, document_id)
-    content = build_content(db_session, item_id, state=ContentState.COMPLETE)
-    src_key = db_session.execute(
-        text("SELECT filepath FROM unclassified_files WHERE id=:id"), {"id": document_id}
-    ).scalar_one()
-    # Persist the seed past the savepoint move_and_complete will roll back to.
+    # Persist the seed past the savepoint complete_item rolls back to on refusal.
     db_session.commit()
 
-    ok = processing.move_and_complete(
-        db_session, item_id, document_id, content, expected=_IN_PROGRESS
-    )
-
-    assert ok is False
-    # No reports row was left behind, the source survives, and the cancel stands.
+    assert processing.complete_item(db_session, item_id, expected=_IN_PROGRESS) is False
     assert _item(db_session, item_id)["status"] == "cancelled"
-    assert _unclassified_exists(db_session, document_id) is True
-    orphans = db_session.execute(
-        text("SELECT count(*) FROM reports WHERE filepath = :k"), {"k": src_key}
-    ).scalar_one()
-    assert orphans == 0

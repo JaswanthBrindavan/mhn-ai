@@ -23,12 +23,11 @@ from enum import StrEnum
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, delete, insert, select, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.orm import Session
 
 from app.models.enums import TERMINAL_STATUSES, RunItemStatus
 from app.models.processing import AiProcessingRunItem
-from app.models.spring import reports, unclassified_files
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,8 @@ def _execute_update(session: Session, stmt: Any) -> int:
 def _rowcount(session: Session, stmt: Any) -> int:
     """Execute a statement and return affected rows WITHOUT committing.
 
-    Used inside a multi-statement transaction (the move) that must commit as a unit.
+    Lets the caller inspect the guard's row count and roll back instead of committing
+    when it matched nothing.
     """
     result = cast("CursorResult[Any]", session.execute(stmt))
     return result.rowcount
@@ -195,94 +195,17 @@ def advance(
     return _execute_update(session, stmt) == 1
 
 
-def move_and_complete(
-    session: Session,
-    item_id: UUID,
-    document_id: int,
-    content: dict[str, Any],
-    *,
-    expected: set[str],
-) -> bool:
-    """Atomically move a classified report into ``reports`` and complete the item.
-
-    In ONE transaction: read the source document's fields, INSERT a ``reports`` row with
-    the assembled ``content``, record ``section_row_id`` and mark the item completed (guarded
-    on ``expected``, so a concurrent cancel wins), then DELETE the source
-    ``unclassified_files`` row. Returns False when the guard matches nothing — the whole
-    transaction rolls back, so no ``reports`` row is left orphaned and no source row is
-    deleted.
-
-    Because the move and the completion commit together, a document is never in both
-    tables or in neither, and a redelivery only ever sees a fully-completed item (skipped
-    at claim time) or an untouched source to reprocess — never a half-done move.
-    """
-    src = session.execute(
-        select(
-            unclassified_files.c.user_id,
-            unclassified_files.c.filepath,
-            unclassified_files.c.private,
-            unclassified_files.c.created_by,
-        ).where(unclassified_files.c.id == document_id)
-    ).one_or_none()
-
-    if src is None:
-        # No source to move. Under the one-active-item-per-document invariant this is an
-        # anomaly (the source vanished without this item completing). Don't fabricate a
-        # reports row; leave the item as-is for the guard-failure path to handle.
-        session.rollback()
-        logger.warning(
-            "move_source_missing", extra={"item_id": str(item_id), "document_id": document_id}
-        )
-        return False
-
-    reports_id = session.execute(
-        insert(reports)
-        .values(
-            user_id=src.user_id,
-            filepath=src.filepath,
-            private=src.private,
-            created_by=src.created_by,
-            content=content,
-        )
-        .returning(reports.c.id)
-    ).scalar_one()
-
-    moved = _rowcount(
-        session,
-        update(AiProcessingRunItem)
-        .where(AiProcessingRunItem.id == item_id, AiProcessingRunItem.status.in_(expected))
-        .values(
-            status=RunItemStatus.COMPLETED.value,
-            completed_at=_now(),
-            section_row_id=reports_id,
-        ),
-    )
-    if moved != 1:
-        # Cancelled or moved underneath us: undo the reports insert entirely.
-        session.rollback()
-        return False
-
-    session.execute(delete(unclassified_files).where(unclassified_files.c.id == document_id))
-    session.commit()
-    logger.info(
-        "item_moved_and_completed",
-        extra={"item_id": str(item_id), "reports_id": reports_id},
-    )
-    return True
-
-
 def complete_item(session: Session, item_id: UUID, *, expected: set[str]) -> bool:
-    """Complete an item whose work is done but which is NOT moved out of intake.
+    """Mark an item's work finished.
 
-    A non-report section (insurance, scans/imaging, vaccinations) is transcribed into
-    ``ai_section_extractions`` and stops there: the document stays in
-    ``unclassified_files`` and no section row is created. Filing it is a separate,
-    undecided question — see ``docs/document-filing-design.md`` — and doing it here would
-    duplicate a mover Spring already has, with a different S3 key convention.
+    Filing is **not** done here. Every processable document is filed into its section table
+    by ``app.services.filing.file_document`` straight after classification, and its
+    ``content`` is updated when the stages finish; this only closes the run item afterwards.
+    Keeping the two apart is what lets a document reach its section in seconds instead of
+    waiting for the whole pipeline.
 
-    Guarded on ``expected`` like every other transition, so a concurrent cancel wins.
-    A report never comes through here; it completes inside ``move_and_complete`` so the
-    move and the completion commit together.
+    Guarded on ``expected`` like every other transition, so a concurrent cancel wins: a
+    guard matching nothing means the item was cancelled or moved and the caller stops.
     """
     completed = _rowcount(
         session,
