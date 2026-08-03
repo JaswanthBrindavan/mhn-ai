@@ -32,3 +32,9 @@ Thumbs.db
 
 # Reference screenshots of the staff THP dashboard (local only, like docs/).
 Current_Thp_dashboard/
+
+# Reference screenshots of the app's existing insight screens (local only, like docs/).
+Current_Insights_Results/
+
+# Subagent-driven-development scratch: ledger, briefs, review packages, demo seeds.
+.superpowers/

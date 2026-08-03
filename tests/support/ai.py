@@ -65,9 +65,15 @@ def insights_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "insights": [
             {
-                "heading": "Fasting glucose above the typical range",
-                "body": "Your fasting glucose is above the listed reference range. "
-                "Consider discussing this with a healthcare professional.",
+                "heading": "Elevated Fasting Glucose - Metabolic Risk",
+                "explanation": "This test checks the sugar in your blood before you "
+                "eat. It goes up with sweet food and drinks, and with less movement.",
+                "risk_patterns": "Your fasting sugar is 112, above the normal top of "
+                "100. Staying here can lead to diabetes over time.",
+                "suggestion_heading": "Reduce Fasting Glucose Through Diet",
+                "suggestions": "Cut back on sweet drinks and white rice or bread. "
+                "Walk briskly for 30 minutes most days. Get sugar checked again with "
+                "an HbA1c in 8 to 12 weeks.",
                 "related_tests": ["Fasting Glucose"],
             }
         ],

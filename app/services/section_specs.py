@@ -133,15 +133,19 @@ _INSURANCE_PROMPT = (
 class ScanFields(BaseModel):
     """Validated imaging-report fields.
 
-    ``summary`` is deliberately short: it is read on a phone, under the report's own
-    findings. The radiologist's exact wording is preserved in ``impression``.
+    ``summary`` is the patient-facing one: a radiology report is written for another
+    clinician, so without it the reader is left with `impression`, which is close to
+    unreadable if you have no medical training. It is allowed real room — several
+    sentences — because explaining a term in everyday words costs more words than using
+    it. The radiologist's exact wording is preserved verbatim in ``impression``, so
+    nothing is lost by making ``summary`` plain.
     """
 
     scan_type: str | None = Field(default=None, max_length=64)
     body_part: str | None = Field(default=None, max_length=128)
     scan_date: str | None = Field(default=None, max_length=64)
     facility: str | None = Field(default=None, max_length=256)
-    summary: str | None = Field(default=None, max_length=400)
+    summary: str | None = Field(default=None, max_length=1200)
     impression: str | None = Field(default=None, max_length=2000)
     findings: list[str]
 
@@ -179,11 +183,27 @@ _SCAN_PROMPT = (
     "- scan_date: the date of the study.\n"
     "- facility: the hospital or imaging centre NAME only. Null if only an address "
     "appears.\n"
-    "- summary: AT MOST 2 short sentences and 30 words in total. The first says what "
-    "was scanned; the second is the conclusion. Written in everyday words for the "
-    "patient — say what a clinical term means rather than repeating it, since the exact "
-    "wording is kept in impression. No advice, no alarm. For example: 'An X-ray of the "
-    "left knee. Everything looks normal.'\n"
+    "- summary: THREE TO SIX short sentences explaining, in the simplest possible "
+    "English, what this scan looked at and what it showed. Write for an adult with no "
+    "medical background and limited reading confidence:\n"
+    "    * Say what part of the body was scanned and, in a few words, what that part "
+    "does — 'the lower back, which carries your weight and protects the nerves running "
+    "down to your legs'.\n"
+    "    * NEVER use a clinical term on its own. Either replace it with everyday words "
+    "or explain it immediately: not 'posterocentral disc protrusion', but 'one of the "
+    "soft cushions between the bones is bulging out towards the back'.\n"
+    "    * Spell out abbreviations and bone or joint labels the same way. 'L4-5' is "
+    "'between the fourth and fifth bones of the lower back'.\n"
+    "    * Use short sentences. One idea each. Prefer common words: 'swelling' over "
+    "'oedema', 'narrowing' over 'stenosis', 'pressing on' over 'impinging'.\n"
+    "    * Say plainly when something looks normal, and say plainly what was found when "
+    "it does not. Describe ONLY what the report states.\n"
+    "  You are still not a doctor: no diagnosis, no advice, no reassurance or alarm "
+    "beyond what the report itself says. The radiologist's exact wording is preserved "
+    "in impression, so nothing is lost by keeping this plain.\n"
+    "  For example: 'This was an X-ray of the left knee. The knee is the joint in the "
+    "middle of your leg. The pictures did not show any broken bones or other problems. "
+    "Everything looked normal.'\n"
     "- impression: the radiologist's impression or conclusion, as printed.\n"
     "- findings: at most 5 short key findings, most important first.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
@@ -238,6 +258,10 @@ _VACCINATION_PROMPT = (
     "- date_given: the date this dose was administered.\n"
     "- next_due_date: the NEXT scheduled dose only. Null if the record shows none or "
     "the series is complete.\n"
+    "  If the record gives a WINDOW rather than a single day — 'Between 31 Jan 2022 and "
+    "14 Feb 2022', 'due after 4 weeks', '31/01/2022 - 14/02/2022' — return the START of "
+    "that window, the day the dose first becomes due. Do not return null just because the "
+    "record states a range: a stated next dose is the whole point of this field.\n"
     "- facility: the vaccination centre or hospital NAME only, not its address.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
 )

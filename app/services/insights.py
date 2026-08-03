@@ -5,10 +5,18 @@ insights over that structured data (never the raw file, so it cannot introduce v
 that bypassed extraction), validate with Pydantic (never repaired), attach a fixed
 disclaimer, then persist to ``ai_report_insights`` and a process log.
 
-Insights are informational only — never a diagnosis, emergency instruction, or medical
-certainty. That is enforced by the system prompt; a fixed disclaimer is always stored
-alongside them. When there is nothing to interpret — no extracted results, or every
-result determined to be in range — the model call is skipped entirely.
+**Insights are clinically directive, by product decision (2026-08-03.)** They name the
+risk a pattern carries and recommend concrete action — diet, lifestyle, follow-up tests,
+target values — matching the app's existing Risk Patterns and Suggestions screens. They
+were informational-only until that date; see ``Insight`` for what changed and why.
+
+The one line the prompt still holds: **no medication, no dosage, no starting or stopping
+a drug, and no emergency instruction.** Recommending a blood test or a dietary change is
+not prescribing; recommending a medicine is. A fixed disclaimer is stored with every
+payload regardless.
+
+When there is nothing to interpret — no extracted results, or every result determined to
+be in range — the model call is skipped entirely.
 
 Idempotent: the insights row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
@@ -30,10 +38,13 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ins-2026-07-28"
-SCHEMA_VERSION = "ins-1"
+PROMPT_VERSION = "ins-2026-08-03c"
+SCHEMA_VERSION = "ins-4"
 STAGE_NAME = "generating_insights"
-INSIGHTS_MAX_TOKENS = 4096
+#: Headroom, not a target: the fields are individually capped and a typical report now
+#: lands well under this. Kept generous because a truncated response fails validation and
+#: burns three paid retries — StructuredResponse.truncated is not checked anywhere yet.
+INSIGHTS_MAX_TOKENS = 16384
 
 #: Stored with every insights payload. Informational framing is not left to the model.
 DISCLAIMER = (
@@ -47,8 +58,49 @@ ALL_IN_RANGE_SUMMARY = "All extracted results fall within their reference ranges
 
 
 class Insight(BaseModel):
+    """One finding, shaped for the app's two cards.
+
+    ``heading`` + ``risk_patterns`` render the Risk Patterns card; ``suggestion_heading``
+    + ``suggestions`` render the Suggestions card; ``explanation`` is the plain-language
+    line behind them.
+
+    Every field is capped short on purpose. This is read on a phone by someone with no
+    medical training, and a long block does not get read at all — so the caps are a
+    product requirement, not storage hygiene. ``explanation`` merges what were two
+    separate fields that each explained the same thing at length.
+
+    **The prompt states a word budget for each field, and these caps sit above it.** A cap
+    the model is not told about is not a limit, it is a paid failure: over-long output
+    fails validation, which this stage treats as transient, so it retries the whole call
+    at full price. A 400-char ``risk_patterns`` cap with no stated budget did exactly that
+    once, at $0.046 per attempt. Tighten a cap and the budget together, or not at all.
+
+    **These are clinically directive, by product decision (2026-08-03).** They name
+    conditions, state the risk a pattern carries, and recommend concrete actions — diet,
+    lifestyle, follow-up tests, target values. That is a deliberate change from the
+    earlier informational-only framing, made after comparing both against the app's
+    existing Risk Patterns / Suggestions screens.
+
+    The line that remains: **no medication, no dosage, no starting or stopping a drug,
+    and no emergency instruction.** Recommending a blood test or a dietary change is not
+    prescribing; recommending a medicine is. The disclaimer is still attached to every
+    payload.
+    """
+
+    #: Names the finding AND its risk, as the Risk Patterns card title:
+    #: "Elevated Uric Acid - Gout & Renal Risk".
     heading: str = Field(min_length=1, max_length=200)
-    body: str = Field(min_length=1, max_length=2000)
+    #: One or two lines: what this test looks at and what moves it, together. Merged
+    #: from two fields that were separately explaining the same thing at length.
+    explanation: str = Field(min_length=1, max_length=350)
+    #: The Risk Patterns card body: the value against the limit it crossed, then what
+    #: that can lead to. Two or three short lines.
+    risk_patterns: str = Field(min_length=1, max_length=500)
+    #: The Suggestions card title — an action, e.g. "Reduce Uric Acid Through Diet".
+    suggestion_heading: str = Field(min_length=1, max_length=120)
+    #: The Suggestions card body: concrete steps, two or three short lines. Never
+    #: medication, dosage, or starting/stopping a drug.
+    suggestions: str = Field(min_length=1, max_length=500)
     #: Test names from the extraction this insight refers to.
     related_tests: list[str] = Field(default_factory=list)
 
@@ -64,10 +116,20 @@ _INSIGHT_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "heading": {"type": "string"},
-        "body": {"type": "string"},
+        "explanation": {"type": "string"},
+        "risk_patterns": {"type": "string"},
+        "suggestion_heading": {"type": "string"},
+        "suggestions": {"type": "string"},
         "related_tests": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["heading", "body", "related_tests"],
+    "required": [
+        "heading",
+        "explanation",
+        "risk_patterns",
+        "suggestion_heading",
+        "suggestions",
+        "related_tests",
+    ],
     "additionalProperties": False,
 }
 INSIGHTS_JSON_SCHEMA: dict[str, Any] = {
@@ -81,22 +143,81 @@ INSIGHTS_JSON_SCHEMA: dict[str, Any] = {
 }
 
 SYSTEM_PROMPT = (
-    "You write brief, plain-language, informational explanations of laboratory results "
-    "for a layperson. You are NOT a doctor.\n\n"
+    "You write a lab report's Risk Patterns and Suggestions for the person whose report "
+    "it is. Be concrete and clinically useful: name the pattern, say what risk it "
+    "carries, and give steps worth acting on.\n\n"
     "Hard rules:\n"
-    "- Do NOT diagnose, and do NOT tell the reader they have or might have any condition.\n"
-    "- Do NOT give emergency, treatment, medication, or dosage instructions.\n"
-    "- Do NOT state anything with medical certainty; keep it informational, not advice.\n"
+    "- NEVER name, recommend, adjust or discourage a MEDICATION, supplement dose, or "
+    "any drug — prescription or over the counter. Recommending a blood test or a change "
+    "of diet is fine; recommending a medicine is not, ever.\n"
+    "- NEVER give emergency instructions or tell the reader to seek urgent care.\n"
     "- Base every statement ONLY on the structured results provided. Do not infer, "
-    "convert, or invent values, units, or ranges.\n"
+    "convert, or invent values, units, or ranges. Every number you cite must appear in "
+    "the input.\n"
     "- The 'abnormal_flag' field is authoritative: it was computed by the system, not by "
     "you. Do not re-judge whether a value is in range.\n"
     "- Do NOT add a 'discuss this with your doctor/healthcare provider' line to your "
     "insights. A disclaimer saying exactly that is attached to every set of insights; "
     "repeating it per result is noise.\n\n"
-    "For a result flagged 'low' or 'high', note in plain language what the test measures "
-    "and that this value sits outside the typical reference range. Cite the relevant test "
-    "name(s) in related_tests. If nothing is noteworthy, return an empty insights list."
+    "Write ONE insight per finding, not one per row, and MERGE AGGRESSIVELY. Results "
+    "belong in the same insight when they describe one finding: a percentage and its "
+    "absolute count, a ratio and the values it is derived from, or several markers of "
+    "the same body system telling the same story (the red-cell markers of anaemia; "
+    "sodium and chloride together; the liver enzymes). List every test name you covered "
+    "in related_tests. Every flagged result must be COVERED by some insight: merge, "
+    "never drop.\n\n"
+    "WRITE IN SIMPLE ENGLISH. This is read on a phone by someone with no medical "
+    "training. A long block does not get read at all, so short beats complete:\n"
+    "- Almost no medical words. Where an everyday word exists, use it: 'bile' not "
+    "'cholestatic', 'liver cells' not 'hepatocellular', 'paler than usual' not "
+    "'hypochromic', 'joint pain' not 'gout flares', 'kidney' not 'renal'. If a term has "
+    "no everyday equivalent, put the plain meaning in brackets right after it once.\n"
+    "- Short sentences, one idea each. No semicolons stacking three clauses together.\n"
+    "- Keep the numbers — they are the point — but drop unit strings the reader cannot "
+    "use if the sentence already reads clearly.\n"
+    "- Do not repeat between fields. Say a thing once.\n\n"
+    "Each insight fills five fields. STAY INSIDE THE LINE LIMITS:\n\n"
+    "- heading: the Risk Patterns card title. Name the finding AND what it can lead to, "
+    "joined by a dash, in plain words. 'High Uric Acid - Joint Pain & Kidney Risk'. "
+    "'Slightly High LDL Cholesterol - Heart Risk'. Where several results form one "
+    "pattern, name it once: 'Low Iron-Related Blood Markers - Possible Nutritional Gap'.\n"
+    "- explanation: ONE OR TWO LINES, AT MOST 40 WORDS, covering both what this "
+    "test looks at and what commonly moves it. 'Uric acid is a waste "
+    "product your kidneys clear out. It builds "
+    "up when you eat a lot of red meat or shellfish, drink alcohol, or do not drink "
+    "enough water.'\n"
+    "- risk_patterns: TWO OR THREE SHORT LINES, AT MOST 60 WORDS. Start with the "
+    "value and the limit it crossed, taken from the input. Then say "
+    "plainly what that can lead to. 'Uric acid "
+    "is 8.6, above the normal top of 8.0. Staying this high can cause sudden joint pain "
+    "and, over time, kidney stones.' Say when something is only mild — 'this is only "
+    "slightly above the line' — so the reader can tell small from serious.\n"
+    "- suggestion_heading: the Suggestions card title. An action, AT MOST 6 WORDS: "
+    "'Cut Down Uric Acid Through Food'. 'Check for Low Iron'.\n"
+    "- suggestions: TWO OR THREE SHORT LINES, AT MOST 60 WORDS, of things to "
+    "actually do. Name real foods, name the follow-up test, give the "
+    "retest gap. 'Eat less red meat, organ meat and "
+    "shellfish, and cut back on alcohol. Drink more water. Get uric acid checked again "
+    "in 4 to 6 weeks.' Say what to do, not who to ask.\n"
+    "  BANNED here, because they are true of every result and so say nothing: 'discuss "
+    "this with your doctor', 'ask a clinician', 'consult a healthcare professional', "
+    "'interpret alongside your other results', 'a clinician can advise'. A disclaimer "
+    "on every payload already says that. Give the reader something to act on instead.\n\n"
+    "**Write an insight ONLY for results flagged 'low' or 'high'.** Nothing else earns "
+    "one:\n"
+    "- A result flagged 'normal' NEVER gets its own insight. Use it as context inside "
+    "another finding if it sharpens the picture, and nothing more.\n"
+    "- **Never write a round-up insight** — no 'Remaining Tests - All Within Normal "
+    "Limits', no 'Other Results', no 'Everything Else Is Fine'. The summary already "
+    "covers what came back normal. A card that says nothing happened is a card the "
+    "reader has to swipe past to reach one that matters.\n"
+    "- A result flagged null means the system could not check it against any range. Do "
+    "NOT give it its own insight and do NOT judge whether it is in range. Name those "
+    "tests in the SUMMARY instead, in one clause — 'X and Y were reported without "
+    "reference ranges, so they could not be checked'.\n\n"
+    "summary: two to four sentences covering the whole panel — what was flagged, grouped "
+    "sensibly, and what came back within range. Written for someone reading it before "
+    "any of the detail below it."
 )
 
 INSTRUCTION_PREFIX = (
