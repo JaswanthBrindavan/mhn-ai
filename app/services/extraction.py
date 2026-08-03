@@ -34,9 +34,18 @@ PROMPT_VERSION = "ext-2026-07-27"
 SCHEMA_VERSION = "ext-3"
 STAGE_NAME = "extracting"
 #: Reports can carry many analytes; give the model room but keep it bounded.
-#: Room for a ~120-result panel. A full-body report has produced 98 distinct results at
-#: ~70 tokens each; 8192 was 82% used on a 100-result document.
-EXTRACT_MAX_TOKENS = 16000
+#:
+#: Measured, not guessed: 8192 was 82% used on a 100-result document; a 128-result panel
+#: (Vivek_Health_Report_Condensed, 2026-08-03) used 11,679 — 73% of 16000. That is far
+#: too close for a ceiling whose failure mode is expensive: a truncated response fails
+#: Pydantic, is recorded as `invalid_model_output`, and is treated as TRANSIENT, so it
+#: retries and fails identically every time — `StructuredResponse.truncated` is still not
+#: checked anywhere (see docs/FUTURE.md).
+#:
+#: Headroom here is nearly free. Extraction runs on Gemini Flash-Lite at $1.50/M output,
+#: so the 8000-token increase costs at most $0.012 on a document that actually needs it,
+#: and nothing at all on one that does not — max_tokens is a ceiling, not an allocation.
+EXTRACT_MAX_TOKENS = 24000
 
 
 class ExtractedLabResult(BaseModel):
