@@ -47,7 +47,18 @@ def parse_number(value: str | None) -> float | None:
 
 
 #: "Male: 65-175, Female: 50-170" — one printed range carrying both sexes.
-_GENDER_SEGMENT_RE = re.compile(r"\b(?P<gender>male|female)\s*:\s*(?P<range>[^,;]+)", re.I)
+#:
+#: A segment runs to the NEXT gender label, not merely to a comma. Labs write the pair
+#: with no separator at all ("Male : 63.5 - 150 Female : 80 - 155"), and a ``[^,;]+``
+#: range group let the male half swallow the female half whole — so only one segment was
+#: ever found, selecting "female" matched nothing, and the result went unflagged. A
+#: genuinely high serum copper (162.22 against a female ceiling of 155) came back with no
+#: flag that way on a real report.
+_GENDER_SEGMENT_RE = re.compile(
+    r"\b(?P<gender>male|female)\s*:\s*(?P<range>.+?)"
+    r"(?=[,;]|\bmale\s*:|\bfemale\s*:|$)",
+    re.I,
+)
 #: A leading qualifier ("Desirable : 2.5-3.0", "Adult : 17-43") or a trailing one
 #: (">= 90 : Normal"). The label is context for a human, noise for the bounds.
 _LEADING_LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z ]{0,24}:\s*")

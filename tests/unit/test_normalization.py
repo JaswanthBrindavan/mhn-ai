@@ -249,3 +249,53 @@ def test_override_bounds_win_over_report_range():
     assert enriched["range_source"] == "ideal_range"
     assert enriched["matched_parameter"] == "Fasting Glucose"
     assert enriched["matched_group"] == "adult male"
+
+
+def test_sex_split_range_without_a_comma_separator() -> None:
+    """Labs separate the two halves with nothing but a space.
+
+    The original pattern ended a segment only at ',' or ';', so the male half greedily
+    swallowed the female half and the female segment never existed — leaving a genuinely
+    abnormal result unflagged. Measured on a real report: SERUM COPPER 162.22 against
+    "Male : 63.5 - 150 Female : 80 - 155" for a female patient came back with no flag.
+    """
+    copper = "Male : 63.5 - 150 Female : 80 - 155"
+    assert parse_reference_range(copper, "F") == (80.0, 155.0)
+    assert parse_reference_range(copper, "M") == (63.5, 150.0)
+
+    iron = "Male : 65 - 175 Female : 50 - 170"
+    assert parse_reference_range(iron, "Female") == (50.0, 170.0)
+
+    # Trailing units on each half, still no comma.
+    tibc = "Male: 225 - 535 µg/dl Female: 215 - 535 µg/dl"
+    assert parse_reference_range(tibc, "F") == (215.0, 535.0)
+
+    # The comma-separated form must keep working.
+    assert parse_reference_range("Male: 65-175, Female: 50-170", "F") == (50.0, 170.0)
+    # Unknown sex still refuses to pick a half.
+    assert parse_reference_range(copper, None) is None
+
+
+def test_sex_split_flags_the_real_copper_and_iron_results() -> None:
+    """End to end through enrich_result, the way extraction calls it."""
+    copper = enrich_result(
+        {
+            "test_name": "SERUM COPPER",
+            "value": "162.22",
+            "unit": "µg/dL",
+            "reference_range": "Male : 63.5 - 150 Female : 80 - 155",
+        },
+        gender="F",
+    )
+    assert copper["abnormal_flag"] == "high"
+
+    iron = enrich_result(
+        {
+            "test_name": "IRON",
+            "value": "31",
+            "unit": "µg/dL",
+            "reference_range": "Male : 65 - 175 Female : 50 - 170",
+        },
+        gender="F",
+    )
+    assert iron["abnormal_flag"] == "low"
