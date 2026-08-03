@@ -45,9 +45,11 @@ class ContentState(StrEnum):
 
 
 #: Version of the content["ai"] shape, so consumers can migrate on change.
+#: 2.1 — each insight is now four explanatory parts (what_it_is / why_it_varies /
+#: risk_context / suggestions) rather than a single `body`.
 #: 2.0 — the payload is now written at filing time, before extraction has run, and gained
 #: `state` and `section_extraction`. 1.1 was report-only and written once, at the move.
-CONTENT_SCHEMA_VERSION = "2.0"
+CONTENT_SCHEMA_VERSION = "2.1"
 
 
 def build_content(session: Session, item_id: UUID, *, state: ContentState) -> dict[str, Any]:

@@ -137,7 +137,7 @@ def test_content_at_filing_time_carries_only_the_classification(db_session, make
     content = build_content(db_session, item_id, state=ContentState.CLASSIFIED)["ai"]
 
     assert content["state"] == "classified"
-    assert content["schema_version"] == "2.0"
+    assert content["schema_version"] == "2.1"
     assert content["classification"]["section"] == "reports"
     assert content["extraction"] is None
     assert content["section_extraction"] is None

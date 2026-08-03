@@ -7,10 +7,10 @@ section, so its absence cannot mean "still working".
 from app.services.assembly import CONTENT_SCHEMA_VERSION, ContentState
 
 
-def test_schema_version_is_two() -> None:
-    """Bumped because the payload now appears before extraction has run, and gained
-    `state` and `section_extraction`."""
-    assert CONTENT_SCHEMA_VERSION == "2.0"
+def test_schema_version_is_current() -> None:
+    """2.0 moved the payload to filing time and added `state`/`section_extraction`;
+    2.1 split each insight into four explanatory parts."""
+    assert CONTENT_SCHEMA_VERSION == "2.1"
 
 
 def test_content_states() -> None:
