@@ -1,9 +1,11 @@
 """Section extraction — the stage that handles non-report documents.
 
-The report pipeline is classify -> extract -> insights. Everything the classifier places
-outside ``reports`` is currently rejected. This stage handles three of those sections —
-insurance, scans/imaging, and vaccinations — by transcribing their fields into
-``ai_section_extractions``.
+The report pipeline is classify -> extract -> insights. This is the whole post-filing
+pipeline for the three sections that are transcribed rather than interpreted — insurance,
+scans/imaging and vaccinations — writing their fields to ``ai_section_extractions`` and
+stopping. There is no insights stage for them: there is nothing clinical to interpret.
+The sections that remain rejected are those with no extractor (``prescriptions``) and
+those that are manual-upload-only by product decision (``bills``, ``medical_condition``).
 
 Flow: read this item's classification to learn the section, reload the source object,
 extract its TEXT (embedded layer first, Tesseract OCR for image-only pages), ask the
@@ -24,11 +26,10 @@ silently stored as fact.
 Idempotent: the extraction row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 
-Not yet wired in. ``STAGE_SEQUENCE`` does not include this stage and ``classify_report``
-still rejects every non-report section, so behaviour today is unchanged. Connecting it
-needs a decision on how the sequence branches — a report runs
-``extract_report -> generate_insights``, a section runs this and stops — which is a
-change to the sequence's shape rather than a line to append.
+Live since the auto-filing work. ``SECTION_PIPELINES`` routes insurance, scans/imaging and
+vaccinations here — the branch it once needed — and each runs this stage and stops. The
+supported set is derived from ``SECTION_SPECS``, so adding a section is an entry there and
+nothing else.
 """
 
 import logging

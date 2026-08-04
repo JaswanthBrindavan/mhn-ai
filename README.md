@@ -155,6 +155,36 @@ decision and re-authorizes on read.
    docker compose --profile localdev up -d
    ```
 
+### Deploying
+
+`railway.toml` carries the build and deploy configuration. Two things about it are easy to
+get wrong, and both fail quietly rather than loudly.
+
+**Deploy this repository as two services, not one.** They share the image and the
+environment, and differ only by start command:
+
+| Service | Start command |
+|---|---|
+| `api` | the Dockerfile default (uvicorn) |
+| `worker` | `python -m app.workers.main` |
+
+Nothing else consumes the queue. Without the worker, submissions are accepted, rows are
+created, messages are published — and every document sits at `queued` for ever with no
+error to explain it.
+
+**The healthcheck belongs to the api alone**, set on that service rather than in
+`railway.toml`, because the file governs both and the worker serves no HTTP — it long-polls
+SQS and binds no port, so a shared healthcheck fails a worker that is working.
+
+Migrations run through `preDeployCommand`, once per deploy rather than in every replica.
+`DATABASE_URL` must use the `postgresql+psycopg://` scheme: a plain `postgresql://` sends
+SQLAlchemy looking for psycopg2, which is not installed. The container binds `$PORT` when
+the platform provides one, falling back to 8000.
+
+Keep the service unexposed and reachable only on the private network. It returns extracted
+lab values for any document id presented with a valid token, and performs no user-level
+authorization of its own — that is Spring's job, by design.
+
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Usage
