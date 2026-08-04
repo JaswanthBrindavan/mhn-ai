@@ -65,6 +65,33 @@ class DocumentAiResult(BaseModel):
     section_extraction: dict[str, Any] | None = None
 
 
+class DocumentStatusResponse(BaseModel):
+    """Where a document has got to, addressable by its id alone.
+
+    Exists so Spring need not persist a ``run_id``. Status and ``document_type`` otherwise
+    live only on the run, and a retry mints a *new* run — so a stored copy goes stale on
+    exactly the documents most likely to need watching.
+
+    **Deliberately carries no extracted content**: no title, no confidence, no payloads.
+    That is what separates it from the typed result routes and leaves the "no untyped
+    variant" rule intact — that rule guards lab values, and there are none here.
+    """
+
+    document_id: int
+    item_id: uuid.UUID
+    run_id: uuid.UUID
+    #: Current lifecycle state of the latest processing item for this document.
+    status: str
+    #: The type to put in a result/retry URL. Null until the document is classified, and
+    #: for a section with no addressable type (`bills`, `medical_condition`, `unknown`).
+    document_type: DocumentType | None = None
+    last_error_code: str | None = None
+    #: Set once the document was filed into its section table.
+    section_row_id: int | None = None
+    #: Which section table ``section_row_id`` points at.
+    filed_section: str | None = None
+
+
 class RetryResponse(BaseModel):
     document_id: int
     item_id: uuid.UUID

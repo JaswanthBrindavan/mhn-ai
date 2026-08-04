@@ -199,7 +199,18 @@ unclassified, so there is nothing to declare at submit time. Each item in the ru
 carries a `document_type` telling you which URL to call; asking under the wrong type returns
 `409` naming the real section.
 
-The remaining routes are `POST /v1/documents/{type}/{id}/ai-result:retry` (retry a document
+If you have only the document id, ask for its state directly:
+
+```sh
+curl http://localhost:8000/v1/documents/101/status \
+  -H "Authorization: Bearer $MHN_SERVICE_TOKEN"
+```
+
+That returns the lifecycle status plus the `document_type` to build the result URL with —
+so a caller never has to store a `run_id`. It is the one untyped route, and returns nothing
+extracted: state only, no title, no values.
+
+The remaining routes are `POST /v1/documents/{type}/{id}/ai-result/retry` (retry a document
 that did not complete) and `DELETE /v1/document-processing-runs/{id}` (cancel unfinished
 items). Interactive docs are at `/docs`.
 

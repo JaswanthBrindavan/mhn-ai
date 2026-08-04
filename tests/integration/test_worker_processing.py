@@ -707,7 +707,7 @@ def test_a_filed_but_failed_document_is_reprocessed_in_place_on_retry(
     assert _filed_row(db_session, item_id).content["ai"]["state"] == "failed"
 
     monkeypatch.undo()  # whatever broke extraction is fixed; the retry runs the real pipeline
-    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
     assert response.status_code == 202
     retry_item_id = uuid.UUID(response.json()["item_id"])
     assert retry_item_id != item_id
@@ -756,7 +756,7 @@ def test_a_retry_that_classifies_into_another_section_is_rejected(
 
     monkeypatch.undo()
     retry_item_id = uuid.UUID(
-        api.post(f"/v1/documents/reports/{document_id}/ai-result:retry").json()["item_id"]
+        api.post(f"/v1/documents/reports/{document_id}/ai-result/retry").json()["item_id"]
     )
 
     outcome = _process(

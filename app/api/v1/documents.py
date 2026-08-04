@@ -8,9 +8,10 @@ Both routes name the document type — ``/documents/reports/{id}/ai-result`` —
 only when the document really was classified as that type, so a caller reading an insurance
 policy can never be handed a lab report's values by a wrong id.
 
-The caller learns which type to use from ``document_type`` on the run it already polls
-(``GET /v1/document-processing-runs/{run_id}``); there is no untyped variant, so there is
-exactly one way to read a result and exactly one way to retry.
+The caller learns which type to use either from ``GET /v1/documents/{id}/status`` or from
+``document_type`` on the run. There is exactly one way to read a result and one way to
+retry — both typed. The status route is the sole untyped one, and may be: it returns
+lifecycle state only, never anything extracted.
 
 Submission stays type-agnostic, because the type is something this service *detects* — see
 ``DocumentType``.
@@ -24,7 +25,12 @@ from sqlalchemy.orm import Session
 from app.api.deps import s3_client, sqs_client
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.schemas.results import DocumentAiResult, DocumentType, RetryResponse
+from app.schemas.results import (
+    DocumentAiResult,
+    DocumentStatusResponse,
+    DocumentType,
+    RetryResponse,
+)
 from app.services import results as results_service
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -42,6 +48,21 @@ _WRONG_TYPE: dict[int | str, dict[str, Any]] = {
 
 
 @router.get(
+    "/documents/{document_id}/status",
+    response_model=DocumentStatusResponse,
+    summary="Where a document has got to, and the type its result is readable under",
+    responses=_NOT_FOUND,
+)
+def get_document_status(
+    document_id: int,
+    session: Annotated[Session, Depends(get_session)],
+) -> DocumentStatusResponse:
+    """The one untyped route. Two path segments, so it cannot shadow the three-segment
+    result routes below."""
+    return results_service.get_document_status(session, document_id)
+
+
+@router.get(
     "/documents/{document_type}/{document_id}/ai-result",
     response_model=DocumentAiResult,
     summary="AI result for a document of a known type",
@@ -56,7 +77,7 @@ def get_typed_ai_result(
 
 
 @router.post(
-    "/documents/{document_type}/{document_id}/ai-result:retry",
+    "/documents/{document_type}/{document_id}/ai-result/retry",
     response_model=RetryResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Retry a document of a known type that did not complete",
