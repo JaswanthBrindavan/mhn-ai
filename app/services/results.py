@@ -24,12 +24,17 @@ from app.models.processing import AiProcessingRunItem
 from app.schemas.results import (
     ClassificationResult,
     DocumentAiResult,
+    DocumentStatusResponse,
     DocumentType,
     RetryResponse,
 )
 from app.schemas.runs import CreateRunRequest, SubmittedDocument
 from app.services import runs as runs_service
-from app.services.classification import SECTION_BY_DOCUMENT_TYPE, DocumentSection
+from app.services.classification import (
+    DOCUMENT_TYPE_BY_SECTION,
+    SECTION_BY_DOCUMENT_TYPE,
+    DocumentSection,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mypy_boto3_s3.client import S3Client
@@ -96,6 +101,33 @@ def _require_type(
             f"This document was classified as '{clf.section}', not '{document_type.value}'",
             {"detected_section": clf.section, "requested_type": document_type.value},
         )
+
+
+def get_document_status(session: Session, document_id: int) -> DocumentStatusResponse:
+    """Where a document has got to, and the type its result will be readable under.
+
+    Untyped on purpose, and the one route that is: a caller cannot know the type before
+    classification decides it, so requiring it here would make the endpoint unusable for
+    the state it exists to report. Safe to leave untyped because nothing extracted is
+    returned — see ``DocumentStatusResponse``.
+    """
+    item = _latest_item(session, document_id)
+    if item is None:
+        raise ApiError(404, "no_ai_result", "No AI result exists for this document")
+
+    clf = _classification(session, item.id)
+    return DocumentStatusResponse(
+        document_id=document_id,
+        item_id=item.id,
+        run_id=item.run_id,
+        status=item.status,
+        # Absent from the map for a section with no addressable type, and null before
+        # classification has run at all. Both mean "no result URL to build yet".
+        document_type=DOCUMENT_TYPE_BY_SECTION.get(clf.section) if clf is not None else None,
+        last_error_code=item.last_error_code,
+        section_row_id=item.section_row_id,
+        filed_section=item.filed_section,
+    )
 
 
 def get_document_ai_result(

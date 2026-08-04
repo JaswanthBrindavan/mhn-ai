@@ -147,7 +147,7 @@ def test_retry_a_failed_document_creates_and_queues_a_new_item(api, db_session, 
     document_id = make_document()
     failed_item = _seed_item(db_session, document_id, "failed")
 
-    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
 
     assert response.status_code == 202
     body = response.json()
@@ -163,7 +163,7 @@ def test_retry_preserves_the_original_intended_section(api, db_session, make_doc
     document_id = make_document()
     old_item = _seed_item(db_session, document_id, "failed", intended_section="vaccinations")
 
-    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
 
     assert response.status_code == 202
     new_item_id = uuid.UUID(response.json()["item_id"])
@@ -182,7 +182,7 @@ def test_retry_a_completed_document_is_rejected(api, db_session, make_document):
     document_id = make_document()
     _seed_item(db_session, document_id, "completed", section_row_id=5)
 
-    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "already_completed"
@@ -192,7 +192,7 @@ def test_retry_an_in_flight_document_is_rejected(api, db_session, make_document)
     document_id = make_document()
     _seed_item(db_session, document_id, "processing")
 
-    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "already_in_progress"
@@ -200,7 +200,7 @@ def test_retry_an_in_flight_document_is_rejected(api, db_session, make_document)
 
 def test_retry_a_never_processed_document_is_404(api, make_document):
     document_id = make_document()
-    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "no_ai_result"
@@ -210,7 +210,7 @@ def test_retry_a_filed_but_failed_document(api, filed_failed_item):
     """Filing does not end the story: a document filed with classification-only content
     can be reprocessed in place once whatever failed is fixed. Before the run item's
     source_key was consulted this 404'd, because filing had deleted the intake row."""
-    response = api.post(f"/v1/documents/reports/{filed_failed_item.document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{filed_failed_item.document_id}/ai-result/retry")
 
     assert response.status_code == 202
     assert response.json()["status"] in {"queued", "pending"}
@@ -221,7 +221,7 @@ def test_retry_resolves_the_source_from_the_filed_key(api, db_session, filed_fai
     carried onto the new item, or the worker would have nothing to load the document by."""
     assert filed_failed_item.source_key.startswith("reports/")
 
-    response = api.post(f"/v1/documents/reports/{filed_failed_item.document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{filed_failed_item.document_id}/ai-result/retry")
 
     assert response.status_code == 202
     new_item_id = uuid.UUID(response.json()["item_id"])
@@ -235,7 +235,7 @@ def test_retry_resolves_the_source_from_the_filed_key(api, db_session, filed_fai
 
 def test_retry_of_a_document_that_never_existed_is_still_404(api):
     """The fallback must not turn a genuinely unknown id into work."""
-    response = api.post("/v1/documents/reports/99999999/ai-result:retry")
+    response = api.post("/v1/documents/reports/99999999/ai-result/retry")
 
     assert response.status_code == 404
 
@@ -335,7 +335,7 @@ def test_typed_retry_runs_for_the_right_type(api, db_session, make_document):
     document_id = make_document()
     _seed_item(db_session, document_id, "failed")
 
-    response = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
 
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
@@ -346,7 +346,7 @@ def test_typed_retry_refuses_the_wrong_type_before_checking_status(api, db_sessi
     item_id = _seed_item(db_session, document_id, "failed")
     _seed_classified(db_session, item_id, document_id, "reports")
 
-    response = api.post(f"/v1/documents/vaccinations/{document_id}/ai-result:retry")
+    response = api.post(f"/v1/documents/vaccinations/{document_id}/ai-result/retry")
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "section_mismatch"
@@ -359,7 +359,7 @@ def test_typed_retry_allows_a_document_that_never_got_classified(api, db_session
     _seed_item(db_session, document_id, "failed")  # no classification row
 
     read = api.get(f"/v1/documents/reports/{document_id}/ai-result")
-    retry = api.post(f"/v1/documents/reports/{document_id}/ai-result:retry")
+    retry = api.post(f"/v1/documents/reports/{document_id}/ai-result/retry")
 
     assert read.status_code == 409  # refuses to answer under an unverified type
     assert retry.status_code == 202  # but re-queues the work
@@ -413,3 +413,90 @@ def test_a_report_result_carries_no_section_extraction(api, db_session, make_doc
 
     assert body["extraction"] is not None
     assert body["section_extraction"] is None
+
+
+# --- GET status -------------------------------------------------------------
+# The untyped route. It exists so Spring need not persist a run_id, so the cases that
+# matter are the ones where a *typed* route cannot answer at all.
+
+
+def test_status_names_the_type_a_result_is_readable_under(api, db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "completed", section_row_id=77)
+    _seed_results(db_session, item_id, document_id)
+
+    response = api.get(f"/v1/documents/{document_id}/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    # The whole point: the caller now knows which URL to build.
+    assert body["document_type"] == "reports"
+    assert body["section_row_id"] == 77
+
+
+def test_status_answers_before_classification_where_a_typed_read_cannot(
+    api, db_session, make_document
+):
+    document_id = make_document()
+    _seed_item(db_session, document_id, "classifying")
+
+    response = api.get(f"/v1/documents/{document_id}/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "classifying"
+    # No classification yet, so no URL to build — but the status is still observable,
+    # where GET .../reports/{id}/ai-result would 409 not_classified_yet.
+    assert body["document_type"] is None
+    assert body["section_row_id"] is None
+
+
+def test_status_reports_a_rejection_reason(api, db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "rejected", intended_section="reports")
+    _seed_classified(db_session, item_id, document_id, "insurance")
+    db_session.execute(
+        text(
+            "UPDATE ai_processing_run_items SET last_error_code = 'section_mismatch' WHERE id = :i"
+        ),
+        {"i": item_id},
+    )
+    db_session.flush()
+
+    body = api.get(f"/v1/documents/{document_id}/status").json()
+
+    assert body["status"] == "rejected"
+    assert body["last_error_code"] == "section_mismatch"
+    # Classified as insurance despite being uploaded into reports.
+    assert body["document_type"] == "insurance"
+
+
+def test_status_has_no_type_for_a_section_with_no_result_url(api, db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "rejected")
+    _seed_classified(db_session, item_id, document_id, "bills")
+
+    body = api.get(f"/v1/documents/{document_id}/status").json()
+
+    assert body["status"] == "rejected"
+    assert body["document_type"] is None
+
+
+def test_status_carries_nothing_extracted(api, db_session, make_document):
+    """The reason this route may be untyped at all."""
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "completed", section_row_id=5)
+    _seed_results(db_session, item_id, document_id)
+
+    body = api.get(f"/v1/documents/{document_id}/status").json()
+
+    for leaked in ("extraction", "insights", "section_extraction", "classification"):
+        assert leaked not in body
+
+
+def test_status_404s_for_a_document_with_no_item(api, make_document):
+    response = api.get(f"/v1/documents/{make_document()}/status")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "no_ai_result"
