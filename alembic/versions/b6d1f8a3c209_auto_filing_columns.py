@@ -35,15 +35,27 @@ def upgrade() -> None:
     # Backfill source_key for items created before it existed, so no code path needs a
     # fallback to unclassified_files. This reads a Spring-owned table but alters only ours —
     # it is a data backfill, not DDL against their schema.
-    op.execute(
-        """
-        UPDATE ai_processing_run_items AS i
-           SET source_key = u.filepath
-          FROM unclassified_files AS u
-         WHERE u.id = i.document_id
-           AND i.source_key IS NULL
-        """
+    #
+    # Skipped when that table is absent. On a database Spring has not migrated yet the
+    # backfill has nothing to do anyway — no intake rows means no items referencing them —
+    # so failing here would only make this service's migrations depend on another service
+    # having deployed first, which is not a dependency this service accepts anywhere else.
+    intake_exists = (
+        op.get_bind()
+        .execute(sa.text("SELECT to_regclass('public.unclassified_files')"))
+        .scalar()
+        is not None
     )
+    if intake_exists:
+        op.execute(
+            """
+            UPDATE ai_processing_run_items AS i
+               SET source_key = u.filepath
+              FROM unclassified_files AS u
+             WHERE u.id = i.document_id
+               AND i.source_key IS NULL
+            """
+        )
     # Items already filed under the old behaviour were reports by definition.
     op.execute(
         """
