@@ -1,0 +1,31 @@
+# Railway build and deploy settings.
+#
+# Deploy this repository as TWO services sharing this file and the same environment:
+#
+#   api     — default start command (uvicorn, see Dockerfile)
+#   worker  — start command overridden to: python -m app.workers.main
+#
+# The worker is not optional and not a replica. Nothing else consumes the SQS queue, so
+# without it every submitted document reaches `queued` and stops there — no classification,
+# no filing, no extraction, and no error anywhere to explain it.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Schema migrations run here rather than at application startup: this runs once per deploy,
+# whereas a startup hook would run in every replica of every service simultaneously and race.
+# Alembic is idempotent — on an up-to-date database this reads the version table and exits —
+# so it is safe to leave configured on both services.
+preDeployCommand = "alembic upgrade head"
+
+# The AI service refuses to start when MHN_SERVICE_TOKEN is missing or shorter than 32
+# characters (an empty token would disable authentication entirely). That is a
+# misconfiguration, not a transient fault, so a bounded retry surfaces it as a failed deploy
+# instead of an endless crash loop.
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+healthcheckPath = "/health"
+healthcheckTimeout = 30
