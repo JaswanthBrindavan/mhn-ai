@@ -27,5 +27,11 @@ preDeployCommand = "alembic upgrade head"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
 
-healthcheckPath = "/health"
-healthcheckTimeout = 30
+# NO healthcheckPath here, deliberately. This file is shared by both services, and the
+# worker serves no HTTP at all — it long-polls SQS and binds no port. A healthcheck defined
+# here is applied to it too, so it starts correctly, processes work, and is then failed for
+# not answering a request it was never built to serve.
+#
+# The api's healthcheck is set on the api SERVICE instead (Railway → Settings → Deploy →
+# Healthcheck Path = /health). Per-service settings are the right home for anything that is
+# true of one service and not the other.
