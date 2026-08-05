@@ -21,7 +21,9 @@ Dates are normalised here rather than trusted from the model, for the same reaso
 extraction computes abnormal flags in Python: a deterministic rule beats a prompt. An
 unreadable date becomes null rather than a guess, and a section whose dates are
 inverted (an end before its start) is recorded as a data-quality flag rather than
-silently stored as fact.
+silently stored as fact. Money goes the same way (``app.services.money``): amounts are
+reduced to a bare decimal string and the currency to an ISO code, because a symbol
+printed in a column header rarely survives text extraction intact.
 
 Idempotent: the extraction row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
@@ -45,6 +47,7 @@ from app.models.ai_results import AiReportClassification, AiSectionExtraction
 from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
 from app.services.classification import DocumentSection
 from app.services.dates import in_order, iso_date
+from app.services.money import normalise_amount, normalise_currency
 from app.services.ocr import ExtractedText, TextExtractionError, extract_text
 from app.services.section_specs import INSTRUCTION_PREFIX, SectionSpec, spec_for
 from app.services.source_loading import load_source_document
@@ -52,8 +55,8 @@ from app.workers.stagetypes import RejectStageError, StageContext, TransientStag
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "sec-2026-07-27"
-SCHEMA_VERSION = "sec-1"
+PROMPT_VERSION = "sec-2026-08-05"
+SCHEMA_VERSION = "sec-2"
 STAGE_NAME = "extracting_section"
 
 
@@ -141,6 +144,10 @@ def build_payload(
     fields = result.model_dump()
     for name in spec.date_fields:
         fields[name] = iso_date(fields.get(name))
+    for name in spec.amount_fields:
+        fields[name] = normalise_amount(fields.get(name))
+    for name in spec.currency_fields:
+        fields[name] = normalise_currency(fields.get(name))
 
     payload: dict[str, Any] = {
         "section": spec.section.value,
