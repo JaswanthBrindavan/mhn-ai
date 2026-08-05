@@ -37,6 +37,7 @@ from app.models.ai_results import AiSectionExtraction
 from app.models.processing import AiProcessingRunItem
 from app.models.spring import (
     insurance,
+    prescriptions,
     reports,
     scans_imaging,
     unclassified_files,
@@ -58,6 +59,7 @@ SECTION_TABLES: dict[DocumentSection, Table] = {
     DocumentSection.REPORTS: reports,
     DocumentSection.SCANS_IMAGING: scans_imaging,
     DocumentSection.INSURANCE: insurance,
+    DocumentSection.PRESCRIPTIONS: prescriptions,
     DocumentSection.VACCINATIONS: vaccinations,
 }
 

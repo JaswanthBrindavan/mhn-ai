@@ -4,8 +4,11 @@ The report pipeline is classify -> extract -> insights. This is the whole post-f
 pipeline for the three sections that are transcribed rather than interpreted — insurance,
 scans/imaging and vaccinations — writing their fields to ``ai_section_extractions`` and
 stopping. There is no insights stage for them: there is nothing clinical to interpret.
-The sections that remain rejected are those with no extractor (``prescriptions``) and
-those that are manual-upload-only by product decision (``bills``, ``medical_condition``).
+``prescriptions`` has its own stage rather than a spec here — ``app.services.prescriptions``
+sends the document itself rather than its OCR text, because the dosing sits in a column
+beside the medicine and flattening that puts a dose on the wrong row. The sections that
+remain rejected are those that are manual-upload-only by product decision (``bills``,
+``medical_condition``).
 
 Flow: read this item's classification to learn the section, reload the source object,
 extract its TEXT (embedded layer first, Tesseract OCR for image-only pages), ask the
