@@ -52,11 +52,25 @@ class Exclusion(BaseModel):
 
 class InsuranceFields(BaseModel):
     """Validated insurance policy fields. Empty lists are valid (a receipt or ID card
-    carries dates and an insurer but no benefit schedule)."""
+    carries dates and an insurer but no benefit schedule).
+
+    ``currency`` is separate from the amounts on purpose: the symbol is usually printed
+    once in a column header rather than beside each number, and often survives text
+    extraction as a stray character. See ``app.services.money``, which normalises all
+    three after validation.
+
+    The money caps are generous because a cap the model is not told about is not a limit
+    — it is a paid failure. Over-long output fails validation, which this stage treats as
+    transient, so it retries the whole call. The prompt asks for digits only; the caps sit
+    well above that so a wordier answer is normalised rather than retried.
+    """
 
     insurer: str | None = Field(default=None, max_length=256)
     policy_name: str | None = Field(default=None, max_length=256)
     policy_type: str | None = Field(default=None, max_length=128)
+    currency: str | None = Field(default=None, max_length=32)
+    sum_insured: str | None = Field(default=None, max_length=64)
+    premium_amount: str | None = Field(default=None, max_length=64)
     co_pay: str | None = Field(default=None, max_length=128)
     start_date: str | None = Field(default=None, max_length=64)
     end_date: str | None = Field(default=None, max_length=64)
@@ -70,6 +84,9 @@ _INSURANCE_SCHEMA: dict[str, Any] = {
         "insurer": _NULLABLE_STR,
         "policy_name": _NULLABLE_STR,
         "policy_type": _NULLABLE_STR,
+        "currency": _NULLABLE_STR,
+        "sum_insured": _NULLABLE_STR,
+        "premium_amount": _NULLABLE_STR,
         "co_pay": _NULLABLE_STR,
         "start_date": _NULLABLE_STR,
         "end_date": _NULLABLE_STR,
@@ -96,6 +113,9 @@ _INSURANCE_SCHEMA: dict[str, Any] = {
         "insurer",
         "policy_name",
         "policy_type",
+        "currency",
+        "sum_insured",
+        "premium_amount",
         "co_pay",
         "start_date",
         "end_date",
@@ -113,16 +133,45 @@ _INSURANCE_PROMPT = (
     "- insurer: the insurance company or scheme name.\n"
     "- policy_name: the product name, if printed.\n"
     "- policy_type: a short type, e.g. 'Health Insurance (Family Floater)'.\n"
-    "- co_pay: the co-payment the insured bears per claim, as printed. Null if none.\n"
+    "- currency: the ISO-4217 code of the money on this document — 'INR' for Indian "
+    "rupees, three letters, nothing else. The symbol is often printed ONCE in a column "
+    "header ('Sum Insured (₹)') rather than beside each figure, and may reach you as a "
+    "stray character such as ` or ? because the text layer could not resolve it. Words "
+    "count as evidence too: 'Rs', 'Rs.', or an amount spelled out ('RUPEES FIFTY-TWO "
+    "THOUSAND ... ONLY'). Null only if the document shows no currency anywhere.\n"
+    "- sum_insured: the total sum insured for the policy. DIGITS AS PRINTED and nothing "
+    "else — '300,000.00', never 'Rs 300,000', never words. Not the cumulative bonus "
+    "('CB Amount'), not a per-benefit sub-limit, not one member's share.\n"
+    "- premium_amount: the TOTAL premium payable, including tax — the figure the "
+    "customer actually paid. Where the document prints a breakdown (basic premium, "
+    "loadings, service tax, total), return the total, not a component. Digits as "
+    "printed.\n"
+    "- co_pay: the co-payment the insured bears per claim, as printed ('20%', 'Rs 1,000 "
+    "per claim'). Null if the document does not mention a co-payment at all.\n"
     "- start_date / end_date: the policy period.\n"
-    "- covered_conditions: at most 5, most important first. These are the medical "
-    "conditions, treatments, or benefits the policy covers — NOT the insured people. "
-    "cap is the stated limit or sum for that condition, or null.\n"
-    "- exclusions: at most 5, most important first. What the policy does not cover.\n\n"
+    "- covered_conditions: EVERY medical condition, treatment or benefit this document "
+    "states is covered — NOT the insured people. In the order the document prints them, "
+    "with no ranking and no limit on how many. Copy each name VERBATIM from the "
+    "document; do not paraphrase it, tidy it, or translate it into a condition name of "
+    "your own. cap is the stated limit or sum for that item, as printed, or null.\n"
+    "- exclusions: EVERY item this document states is NOT covered, under the same "
+    "rules.\n\n"
     "Rules:\n"
     + _NO_INVENTION_RULE
     + _DATE_RULE
-    + "- A schedule, receipt, or ID card usually has no benefit list. Return empty "
+    + "- A benefit table is often printed in two columns and read across them, so one "
+    "line can splice two unrelated entries together. Emit only entries that read as a "
+    "whole benefit. A stray fragment left over from the splice — a bare number, or a "
+    "phrase like 'Claims free' — is not a benefit and must not be listed as one.\n"
+    "- NEVER add an item to covered_conditions or exclusions because the product name, "
+    "the insurer, or a similar policy you have seen implies it. Only what THIS document "
+    "prints. A person will be told they are covered for exactly what you list, and being "
+    "told they are covered for something they are not is the worst thing you can do "
+    "here.\n"
+    "- Many schedules print the benefits but leave the exclusions to a separate policy "
+    "wording document. When this document defers to one ('refer the Policy Wordings'), "
+    "return an empty list. Do not supply the missing side from general knowledge.\n"
+    "- A schedule, receipt, or ID card usually has no benefit list. Return empty "
     "lists rather than inferring cover from the product name.\n"
 )
 
@@ -284,6 +333,12 @@ class SectionSpec:
     date_fields: tuple[str, ...]
     #: (earlier, later) pairs where the later date may not precede the earlier one.
     date_order: tuple[tuple[str, str], ...] = ()
+    #: Money fields, reduced to a bare decimal string before storage — same reason as
+    #: dates: the model transcribes, Python decides.
+    amount_fields: tuple[str, ...] = ()
+    #: Fields holding a currency, resolved to an ISO-4217 code. Listed explicitly rather
+    #: than found by name so the rule is visible in the spec, like every other field.
+    currency_fields: tuple[str, ...] = ()
 
 
 INSTRUCTION_PREFIX = (
@@ -299,9 +354,15 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         model=InsuranceFields,
         json_schema=_INSURANCE_SCHEMA,
         system_prompt=_INSURANCE_PROMPT,
-        max_tokens=4096,
+        # Raised with the benefit lists: they are no longer capped at five, and a group
+        # policy can print a long schedule. Truncation is not free — a cut-off response
+        # fails validation, which this stage treats as transient, so it is retried at
+        # full price and fails identically each time.
+        max_tokens=8192,
         date_fields=("start_date", "end_date"),
         date_order=(("start_date", "end_date"),),
+        amount_fields=("sum_insured", "premium_amount"),
+        currency_fields=("currency",),
     ),
     DocumentSection.SCANS_IMAGING: SectionSpec(
         section=DocumentSection.SCANS_IMAGING,

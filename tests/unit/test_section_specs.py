@@ -30,6 +30,10 @@ def test_every_spec_is_self_consistent():
         for earlier, later in spec.date_order:
             assert earlier in spec.date_fields
             assert later in spec.date_fields
+        # Same for money: a field listed here but absent from the model would be
+        # normalised into a key nothing reads, which no test would otherwise notice.
+        for name in spec.amount_fields + spec.currency_fields:
+            assert name in spec.model.model_fields
 
 
 def test_supported_sections_are_the_non_report_ones():
@@ -77,6 +81,52 @@ def test_insurance_payload_flags_an_inverted_policy_period():
     assert payload["flags"][0]["field"] == "end_date"
     # The values are still stored — flagged, not discarded.
     assert payload["fields"]["start_date"] == "2027-07-29"
+
+
+def test_insurance_payload_separates_the_amount_from_its_currency():
+    """The shapes a real schedule prints: a rupee sign the text layer lost, Indian
+    grouping, and a premium quoted with its symbol attached."""
+    spec = spec_for(DocumentSection.INSURANCE)
+    fields = InsuranceFields(
+        currency="`",
+        sum_insured="` 3,00,000.00",
+        premium_amount="Rs 52,123.00",
+        covered_conditions=[],
+        exclusions=[],
+    )
+    payload = build_payload(spec, fields)["fields"]
+
+    assert payload["currency"] == "INR"
+    assert payload["sum_insured"] == "300000.00"
+    assert payload["premium_amount"] == "52123.00"
+
+
+def test_insurance_payload_refuses_a_percentage_as_a_sum():
+    """A co-payment share in an amount field is a misread, and storing 20 there would
+    present it as twenty rupees."""
+    spec = spec_for(DocumentSection.INSURANCE)
+    fields = InsuranceFields(sum_insured="20%", covered_conditions=[], exclusions=[])
+
+    assert build_payload(spec, fields)["fields"]["sum_insured"] is None
+
+
+def test_insurance_payload_keeps_an_absent_policy_absent():
+    """The HDFC ERGO schedule prints no co-payment and defers its exclusions to a
+    separate policy wording. Nulls and empty lists are the correct answer, and the one
+    the liability rests on."""
+    spec = spec_for(DocumentSection.INSURANCE)
+    fields = InsuranceFields(
+        insurer="HDFC ERGO General Insurance Company Limited",
+        policy_name="Health Suraksha Policy",
+        covered_conditions=[],
+        exclusions=[],
+    )
+    payload = build_payload(spec, fields)["fields"]
+
+    assert payload["co_pay"] is None
+    assert payload["exclusions"] == []
+    assert payload["currency"] is None
+    assert payload["sum_insured"] is None
 
 
 def test_scan_payload_normalises_a_study_timestamp():
