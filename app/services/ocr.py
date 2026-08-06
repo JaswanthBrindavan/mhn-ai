@@ -163,14 +163,37 @@ class ExtractedText:
         }
 
 
-def extract_text(document: DocumentPayload) -> ExtractedText:
-    """Read a document to text. Raises ``TextExtractionError`` if it cannot be opened."""
+def extract_text(document: DocumentPayload, *, allow_ocr: bool = True) -> ExtractedText:
+    """Read a document to text. Raises ``TextExtractionError`` if it cannot be opened.
+
+    ``allow_ocr=False`` reads the embedded text layer and nothing else: a page that would
+    have been OCR'd is marked ``"skipped"`` and contributes no text. For a caller that
+    cannot use an OCR'd page anyway — ``prescriptions._verify_against_document`` will not
+    reject a drug name on OCR output — running the engine and discarding the result is a
+    full Tesseract pass bought for nothing, and a photographed prescription is several
+    seconds of it.
+
+    Crucially the pages are *skipped*, not read poorly. A page whose text layer came back
+    scrambled is exactly where a text-only read would be most tempting and least
+    trustworthy, so it is dropped rather than passed on with the OCR that would have
+    replaced it.
+    """
     if not document.data:
         raise TextExtractionError("Source file is empty")
 
     if document.content_type in _IMAGE_CONTENT_TYPES:
+        if not allow_ocr:
+            # An image has no text layer to read; OCR is the only path and it is barred.
+            return ExtractedText(
+                text="",
+                page_count=1,
+                ocr_pages=0,
+                engine=None,
+                mean_confidence=None,
+                pages=[PageText(0, "skipped", 0, None)],
+            )
         return _from_image(document.data)
-    return _from_pdf(document.data)
+    return _from_pdf(document.data, allow_ocr=allow_ocr)
 
 
 # --- usability of a text layer ----------------------------------------------
@@ -239,7 +262,7 @@ def _layout_pages(data: bytes) -> list[str] | None:
         return None
 
 
-def _from_pdf(data: bytes) -> ExtractedText:
+def _from_pdf(data: bytes, *, allow_ocr: bool = True) -> ExtractedText:
     layout_pages = _layout_pages(data)
 
     try:
@@ -267,6 +290,14 @@ def _from_pdf(data: bytes) -> ExtractedText:
                 # back scrambled: every character present but the words destroyed, which
                 # a character count alone cannot distinguish from a healthy page.
                 if _informative(best) < MIN_TEXT_CHARS or _looks_scrambled(best):
+                    if not allow_ocr:
+                        # Skipped rather than kept: what is here is either too little to
+                        # read or scrambled, and the caller barred the engine that would
+                        # have fixed it. Passing it on would hand over the worst text on
+                        # the document dressed as a clean text layer.
+                        pages.append(PageText(index, "skipped", 0, None))
+                        continue
+
                     if ocr_pages >= MAX_OCR_PAGES:
                         pages.append(PageText(index, "skipped", 0, None))
                         logger.warning(

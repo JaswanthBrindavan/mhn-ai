@@ -5,6 +5,9 @@ what happens to what it returns, which is where a wrong answer becomes a stored 
 """
 
 from app.services.prescriptions import (
+    ABSENT,
+    EXACT,
+    PARTIAL,
     PrescribedMedicine,
     PrescriptionFields,
     _appears_in,
@@ -35,20 +38,24 @@ def test_a_name_split_across_columns_is_still_found() -> None:
     """The whole run is never contiguous in the extracted text, so parts have to match.
 
     Split on whitespace this is one token and matches nothing, and a real medicine is
-    dropped. Split on the hyphens, its drug parts are found individually.
+    dropped. Split on the hyphens, its drug parts are found individually. It is a PARTIAL
+    match, not an exact one — the page really does not contain that string.
     """
-    assert _appears_in("DAPAGLIFLOZIN-TABLET-5MG-DAPEFY", PAGE)
+    assert _appears_in("DAPAGLIFLOZIN-TABLET-5MG-DAPEFY", PAGE) == PARTIAL
 
 
 def test_tidying_by_the_reader_is_not_mistaken_for_invention() -> None:
-    assert _appears_in("TAB DOLO 650", PAGE)  # punctuation dropped
-    assert _appears_in("DOLO-650 Tablet", PAGE)  # dosage form supplied
-    assert _appears_in("DAPEFY", PAGE)  # brand on its own
+    # Punctuation and spacing are normalised away, so tidying still reads as EXACT — the
+    # part matcher is not what rescues these, and the loose flag stays quiet for them.
+    assert _appears_in("TAB DOLO 650", PAGE) == EXACT
+    assert _appears_in("DAPEFY", PAGE) == EXACT  # brand on its own, printed as-is
+    # A dosage form the reader supplied is genuinely not on the page next to the name.
+    assert _appears_in("DOLO-650 Tablet", PAGE) == PARTIAL
 
 
 def test_a_drug_the_page_never_mentions_is_rejected() -> None:
-    assert not _appears_in("Warfarin", PAGE)
-    assert not _appears_in("Metformin 500", PAGE)
+    assert _appears_in("Warfarin", PAGE) == ABSENT
+    assert _appears_in("Metformin 500", PAGE) == ABSENT
 
 
 def test_an_invented_name_in_the_documents_own_style_is_still_rejected() -> None:
@@ -57,17 +64,35 @@ def test_an_invented_name_in_the_documents_own_style_is_still_rejected() -> None
     This is shaped exactly like the real EMR names on the page — same hyphen-joined
     generic/form/strength/brand run — and none of its drug parts are there.
     """
-    assert not _appears_in("WARFARIN-TABLET-5MG-SOFARIN", PAGE)
+    assert _appears_in("WARFARIN-TABLET-5MG-SOFARIN", PAGE) == ABSENT
+
+
+def test_a_suffixed_brand_does_not_pass_as_its_stem() -> None:
+    """The failure that made a third verdict necessary.
+
+    Parts shorter than three characters are dropped, so every one of these collapses to a
+    stem the page really does print — and each names a different product from that stem.
+    They are still KEPT: on a two-column page a genuine name loses its suffix to the column
+    boundary, and dropping a real medicine is the worse failure. But the page did not
+    contain them, and the payload has to say so.
+    """
+    page = _normalise("Tab. PANTOP 40mg 1-0-0\nTab. ECOSPRIN 75 0-0-1\nCap. BECOSULES 1-0-0")
+    for name in ("PAN-D", "PANTOP-D", "ECOSPRIN AV", "BECOSULES Z"):
+        assert _appears_in(name, page) == PARTIAL, name
+    # The stems themselves are on the page, and say so.
+    assert _appears_in("PANTOP", page) == EXACT
+    # An unrelated drug is still rejected outright.
+    assert _appears_in("AMLODIPINE", page) == ABSENT
 
 
 # --- does it name a drug at all? --------------------------------------------
 
 
 def test_a_name_of_only_dosage_forms_is_not_a_medicine() -> None:
-    """"Tablet" is printed on nearly every prescription, so it passes "is it on the page"
+    """ "Tablet" is printed on nearly every prescription, so it passes "is it on the page"
     while naming nothing. That is a misread heading, not a hallucination, and it needs a
     different check to catch it."""
-    assert _appears_in("Tablet", PAGE)  # it IS on the page
+    assert _appears_in("Tablet", PAGE) == EXACT  # it IS on the page
     assert not _has_drug_identity("Tablet")  # but it names no drug
     assert not _has_drug_identity("Cap")
     assert not _has_drug_identity("e/d")
@@ -98,7 +123,7 @@ def test_payload_carries_the_normalised_schedule() -> None:
 
 
 def test_the_lookup_table_beats_the_model_on_a_form_it_knows() -> None:
-    """"Tab." is Tablet in every document ever printed, so it is never put to a model that
+    """ "Tab." is Tablet in every document ever printed, so it is never put to a model that
     could answer differently tomorrow."""
     result = PrescriptionFields(
         medicines=[medicine(form_raw="Tab.", form="Injection")],
@@ -176,18 +201,27 @@ def test_the_model_may_not_supply_a_form_the_document_never_printed() -> None:
 def test_a_form_outside_the_nine_is_discarded_on_the_way_in() -> None:
     """The schema cannot express "one of nine, or nothing", so the validator is the
     guarantee rather than a second opinion."""
-    assert PrescribedMedicine(
-        name_as_written="X", name_clean="X", form="Suppository"
-    ).form is None
+    assert PrescribedMedicine(name_as_written="X", name_clean="X", form="Suppository").form is None
     assert PrescribedMedicine(name_as_written="X", name_clean="X", form="Cream").form == "Cream"
 
 
 def test_a_rejected_name_is_flagged_not_silently_dropped() -> None:
     result = PrescriptionFields(medicines=[], prescribed_date=None, prescriber=None)
     payload = _build_payload(result, [], ["Warfarin 5mg"])
-    assert payload["flags"] == [
-        {"code": "names_not_on_document", "names": ["Warfarin 5mg"]}
-    ]
+    assert payload["flags"] == [{"code": "names_not_on_document", "names": ["Warfarin 5mg"]}]
+
+
+def test_a_loosely_matched_name_is_kept_and_said_out_loud() -> None:
+    """Between "on the page" and "not on the page" there is "most of it was".
+
+    That is where a suffixed brand lands, so it cannot be reported as verified — but it is
+    also where a genuine name split across two columns lands, so it cannot be dropped.
+    """
+    result = PrescriptionFields(medicines=[medicine()], prescribed_date=None, prescriber=None)
+    payload = _build_payload(result, list(result.medicines), [], loose=["PAN-D"])
+    assert payload["flags"] == [{"code": "names_matched_loosely", "names": ["PAN-D"]}]
+    # Kept, not dropped.
+    assert len(payload["fields"]["medicines"]) == 1
 
 
 def test_an_unverified_read_says_so() -> None:
