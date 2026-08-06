@@ -36,6 +36,7 @@ nothing else.
 
 import logging
 import time
+from functools import partial
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -44,7 +45,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
 from app.models.ai_results import AiReportClassification, AiSectionExtraction
-from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
+from app.services.ai_logging import (
+    check_response,
+    elapsed_ms,
+    log_process,
+    sanitize_validation_error,
+)
 from app.services.classification import DocumentSection
 from app.services.dates import in_order, iso_date
 from app.services.money import normalise_amount, normalise_currency
@@ -105,15 +111,14 @@ def extract_section(ctx: StageContext) -> None:
 
     duration_ms = elapsed_ms(started)
 
-    if response.refused:
-        _log(
-            ctx,
-            outcome="refused",
-            error_code="model_refusal",
-            response=response,
-            duration_ms=duration_ms,
-        )
-        raise TransientStageError("section extraction refused by safety classifier")
+    # Refusal (transient) and truncation (permanent) are the same check for every
+    # stage, so it lives in one place; partial binds this stage's own log helper.
+    check_response(
+        response,
+        log=partial(_log, ctx),
+        duration_ms=duration_ms,
+        what="section extraction",
+    )
 
     try:
         result = spec.model.model_validate_json(response.text)

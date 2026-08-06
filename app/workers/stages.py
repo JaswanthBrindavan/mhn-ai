@@ -30,6 +30,7 @@ from app.services.insights import generate_insights
 from app.services.section_extraction import extract_section
 from app.services.section_specs import SUPPORTED_SECTIONS
 from app.workers.stagetypes import (
+    PermanentStageError,
     RejectStageError,
     Stage,
     StageContext,
@@ -39,6 +40,7 @@ from app.workers.stagetypes import (
 __all__ = [
     "CLASSIFY_STAGE",
     "SECTION_PIPELINES",
+    "PermanentStageError",
     "RejectStageError",
     "Stage",
     "StageContext",
