@@ -4,7 +4,7 @@ The prescription stage transcribes a dosing instruction exactly as printed. This
 that text into a structure something can act on::
 
     {"morning": float, "afternoon": float, "evening": float, "night": float,
-     "with_food": bool | None, "as_needed": bool}
+     "with_food": bool | None, "as_needed": bool, "schedule_inferred": bool}
 
 Deterministic on purpose, for the same reason ``normalization`` computes abnormal flags
 and ``dates`` parses dates: a rule gives the same answer every time and can be tested,
@@ -22,11 +22,29 @@ see a null, but cannot see that "1-0-1" was silently read as once daily.
 morning/afternoon/night with ``evening`` at 0.0 - the slot is present either way, so the
 object has one fixed shape whatever the document wrote.
 
+**The shape says only how much per day, so anything that is not daily is refused.** A
+weekly, monthly or alternate-day medicine has no field to live in here, and writing it as
+a daily schedule multiplies every dose. Same for a course that changes partway ("1-1-1 for
+3 days then 1-0-1"): which schedule applies depends on the day. Both come back None with
+``frequency_raw`` intact.
+
+**``schedule_inferred`` says whether the slots were read or chosen.** ``BD`` states a rate
+— twice a day — and nothing about when; the morning and night it lands in are this
+module's convention, not the prescriber's. Written into the same four floats as a printed
+``1-0-1``, the two would be indistinguishable, so the flag marks which is which. A caller
+showing a reminder time should ask rather than assert when it is set.
+
 Notations covered, all seen on real Indian prescriptions: the dose matrix (``1-0-1``,
 ``1/2-0-1/2``, the 4-slot ``1-0-0-1``), Latin abbreviations (``OD``/``BD``/``TDS``/``QID``/
 ``HS``, with ``AC``/``PC`` for food and ``SOS``/``PRN`` for as-needed), English prose
 ("1 tablet in the morning"), slot-first ("Morning-1, Night-1"), dose-first ("0.75 MG
 MORNING"), clock times ("8 AM and 8 PM"), and bare rates ("twice a day").
+
+**Not covered, and left null rather than guessed:** interval notation (``Q6H``, ``Q8H``,
+"every 6 hours") — the regex matches those tokens but no schedule is mapped to them, so
+they fall through to null; and anything non-daily, per the refusal above. ``Q6H`` is
+common on discharge prescriptions and is the first gap worth closing if this shape ever
+grows a rate field.
 """
 
 import logging
@@ -74,6 +92,9 @@ DOSAGE_FORMS: frozenset[str] = frozenset(
 #: suppository reported as a Tablet would be a swallowing instruction for something that
 #: must not be swallowed. Null says "not one of ours"; a nearest guess says something
 #: false, and the printed text survives in ``form_raw`` either way.
+# Grouped by the form each row maps to, with a comment per group. One entry per line would
+# triple the length and hide that grouping, which is the point of the table.
+# fmt: off
 _FORM_SYNONYMS: dict[str, str] = {
     "tab": "Tablet", "tabs": "Tablet", "tablet": "Tablet", "tablets": "Tablet",
     "dt": "Tablet", "divitab": "Tablet", "divitabs": "Tablet",
@@ -98,6 +119,7 @@ _FORM_SYNONYMS: dict[str, str] = {
     "nebuliser": "Inhaler", "nebulizer": "Inhaler", "mdi": "Inhaler",
     "powder": "Powder", "granules": "Powder", "sachet": "Powder", "sachets": "Powder",
 }
+# fmt: on
 
 #: Splits a printed form into candidate tokens. Keeps "e/d" and "n/d" whole, since the
 #: slash is part of the abbreviation rather than a separator.
@@ -110,15 +132,34 @@ _CLOCK_SLOT_BOUNDS = ((5, 12), (12, 17), (17, 21))
 FRACTION_VALUES = {"½": 0.5, "¼": 0.25, "¾": 0.75}
 
 WORD_NUMBERS = {
-    "half": 0.5, "one": 1.0, "once": 1.0, "a": 1.0, "an": 1.0, "two": 2.0,
-    "twice": 2.0, "three": 3.0, "thrice": 3.0, "four": 4.0, "five": 5.0, "six": 6.0,
+    "half": 0.5,
+    "one": 1.0,
+    "once": 1.0,
+    "a": 1.0,
+    "an": 1.0,
+    "two": 2.0,
+    "twice": 2.0,
+    "three": 3.0,
+    "thrice": 3.0,
+    "four": 4.0,
+    "five": 5.0,
+    "six": 6.0,
 }
 
 TIME_SLOT_INDEX = {
-    "morning": 0, "am": 0, "breakfast": 0,
-    "noon": 1, "afternoon": 1, "midday": 1, "lunch": 1,
-    "evening": 2, "eve": 2,
-    "night": 3, "bedtime": 3, "dinner": 3, "pm": 3,
+    "morning": 0,
+    "am": 0,
+    "breakfast": 0,
+    "noon": 1,
+    "afternoon": 1,
+    "midday": 1,
+    "lunch": 1,
+    "evening": 2,
+    "eve": 2,
+    "night": 3,
+    "bedtime": 3,
+    "dinner": 3,
+    "pm": 3,
 }
 
 #: Latin abbreviation -> (morning, afternoon, evening, night). ``None`` means the token
@@ -133,12 +174,39 @@ _LATIN_SCHEDULES: dict[str, tuple[float, float, float, float] | None] = {
     "qds": (1.0, 1.0, 1.0, 1.0),
     "hs": (0.0, 0.0, 0.0, 1.0),
     "qhs": (0.0, 0.0, 0.0, 1.0),
-    "stat": (1.0, 0.0, 0.0, 0.0),
+    # STAT is one dose, immediately — a point in time, not a time of day and not a
+    # repeating schedule. It used to map to the morning slot, which said "take one
+    # tomorrow morning" about a dose that was given the moment it was written.
+    "stat": None,
     "sos": None,
     "prn": None,
     "ac": None,
     "pc": None,
 }
+
+#: Notations that state a period other than "every day", in any form. Their presence ends
+#: normalisation — see ``normalize_frequency``.
+#:
+#: Deliberately generous, and it will refuse a duration too ("1-0-1 for 2 weeks" states a
+#: perfectly good daily schedule and is left null). That direction is the safe one: a null
+#: is visible to a reader through ``frequency_not_normalized`` and ``frequency_raw``, while
+#: a weekly dose written as a daily one is not visible to anyone. "day"/"days" is
+#: deliberately absent — "for 5 days" is a duration on an ordinary daily schedule, and
+#: refusing it would reject most real prescriptions.
+_NON_DAILY_RE = re.compile(
+    r"\b(?:weeks?|weekly|fortnights?|fortnightly|months?|monthly|years?|yearly|annually"
+    r"|alternate\s+days?|every\s+other\s+day|q\.?o\.?d"
+    r"|every\s+(?:[2-9]|[1-9]\d+|second|third|fourth|other)\s+days?)\b",
+    re.IGNORECASE,
+)
+
+#: The abbreviations that state a RATE and nothing else. Their slots are this module's
+#: choice, not the prescriber's, so a schedule that comes from one is marked
+#: ``schedule_inferred`` — see ``normalize_frequency``.
+#:
+#: ``hs``/``qhs`` are deliberately not here: "at bedtime" IS a stated time of day, so the
+#: night slot is read off the document rather than picked.
+_RATE_ONLY = {"od", "bd", "bid", "tds", "tid", "qid", "qds"}
 
 _AS_NEEDED = {"sos", "prn"}
 _BEFORE_FOOD = {"ac"}
@@ -162,9 +230,7 @@ _DOSE_UNIT = (
     r"tsp|ml|sachets?|units?|doses?|applications?|scoops?|pills?|inhalations?|"
     r"sprays?|pumps?)"
 )
-_SLOT_NAMES = (
-    r"morning|noon|afternoon|midday|evening|night|bed\s*time|lunch|dinner|breakfast"
-)
+_SLOT_NAMES = r"morning|noon|afternoon|midday|evening|night|bed\s*time|lunch|dinner|breakfast"
 #: The separator repeats because some documents rule a line between slots rather than
 #: printing one hyphen: "1----0---1" is the same instruction as "1-0-1".
 #:
@@ -207,9 +273,7 @@ AS_NEEDED_RE = re.compile(
 )
 #: The lookbehind keeps a printed timestamp out: in "07:25 PM" the minutes are not an
 #: hour, and a document header is not a dosing instruction.
-CLOCK_TIME_RE = re.compile(
-    r"(?<![:.\d])(1[0-2]|0?[1-9])\s*([ap])\.?\s?m\b\.?", re.IGNORECASE
-)
+CLOCK_TIME_RE = re.compile(r"(?<![:.\d])(1[0-2]|0?[1-9])\s*([ap])\.?\s?m\b\.?", re.IGNORECASE)
 MEASUREMENT_UNIT_RE = re.compile(rf"^\s*{_UNIT}\s*$", re.IGNORECASE)
 ENGLISH_TIMES_RE = re.compile(
     r"\b(once|twice|thrice|one|two|three|four|\d+)\s*(?:times?)?\s*"
@@ -236,8 +300,12 @@ ENGLISH_SLOT_DOSE_RE = re.compile(
     rf"\b({_SLOT_NAMES})\s*[-–—:]\s*({_DOSE_COUNT})(?![\d/])",  # noqa: RUF001
     re.IGNORECASE,
 )
+#: ``the`` is optional. Without that, "OD at night" named no slot this could read, so the
+#: schedule fell through to the Latin default for OD — the morning — and the one thing the
+#: document actually said about timing was the thing that got dropped. Once-daily-at-night
+#: is how statins and PPIs are routinely written.
 ENGLISH_SLOT_LIST_RE = re.compile(
-    rf"(?:\b(?:in|at|during)\s+the\s+|\(\s*)"
+    rf"(?:\b(?:in|at|during)\s+(?:the\s+)?|\(\s*)"
     rf"((?:{_SLOT_NAMES})(?:\s*(?:,|and|&|\+)\s*(?:{_SLOT_NAMES}))*)\s*\)?",
     re.IGNORECASE,
 )
@@ -295,12 +363,15 @@ def matrix_doses(match: re.Match[str]) -> list[float] | None:
     return doses or None
 
 
-def find_dose_matrix(text: str) -> re.Match[str] | None:
-    """First matrix in *text* that is plausibly a dosage rather than a date."""
-    for match in MATRIX_RE.finditer(text or ""):
-        if matrix_doses(match) is not None:
-            return match
-    return None
+def dose_matrices(text: str) -> list[list[float]]:
+    """Every matrix in *text* that is plausibly a dosage rather than a date.
+
+    All of them, not the first: a tapering course prints two ("1-1-1 for 3 days then
+    1-0-1"), and taking the first silently drops the rest of the course. The caller
+    refuses rather than choosing — see ``normalize_frequency``.
+    """
+    found = [matrix_doses(m) for m in MATRIX_RE.finditer(text or "")]
+    return [doses for doses in found if doses is not None]
 
 
 def _normalise_latin_token(token: str) -> str:
@@ -313,21 +384,40 @@ def normalize_frequency(frequency_raw: str | None) -> dict[str, Any] | None:
     The notations are tried in order of how specific they are, and the first that yields
     a schedule wins. A dose matrix is unambiguous, so it is tried first; a bare rate
     ("twice a day") says nothing about which slots, so it is tried last.
+
+    Two things are refused outright before any of that, because the returned shape cannot
+    express them and a schedule that quietly means something else is the failure this
+    module exists to avoid: a **non-daily period**, and a **course that changes**.
     """
     if not frequency_raw:
         return None
 
     text = frequency_raw.strip()
+
+    if _NON_DAILY_RE.search(text):
+        # The shape counts doses per day and has no field for a period, so a weekly or
+        # alternate-day medicine cannot be written in it — and rendering one as daily
+        # multiplies every dose. This is the rule the module already applied to a bare
+        # "Alternate day"; it has to hold when a matrix is printed alongside the period
+        # ("1-0-0 once a week"), which is how a weekly medicine is actually written.
+        logger.info("frequency %r states a non-daily period - left null", frequency_raw)
+        return None
+
     schedule: tuple[float, float, float, float] | None = None
     with_food: bool | None = None
     as_needed = False
     saw_any_token = False
+    inferred = False
 
-    matrix = find_dose_matrix(text)
-    if matrix:
-        # find_dose_matrix has already rejected out-of-range slots (dates), so this
-        # cannot come back None.
-        doses = matrix_doses(matrix) or []
+    matrices = dose_matrices(text)
+    if len({tuple(doses) for doses in matrices}) > 1:
+        # A tapering or changing course ("1-1-1 for 3 days then 1-0-1"). Which one applies
+        # depends on the day, which this shape cannot say either.
+        logger.info("frequency %r prints more than one schedule - left null", frequency_raw)
+        return None
+
+    if matrices:
+        doses = matrices[0]
         if len(doses) == 3:
             # morning-afternoon-night, the common form: nothing in the evening slot.
             schedule = (doses[0], doses[1], 0.0, doses[2])
@@ -435,6 +525,7 @@ def normalize_frequency(frequency_raw: str | None) -> dict[str, Any] | None:
             if equivalent:
                 schedule = _LATIN_SCHEDULES[equivalent]
                 saw_any_token = True
+                inferred = equivalent in _RATE_ONLY
 
     for match in LATIN_RE.finditer(text):
         token = _normalise_latin_token(match.group(1))
@@ -450,6 +541,7 @@ def normalize_frequency(frequency_raw: str | None) -> dict[str, Any] | None:
         token_schedule = _LATIN_SCHEDULES[token]
         if token_schedule and schedule is None:
             schedule = token_schedule
+            inferred = token in _RATE_ONLY
 
     if AS_NEEDED_RE.search(text):
         # The prose form of SOS/PRN: "take when in need", "as required".
@@ -490,4 +582,10 @@ def normalize_frequency(frequency_raw: str | None) -> dict[str, Any] | None:
         "night": float(schedule[3]),
         "with_food": with_food,
         "as_needed": as_needed,
+        # True when the SLOTS above were chosen here rather than read off the document.
+        # "BD" states a rate — twice a day — and says nothing about when; the morning and
+        # night it lands in are this module's convention. Stored identically to a printed
+        # "1-0-1", a consumer could not tell the two apart, so it is said explicitly. What
+        # the document stated in that case is the total, which is the sum of the slots.
+        "schedule_inferred": inferred,
     }
