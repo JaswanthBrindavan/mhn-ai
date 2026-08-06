@@ -260,6 +260,12 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
         )
 
     pipeline = SECTION_PIPELINES.get(section)
+    if section is DocumentSection.PRESCRIPTIONS and not ctx.settings.prescriptions_enabled:
+        # Filing is never undone, and Spring's listMyFiles still 501s for prescriptions, so
+        # a filed one renders nowhere and cannot be moved back. Reject until Spring can
+        # display it — routing, and the same answer as before the extractor existed.
+        # Remove this branch (and the setting) once that is true.
+        pipeline = None
     if pipeline is None:
         # Correctly classified, just not a section this service processes. Routing, not
         # failure: the document stays in unclassified_files with its section recorded.

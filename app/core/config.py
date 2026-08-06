@@ -95,6 +95,15 @@ class Settings(BaseSettings):
     # on once they exist and carry approved rows. See app/services/ideal_ranges.py.
     ideal_ranges_enabled: bool = False
 
+    # --- Prescriptions ------------------------------------------------------
+    # When on, a document classified as a prescription is filed into Spring's
+    # `prescriptions` table and extracted. OFF by default because filing is never undone
+    # and Spring's `listMyFiles` still returns 501 for this section: a filed prescription
+    # would render nowhere, and could not be moved back. Rejected while off, exactly as
+    # before the extractor existed — the document stays visible in Unclassified.
+    # Flip on once Spring lists and serves prescriptions.
+    prescriptions_enabled: bool = False
+
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""
     log_level: str = "INFO"

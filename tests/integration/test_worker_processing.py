@@ -515,7 +515,13 @@ def test_a_section_mismatch_stops_at_classification_and_files_nothing(
 def test_a_section_with_no_pipeline_is_rejected_by_the_router(
     db_session, make_document, session_factory, test_settings, aws, section
 ):
-    """Routing, not failure: no extractor exists, so the document stays where it is."""
+    """Routing, not failure: no extractor exists, so the document stays where it is.
+
+    ``prescriptions`` is here for a different reason from the other three: it *has* an
+    extractor, and is held behind ``PRESCRIPTIONS_ENABLED`` until Spring can list a filed
+    prescription. Off, it must be indistinguishable from a section with no pipeline at
+    all — which is what this asserts. The mirror, with the flag on, is the next test.
+    """
     _, sqs, queue_url, _ = aws
     item_id, run_id, document_id = _seed_item(db_session, make_document)
     publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
@@ -539,6 +545,48 @@ def test_a_section_with_no_pipeline_is_rejected_by_the_router(
         ).scalar_one()
         == section
     )
+
+
+def test_a_prescription_is_filed_and_extracted_once_the_flag_is_on(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The mirror of the case above: ``PRESCRIPTIONS_ENABLED`` is the only difference.
+
+    Kept beside it so the flag's two halves are read together. The reject path is what
+    ships today; this is what the flag turns on, and it is the test that fails if a later
+    fix to the dose normaliser or the name guard breaks the pipeline.
+    """
+    _, sqs, queue_url, _ = aws
+    # The stage verifies every name against the document's own text, so the page has to
+    # actually print the medicine the model claims to have read off it.
+    document_id = make_document(body=text_pdf("Tab. DOLO 650  1-0-1 after food  5 days"))
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs,
+        queue_url,
+        session_factory,
+        test_settings.model_copy(update={"prescriptions_enabled": True}),
+        aws,
+        ai=_ClassifiesAs("prescriptions"),
+    )
+
+    assert outcome is Outcome.COMPLETED
+    row = _section_row(db_session, item_id)
+    assert row is not None and row["section"] == "prescriptions"
+    assert [m["name_clean"] for m in row["data"]["fields"]["medicines"]] == ["DOLO"]
+
+    item = _item(db_session, item_id)
+    assert item["filed_section"] == "prescriptions"
+    # Out of intake and into Spring's own prescriptions table, under its own prefix.
+    assert not _source_exists(db_session, document_id)
+    filed = _filed_row(db_session, item_id)
+    assert filed.filepath.startswith("prescriptions/")
+    assert filed.content["ai"]["state"] == "complete"
+    assert filed.content["ai"]["section_extraction"] is not None
+    # Transcription only: there is no insights stage for a prescription.
+    assert filed.content["ai"]["insights"] is None
 
 
 # --- a filed document must never be left saying "still processing" ----------

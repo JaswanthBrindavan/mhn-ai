@@ -41,6 +41,7 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import logging
 import re
 import time
+from functools import partial
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -50,7 +51,12 @@ from app.integrations.ai.base import AIProviderError
 from app.integrations.ai.factory import get_stage_provider
 from app.models.ai_results import AiSectionExtraction
 from app.services import medicines
-from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
+from app.services.ai_logging import (
+    check_response,
+    elapsed_ms,
+    log_process,
+    sanitize_validation_error,
+)
 from app.services.classification import DocumentSection
 from app.services.ocr import TextExtractionError, extract_text
 from app.services.source_loading import load_source_document
@@ -280,15 +286,16 @@ def extract_prescription(ctx: StageContext) -> None:
 
     duration_ms = elapsed_ms(started)
 
-    if response.refused:
-        _log(
-            ctx,
-            outcome="refused",
-            error_code="model_refusal",
-            response=response,
-            duration_ms=duration_ms,
-        )
-        raise TransientStageError("prescription extraction refused by safety classifier")
+    # Refusal (transient) and truncation (permanent) are the same check for every stage, so
+    # it lives in one place; partial binds this stage's own log helper. Truncation matters
+    # here in particular: the largest of the 21 measured documents used 5,852 of the 8,192
+    # ceiling, and a cut-off response fails Pydantic identically on every retry.
+    check_response(
+        response,
+        log=partial(_log, ctx),
+        duration_ms=duration_ms,
+        what="prescription extraction",
+    )
 
     try:
         result = PrescriptionFields.model_validate_json(response.text)
@@ -304,8 +311,8 @@ def extract_prescription(ctx: StageContext) -> None:
         )
         raise TransientStageError("prescription output failed validation") from exc
 
-    kept, rejected, verified = _verify_against_document(document, result.medicines)
-    payload = _build_payload(result, kept, rejected, verified)
+    kept, rejected, loose, verified = _verify_against_document(document, result.medicines)
+    payload = _build_payload(result, kept, rejected, verified, loose)
     _persist(ctx, payload)
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
 
@@ -317,6 +324,8 @@ _NOT_ALNUM = re.compile(r"[^a-z0-9]+")
 #: Dosage forms carry no drug identity, so they are weighed out of the comparison below.
 #: "Capsule" appearing in a name the reader tidied must not cost a real medicine, while a
 #: name whose *drug* part is absent is still rejected.
+# A word list reads as a block; one per line would run to thirty.
+# fmt: off
 _FORM_WORDS = frozenset(
     {
         "tab", "tabs", "tablet", "tablets", "cap", "caps", "capsule", "capsules",
@@ -325,6 +334,7 @@ _FORM_WORDS = frozenset(
         "e/d", "e/o", "n/d", "eye", "ear", "oral", "orally",
     }
 )
+# fmt: on
 
 
 def _normalise(text: str) -> str:
@@ -342,14 +352,16 @@ def _has_drug_identity(name: str) -> bool:
     misread heading or a stray table cell — and storing it as a prescribed medicine would
     be wrong in a way no downstream reader could detect.
     """
-    return any(
-        len(part) > 2 and part not in _FORM_WORDS
-        for part in _NOT_ALNUM.split(name.lower())
-    )
+    return any(len(part) > 2 and part not in _FORM_WORDS for part in _NOT_ALNUM.split(name.lower()))
 
 
-def _appears_in(name: str, haystack: str) -> bool:
-    """Is *name* present in the document, allowing for tidying by the reader?
+#: The three answers ``_appears_in`` can give, strongest first. ``PARTIAL`` is kept but
+#: flagged rather than treated as a pass — see below.
+EXACT, PARTIAL, ABSENT = "exact", "partial", "absent"
+
+
+def _appears_in(name: str, haystack: str) -> str:
+    """How well the document's own text supports *name*: ``EXACT``, ``PARTIAL``, ``ABSENT``.
 
     Whole string first. Failing that, most of its parts have to be there — which is what
     makes this survive the way a page was read rather than only the way it was printed.
@@ -360,27 +372,43 @@ def _appears_in(name: str, haystack: str) -> bool:
     returns the halves of that run on different lines with the dosing column in between.
     Split on spaces, such a name is a single token that matches nothing and a real
     medicine is dropped; split on the hyphens, its drug parts are found individually.
+
+    **A part match is not a pass, because parts shorter than three characters are dropped
+    and those are exactly what distinguishes one product from its neighbour.** PAN-D is
+    pantoprazole with domperidone and PANTOP is not; ECOSPRIN AV carries a statin and
+    ECOSPRIN does not; the prompt itself insists the model keep XT, CR, SR, Duo, Plus. On
+    a page printing only the stem, every one of those used to come back verified. They are
+    still kept — a partial match is far more often a page read across two columns than an
+    invention, and dropping a real medicine is the worse failure — but the payload now says
+    the page did not literally contain the name, which is a thing a reader can act on.
+
+    An exact match on ``name_as_written`` also settles the strength, since the printed name
+    carries it ("Tab. DOLO 650"). That is why nothing checks strength separately.
     """
     needle = _normalise(name)
     if not needle:
-        return False
+        return ABSENT
     if needle in haystack:
-        return True
+        return EXACT
     parts = [p for p in _NOT_ALNUM.split(name.lower()) if p and p not in _FORM_WORDS]
     parts = [p for p in parts if len(p) > 2]
     if not parts:
-        return False
+        return ABSENT
     found = sum(len(p) for p in parts if p in haystack)
-    return found / sum(len(p) for p in parts) >= MIN_NAME_OVERLAP
+    if found / sum(len(p) for p in parts) >= MIN_NAME_OVERLAP:
+        return PARTIAL
+    return ABSENT
 
 
 def _verify_against_document(
     document: Any, rows: list[PrescribedMedicine]
-) -> tuple[list[PrescribedMedicine], list[str], bool]:
+) -> tuple[list[PrescribedMedicine], list[str], list[str], bool]:
     """Split *rows* into those the document's own text supports and those it does not.
 
-    Returns ``(kept, rejected, verified)``. ``verified`` is False when the check could not
-    be made at all, which the caller records as a flag rather than passing off as a pass.
+    Returns ``(kept, rejected, loose, verified)``. ``loose`` is the kept names the page
+    supported only in part — see ``_appears_in``. ``verified`` is False when the check
+    could not be made at all, which the caller records as a flag rather than passing off
+    as a pass.
 
     **Only a text layer is trusted to reject with.** A rejection deletes a prescribed
     medicine, so the text it rests on has to be at least as reliable as the model. An
@@ -403,40 +431,55 @@ def _verify_against_document(
     if not rows:
         # Nothing to check costs nothing to check — and skips an OCR pass on an image,
         # which is most of the time this stage would otherwise spend.
-        return [], [], True
+        return [], [], [], True
 
     try:
-        extracted = extract_text(document)
+        # Text layer only. This guard will not reject a drug name on OCR output (see
+        # above), so running Tesseract here would be a full pass bought to be thrown
+        # away — and a photographed prescription, the common case, is the slowest one.
+        # A page that would have needed OCR comes back "skipped" and carries no text.
+        extracted = extract_text(document, allow_ocr=False)
     except TextExtractionError:
         logger.warning("document could not be read as text - prescription names unchecked")
-        return rows, [], False
+        return rows, [], [], False
 
-    if extracted.ocr_pages or not extracted.text.strip():
+    unread = sum(1 for page in extracted.pages if page.method == "skipped")
+    if unread or not extracted.text.strip():
         logger.info(
-            "names not verified: %d of %d pages needed OCR (engine=%s, confidence=%s)",
-            extracted.ocr_pages,
+            "names not verified: %d of %d pages have no usable text layer",
+            unread,
             extracted.page_count,
-            extracted.engine,
-            extracted.mean_confidence,
         )
-        return rows, [], False
+        return rows, [], [], False
 
     haystack = _normalise(extracted.text)
     kept: list[PrescribedMedicine] = []
     rejected: list[str] = []
+    loose: list[str] = []
     for row in rows:
         # Either name is enough. What the guard is for is a drug the page never mentions,
         # and that identity lives in name_clean; name_as_written carries the form, pack
         # and strength alongside it, any of which the extractor may have placed on
         # another line. Requiring both would reject honest readings without making a
         # hallucinated name any harder to produce - it would fail on both counts.
-        if _appears_in(row.name_clean, haystack) or _appears_in(row.name_as_written, haystack):
+        # The stronger of the two verdicts stands: one name found whole is better evidence
+        # than the other found only in parts.
+        verdicts = (
+            _appears_in(row.name_clean, haystack),
+            _appears_in(row.name_as_written, haystack),
+        )
+        if EXACT in verdicts:
             kept.append(row)
+        elif PARTIAL in verdicts:
+            kept.append(row)
+            loose.append(row.name_as_written)
         else:
             rejected.append(row.name_as_written)
     for name in rejected:
         logger.warning("%r is not on the document - dropped", name)
-    return kept, rejected, True
+    for name in loose:
+        logger.info("%r matched the page only in part - kept and flagged", name)
+    return kept, rejected, loose, True
 
 
 # --- payload ----------------------------------------------------------------
@@ -472,6 +515,7 @@ def _build_payload(
     kept: list[PrescribedMedicine],
     rejected: list[str],
     verified: bool = True,
+    loose: list[str] | None = None,
 ) -> dict[str, Any]:
     """The stored shape: the section's own fields, plus data-quality flags.
 
@@ -495,10 +539,14 @@ def _build_payload(
         # than letting an unverified result look like a verified one — see
         # ``_verify_against_document`` for why an OCR'd page cannot reject.
         flags.append({"code": "names_unverified", "reason": "no reliable text layer"})
+    if loose:
+        # Kept, but the page did not literally contain the name — only most of its parts,
+        # and the parts a name is split into exclude anything under three characters. That
+        # is exactly where PAN-D and PANTOP become the same answer, so it is said out loud
+        # rather than counted as verified.
+        flags.append({"code": "names_matched_loosely", "names": loose})
     unparsed = [
-        r["frequency_raw"]
-        for r in rows
-        if r["frequency_raw"] and not r["frequency_normalized"]
+        r["frequency_raw"] for r in rows if r["frequency_raw"] and not r["frequency_normalized"]
     ]
     if unparsed:
         flags.append({"code": "frequency_not_normalized", "values": unparsed})

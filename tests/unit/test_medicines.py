@@ -85,6 +85,26 @@ def test_latin_abbreviations(text: str, expected: tuple[float, ...]) -> None:
     assert slots(text) == expected
 
 
+def test_an_abbreviations_slots_are_marked_as_this_modules_choice() -> None:
+    """BD says twice a day. Morning and night is what this module picked, not what the
+    prescription said — and stored as four floats it is indistinguishable from a printed
+    "1-0-1" unless something says so."""
+    assert norm("BD")["schedule_inferred"] is True
+    assert norm("twice a day")["schedule_inferred"] is True
+    assert norm("1-0-1")["schedule_inferred"] is False
+    # HS is not a rate: "at bedtime" is a time of day the document actually stated.
+    assert norm("HS")["schedule_inferred"] is False
+    assert norm("1 tab OD at night")["schedule_inferred"] is False
+
+
+def test_interval_notation_is_left_null_rather_than_guessed() -> None:
+    """Q6H states a rate this shape has no field for. Null is the honest answer; the
+    module docstring names it as the first gap to close."""
+    assert normalize_frequency("Q6H") is None
+    assert normalize_frequency("q8h") is None
+    assert normalize_frequency("every 6 hours") is None
+
+
 def test_food_modifiers() -> None:
     assert norm("1-0-1 AC")["with_food"] is False
     assert norm("1-0-1 PC")["with_food"] is True
@@ -100,7 +120,7 @@ def test_as_needed() -> None:
 
 
 def test_ac_in_a_brand_name_is_not_read_as_a_food_modifier() -> None:
-    """"PERSOL AC 2.5 GEL" is a benzoyl peroxide gel, not a dose before food.
+    """ "PERSOL AC 2.5 GEL" is a benzoyl peroxide gel, not a dose before food.
 
     AC and PC are two letters and collide with brand names, so they only count beside a
     real schedule. Without this the name is also truncated at "PERSOL".
@@ -131,7 +151,7 @@ def test_english_forms(text: str, expected: tuple[float, ...]) -> None:
 
 
 def test_a_strength_before_a_slot_is_one_dose_not_a_count() -> None:
-    """"0.75 MG MORNING" restates the strength: one dose in the morning, not 0.75 of one."""
+    """ "0.75 MG MORNING" restates the strength: one dose in the morning, not 0.75 of one."""
     assert slots("0.75 MG MORNING") == (1.0, 0.0, 0.0, 0.0)
 
 
@@ -150,6 +170,81 @@ def test_unparseable_stays_null(text: str | None) -> None:
     the dose, so the phrase stays in frequency_raw and the schedule stays null.
     """
     assert normalize_frequency(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Tab Methotrexate 1-0-0 once a week",
+        "1-0-0 weekly",
+        "1 tablet weekly",
+        "1-0-0 once a month",
+        "1-0-0 monthly",
+        "1-0-0 alternate day",
+        "1-0-0 on alternate days",
+        "1-0-0 every other day",
+        "1-0-0 QOD",
+        "1-0-0 every 3 days",
+    ],
+)
+def test_a_non_daily_period_refuses_rather_than_reporting_a_daily_dose(text: str) -> None:
+    """The rule the module already applied to a bare "Alternate day", now held when a dose
+    matrix is printed beside the period — which is how a weekly medicine is written.
+
+    The returned shape counts doses per day and has no field for a period, so there is no
+    way to say "one, on one day in seven". Reading it as a daily schedule multiplies the
+    dose by seven, and nothing downstream can see that it happened: weekly methotrexate
+    taken daily is the standard example of why. Null plus the raw text is the only honest
+    answer this shape can give.
+    """
+    assert normalize_frequency(text) is None
+
+
+def test_a_course_that_changes_refuses_rather_than_taking_the_first_half() -> None:
+    """A taper prints two schedules. Which applies depends on the day, which this shape
+    cannot say either — and silently keeping the first drops the rest of the course."""
+    assert normalize_frequency("1-1-1 for 3 days then 1-0-1") is None
+    # One schedule stated twice is not a taper.
+    assert slots("1-0-1, repeat 1-0-1") == (1.0, 0.0, 0.0, 1.0)
+
+
+def test_a_duration_in_days_is_not_mistaken_for_a_period() -> None:
+    """ "for 5 days" is how long the course runs, not how often a dose is taken."""
+    assert slots("1-0-1 for 5 days") == (1.0, 0.0, 0.0, 1.0)
+    assert slots("1-0-1 x 10 days after food") == (1.0, 0.0, 0.0, 1.0)
+
+
+def test_stat_is_not_a_morning_dose() -> None:
+    """STAT is one dose, immediately: a point in time, not a time of day and not a repeat.
+
+    It used to map to the morning slot, which turned a dose given the moment it was
+    written into an instruction to take one tomorrow morning.
+    """
+    assert normalize_frequency("STAT") is None
+    assert normalize_frequency("Inj. Monocef 1gm STAT") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1 tab OD at night", (0.0, 0.0, 0.0, 1.0)),
+        ("OD at bedtime", (0.0, 0.0, 0.0, 1.0)),
+        ("Once daily at night", (0.0, 0.0, 0.0, 1.0)),
+        ("1 tab OD in the evening", (0.0, 0.0, 1.0, 0.0)),
+    ],
+)
+def test_a_printed_time_of_day_beats_the_abbreviations_default(
+    text: str, expected: tuple[float, ...]
+) -> None:
+    """OD says how MANY doses; it does not say when. When the document also says when, the
+    document wins.
+
+    It did not: "at night" named no slot the parser could read — the phrase needed a "the"
+    — so the schedule fell through to OD's default of morning, and the one thing the
+    document actually stated about timing was the thing that got dropped. Once daily at
+    night is how statins and PPIs are routinely written.
+    """
+    assert slots(text) == expected
 
 
 # --- dosage form ------------------------------------------------------------
@@ -215,8 +310,15 @@ def test_nothing_escapes_the_published_vocabulary() -> None:
 
     assert set(_FORM_SYNONYMS.values()) <= DOSAGE_FORMS
     assert {
-        "Tablet", "Capsule", "Syrup", "Injection", "Drops",
-        "Cream", "Ointment", "Inhaler", "Powder",
+        "Tablet",
+        "Capsule",
+        "Syrup",
+        "Injection",
+        "Drops",
+        "Cream",
+        "Ointment",
+        "Inhaler",
+        "Powder",
     } == DOSAGE_FORMS
 
 
