@@ -14,11 +14,22 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# Schema migrations run here rather than at application startup: this runs once per deploy,
-# whereas a startup hook would run in every replica of every service simultaneously and race.
-# Alembic is idempotent — on an up-to-date database this reads the version table and exits —
-# so it is safe to leave configured on both services.
-preDeployCommand = "alembic upgrade head"
+# NO preDeployCommand, deliberately. There used to be an `alembic upgrade head` here.
+#
+# The schema has one owner now: Spring's Flyway, including the ai_* tables
+# (db/flyway/V4__ai_tables.sql in this repo, applied from Spring's migration folder).
+# There is one database and the Spring team owns it, so this service does not migrate it.
+#
+# Leaving Alembic here would have needed V4 to write a row into ai_alembic_version — our
+# migration tool's bookkeeping, in someone else's database, purely so this command could
+# find nothing to do. Removing the command removes the need for the row.
+#
+# Alembic still lives in this repo and still builds this exact schema; that is how local and
+# test databases come up. It is frozen at b6d1f8a3c209 and takes no new revisions — schema
+# changes are Flyway migrations now.
+#
+# ORDERING: on a fresh environment Spring must migrate before this service can do anything,
+# which was already true of the section tables and is now true of the ai_* tables as well.
 
 # The AI service refuses to start when MHN_SERVICE_TOKEN is missing or shorter than 32
 # characters (an empty token would disable authentication entirely). That is a
