@@ -17,7 +17,11 @@ from app.integrations.ai.pricing import estimate_cost_usd
 from app.models.ai_results import AiProcessLog
 from app.workers.stagetypes import StageContext
 
-PROVIDER_NAME = "anthropic"
+#: What the provider and model columns say when a stage completed without calling a model
+#: at all. ``generate_insights`` skips the paid call when every result is in range, and
+#: naming a model there claimed a call that never happened — in the one table that exists
+#: to say what was spent. Both columns are NOT NULL, so this is the sentinel.
+NO_CALL = "skipped"
 
 
 def log_process(
@@ -33,7 +37,11 @@ def log_process(
     detail: str | None = None,
 ) -> None:
     usage = response.usage if response is not None else None
-    model = response.model if response is not None else (ctx.settings.ai_model or "unknown")
+    # Both come from the response or neither does. Falling back to configuration was how
+    # a skipped stage came to log Haiku for a call it never made, and a hardcoded provider
+    # named Anthropic for every document Gemini actually received.
+    model = response.model if response is not None else NO_CALL
+    provider = response.provider if response is not None else NO_CALL
     cost = estimate_cost_usd(model, usage) if usage is not None else Decimal("0")
 
     values = {
@@ -41,7 +49,7 @@ def log_process(
         "document_id": ctx.document_id,
         "stage": stage,
         "attempt": ctx.attempt,
-        "provider": PROVIDER_NAME,
+        "provider": provider,
         "model": model,
         "prompt_version": prompt_version,
         "schema_version": schema_version,

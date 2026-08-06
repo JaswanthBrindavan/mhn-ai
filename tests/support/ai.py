@@ -25,9 +25,12 @@ def structured_response(
     model: str = "claude-opus-4-8",
     stop_reason: str | None = "end_turn",
     usage: AIUsage = DEFAULT_USAGE,
+    provider: str = "anthropic",
 ) -> StructuredResponse:
     text = payload if isinstance(payload, str) else json.dumps(payload)
-    return StructuredResponse(text=text, model=model, stop_reason=stop_reason, usage=usage)
+    return StructuredResponse(
+        text=text, provider=provider, model=model, stop_reason=stop_reason, usage=usage
+    )
 
 
 def classification_payload(**overrides: Any) -> dict[str, Any]:

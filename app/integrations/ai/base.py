@@ -45,6 +45,12 @@ class StructuredResponse:
     model: str
     stop_reason: str | None
     usage: AIUsage
+    #: Which vendor actually answered. Carried back with the response rather than assumed
+    #: by the caller: stages can be routed to different providers by configuration, so a
+    #: constant in the logger was wrong for every redirected call — and this column is the
+    #: audit trail for which vendor received a document. Provider and model come from the
+    #: same place so the two cannot disagree.
+    provider: str = "unknown"
 
     @property
     def refused(self) -> bool:

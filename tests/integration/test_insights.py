@@ -158,6 +158,25 @@ def test_all_results_in_range_skips_the_model_call(db_session, test_settings):
     assert _logs(db_session, item_id)[0]["outcome"] == "succeeded"
 
 
+def test_a_skipped_stage_does_not_name_a_model_it_never_called(db_session, test_settings):
+    """``ai_process_logs`` is the one table that says what was spent, and it used to
+    claim Haiku for a call that never happened — the configured model was used as a
+    fallback whenever there was no response to read one from."""
+    document_id = 104
+    item_id = _seed_item(db_session, document_id)
+    normal = [dict(_extraction_data()["results"][0], abnormal_flag="normal", value="88")]
+    _seed_extraction(db_session, item_id, document_id, _extraction_data(results=normal))
+    ai = FakeAIProvider()
+
+    generate_insights(_context(db_session, test_settings, document_id, item_id, ai))
+
+    assert ai.calls == []
+    log = _logs(db_session, item_id)[0]
+    assert log["model"] == "skipped"
+    assert log["provider"] == "skipped"
+    assert log["estimated_cost_usd"] == 0
+
+
 def test_undetermined_flag_still_calls_the_model(db_session, test_settings):
     """None means 'could not be checked', which is not the same as in range."""
     document_id = 104
