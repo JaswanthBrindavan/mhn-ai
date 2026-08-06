@@ -25,6 +25,7 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import json
 import logging
 import time
+from functools import partial
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
@@ -33,7 +34,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
 from app.models.ai_results import AiReportExtraction, AiReportInsight
-from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
+from app.services.ai_logging import (
+    check_response,
+    elapsed_ms,
+    log_process,
+    sanitize_validation_error,
+)
 from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
@@ -262,15 +268,14 @@ def generate_insights(ctx: StageContext) -> None:
 
     duration_ms = elapsed_ms(started)
 
-    if response.refused:
-        _log(
-            ctx,
-            outcome="refused",
-            error_code="model_refusal",
-            response=response,
-            duration_ms=duration_ms,
-        )
-        raise TransientStageError("insights refused by safety classifier")
+    # Refusal (transient) and truncation (permanent) are the same check for every
+    # stage, so it lives in one place; partial binds this stage's own log helper.
+    check_response(
+        response,
+        log=partial(_log, ctx),
+        duration_ms=duration_ms,
+        what="insights",
+    )
 
     try:
         result = DocumentInsights.model_validate_json(response.text)

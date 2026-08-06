@@ -241,4 +241,33 @@ def reject_item(
     return _execute_update(session, stmt) == 1
 
 
+def fail_item(
+    session: Session, item_id: UUID, *, code: str, message: str, expected: set[str]
+) -> bool:
+    """Terminally fail an item, without spending the remaining attempts.
+
+    ``claim_item`` also lands on ``failed``, but only after the attempt cap is exhausted.
+    This is for a failure already known to be permanent — a response cut off at the token
+    ceiling fails the same way every time — so the retries would cost money to reach an
+    identical end.
+
+    Deliberately not ``reject_item``: rejection means the document was routed rather than
+    processed, and Spring is told not to show it as an error. This is an error.
+    """
+    stmt = (
+        update(AiProcessingRunItem)
+        .where(
+            AiProcessingRunItem.id == item_id,
+            AiProcessingRunItem.status.in_(expected),
+        )
+        .values(
+            status=RunItemStatus.FAILED.value,
+            last_error_code=code,
+            last_error_message=message,
+            completed_at=_now(),
+        )
+    )
+    return _execute_update(session, stmt) == 1
+
+
 CLAIMABLE_STATUSES = _CLAIMABLE

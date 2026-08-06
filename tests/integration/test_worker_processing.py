@@ -275,6 +275,40 @@ def test_reject_stage_marks_rejected_and_acks(
     assert _queue_depth(sqs, queue_url) == 0  # terminal → dropped
 
 
+def test_a_permanent_stage_failure_fails_the_item_without_spending_retries(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """A truncated response fails identically on every attempt, so retrying it only
+    pays the bill again. It ends `failed` rather than `rejected`: rejection means the
+    document was routed rather than processed, and Spring is told not to show that as
+    an error."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    from app.models.enums import RunItemStatus as S
+    from app.workers.stages import PermanentStageError
+
+    def _truncated(_ctx) -> None:
+        raise PermanentStageError("response_truncated", "hit the output token ceiling")
+
+    monkeypatch.setattr("app.workers.processor.CLASSIFY_STAGE", (S.CLASSIFYING, _truncated))
+
+    outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
+
+    assert outcome is Outcome.FAILED
+    assert _status(db_session, item_id) == S.FAILED.value
+    row = db_session.execute(
+        text("SELECT last_error_code, attempt_count FROM ai_processing_run_items WHERE id=:id"),
+        {"id": item_id},
+    ).one()
+    assert row.last_error_code == "response_truncated"
+    # One attempt, not the cap: the point of the change is that the other two are never
+    # spent on a failure that cannot come out differently.
+    assert row.attempt_count == 1
+    assert _queue_depth(sqs, queue_url) == 0  # terminal → dropped, not redelivered
+
+
 # --- attempt cap ------------------------------------------------------------
 
 

@@ -27,6 +27,7 @@ from app.workers.heartbeat import VisibilityHeartbeat
 from app.workers.stages import (
     CLASSIFY_STAGE,
     SECTION_PIPELINES,
+    PermanentStageError,
     RejectStageError,
     StageContext,
     StageStep,
@@ -49,6 +50,8 @@ class Outcome(StrEnum):
     SKIPPED_TERMINAL = "skipped_terminal"
     NOT_FOUND = "not_found"
     GAVE_UP = "gave_up"
+    #: A deterministic failure the attempt cap would only pay to repeat.
+    FAILED = "failed"
     #: Left on the queue for redelivery; the only outcome that does not delete.
     RETRY = "retry"
 
@@ -143,6 +146,21 @@ def _process(
             logger.info("item_rejected", extra={"item_id": str(item_id), "reason": exc.code})
             _ack(sqs, settings, message)
             return Outcome.REJECTED
+        except PermanentStageError as exc:
+            # Deterministic failure — a truncated response fails the same way every
+            # time — so spend no further attempts on it. Ends `failed`, not `rejected`:
+            # rejection means the document was routed rather than processed, and Spring
+            # is told not to show that as an error. This one is one.
+            processing.fail_item(
+                session, item_id, code=exc.code, message=exc.message, expected=_IN_PROGRESS
+            )
+            filing.mark_content_failed(session, item_id)
+            logger.warning(
+                "item_permanent_failure",
+                extra={"item_id": str(item_id), "reason": exc.code},
+            )
+            _ack(sqs, settings, message)
+            return Outcome.FAILED
         except TransientStageError as exc:
             # Leave the item where it is and do NOT delete: redelivery retries it,
             # and the attempt cap in claim_item eventually gives up.

@@ -32,6 +32,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
+#: The vendor, not the model family: this column answers "who received this document",
+#: and PHI to Google is a compliance question about Google rather than about Gemini.
+PROVIDER_NAME = "google"
+
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 #: Generous, so a 120-result panel is never cut short. Truncation is surfaced by
 #: ``StructuredResponse.truncated`` rather than silently returning a short list.
@@ -169,6 +173,7 @@ def _to_structured_response(response: Any, model: str) -> StructuredResponse:
 
     return StructuredResponse(
         text=text,
+        provider=PROVIDER_NAME,
         model=model,
         stop_reason=stop_reason,
         usage=AIUsage(

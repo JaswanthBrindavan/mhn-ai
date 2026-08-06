@@ -26,6 +26,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
+#: Written to every ``ai_process_logs`` row this provider produces. That column is the
+#: audit trail for which vendor received a document, so it is set here — beside the call
+#: that actually sends it — rather than assumed by the logger.
+PROVIDER_NAME = "anthropic"
+
 DEFAULT_MODEL = "claude-opus-4-8"
 _FILES_BETA = "files-api-2025-04-14"
 
@@ -150,6 +155,7 @@ def _to_structured_response(response: Any, model: str) -> StructuredResponse:
     usage = response.usage
     return StructuredResponse(
         text=text,
+        provider=PROVIDER_NAME,
         model=getattr(response, "model", model),
         stop_reason=getattr(response, "stop_reason", None),
         usage=AIUsage(

@@ -60,7 +60,9 @@ class Settings(BaseSettings):
     ai_model: str = ""
     # Insights run on their own model (typically a stronger one); empty falls back to ai_model.
     ai_model_insights: str = ""
-    ai_max_tokens: int = 16000
+    # No global token ceiling: every stage sets its own, because they differ by an order
+    # of magnitude (a classification label against a 130-result panel). A single setting
+    # here was read by nothing while appearing to govern all of them.
     anthropic_api_key: str = ""
 
     # Per-stage provider overrides. Empty = same provider as everything else (the default,
