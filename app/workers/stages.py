@@ -27,6 +27,7 @@ from app.models.enums import RunItemStatus
 from app.services.classification import DocumentSection, classify_report
 from app.services.extraction import extract_report
 from app.services.insights import generate_insights
+from app.services.prescriptions import extract_prescription
 from app.services.section_extraction import extract_section
 from app.services.section_specs import SUPPORTED_SECTIONS
 from app.workers.stagetypes import (
@@ -69,4 +70,15 @@ SECTION_PIPELINES: dict[DocumentSection, list[StageStep]] = {
         section: [(RunItemStatus.EXTRACTING, extract_section)]
         for section in sorted(SUPPORTED_SECTIONS, key=lambda s: s.value)
     },
+    #: Prescriptions have their own stage rather than a ``SECTION_SPECS`` entry. The
+    #: generic stage sends OCR text, and a prescription is a layout: the dose sits in a
+    #: column beside the medicine, and flattening that puts a dose on the wrong row.
+    #: ``extract_prescription`` sends the document itself, checks every name against the
+    #: page, and normalises the dosing notation in Python.
+    #:
+    #: Listed after the expansion above so this wins outright if a ``prescriptions`` spec
+    #: is ever added there, rather than the two silently disagreeing about the stage.
+    DocumentSection.PRESCRIPTIONS: [
+        (RunItemStatus.EXTRACTING, extract_prescription),
+    ],
 }

@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     ai_model_classification: str = ""
     extraction_provider: str = ""
     ai_model_extraction: str = ""
+    # Prescriptions are read by the same mechanism but measured separately: the document
+    # goes to the model as a file (layout carries the dosing), and many are photographs
+    # rather than digital PDFs. Measured on 21 real prescriptions and bills, Gemini
+    # gemini-3.1-flash-lite read every one at ~2,100 in / 280 out tokens; the larger
+    # flash tiers returned 503 on nearly every request. See app/services/prescriptions.py.
+    prescription_provider: str = ""
+    ai_model_prescription: str = ""
     google_api_key: str = ""
 
     # --- Ideal ranges (approved-THP override) -------------------------------

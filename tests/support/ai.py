@@ -86,6 +86,33 @@ def insights_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def prescription_payload(**overrides: Any) -> dict[str, Any]:
+    """A canned prescription reading.
+
+    Hand-written rather than derived, because unlike a ``SectionSpec`` this schema has
+    required fields with meaning: the stage checks every name against the document's own
+    text before storing it, so a payload of nulls would be dropped by the guard and a test
+    asserting "one medicine was stored" would fail for the wrong reason.
+    """
+    payload: dict[str, Any] = {
+        "medicines": [
+            {
+                "name_as_written": "Tab. DOLO 650",
+                "name_clean": "DOLO",
+                "form_raw": "Tab.",
+                "strength": "650mg",
+                "composition": "Paracetamol (650mg)",
+                "frequency_raw": "1-0-1 after food",
+                "duration": "5 days",
+            }
+        ],
+        "prescribed_date": "18/09/2024",
+        "prescriber": "Dr A Sharma",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def section_payload(section: DocumentSection | str, **overrides: Any) -> dict[str, Any]:
     """A minimal valid payload **built from that section's own schema**.
 
@@ -114,6 +141,7 @@ _PAYLOAD_BY_PROPERTY: dict[str, Any] = {
     "section": classification_payload,
     "results": extraction_payload,
     "insights": insights_payload,
+    "medicines": prescription_payload,
 }
 
 

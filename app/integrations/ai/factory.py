@@ -30,6 +30,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _STAGE_OVERRIDES = {
     "classifying": ("classification_provider", "ai_model_classification"),
     "extracting": ("extraction_provider", "ai_model_extraction"),
+    # Prescriptions get their own pair rather than sharing the extraction override. The
+    # two stages read different things — a lab panel is a printed table, a prescription
+    # is often a photograph of handwriting — so a model good enough for one is not
+    # automatically right for the other, and pinning them together would mean a change
+    # measured on reports silently moves prescriptions too.
+    "extracting_prescription": ("prescription_provider", "ai_model_prescription"),
 }
 
 
