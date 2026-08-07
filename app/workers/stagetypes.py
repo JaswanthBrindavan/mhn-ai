@@ -65,6 +65,11 @@ class StageContext:
     s3: "S3Client"
     ai: AIProvider
     settings: Settings
+    #: How much of the document is handwritten, set by the classification stage and read by
+    #: the router in the same pass. Carried here rather than persisted because a retry
+    #: re-runs classification from the top, so there is nothing to remember between runs —
+    #: which keeps this feature clear of a schema change. "none" until classify has run.
+    handwriting: str = "none"
 
 
 Stage = Callable[[StageContext], None]

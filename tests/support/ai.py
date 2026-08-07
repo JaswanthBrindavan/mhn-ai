@@ -37,6 +37,9 @@ def classification_payload(**overrides: Any) -> dict[str, Any]:
     payload = {
         "section": "reports",
         "title": "Complete Blood Count",
+        # Printed unless a test says otherwise. "mostly" is the only value that changes
+        # routing, and only for prescriptions.
+        "handwriting": "none",
         "confidence": 0.96,
         "reasoning": "Structured lab result values with reference ranges.",
     }

@@ -44,7 +44,13 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "clf-2026-07-23"
+#: clf-2026-08-07 moved the prescriptions/reports boundary. "reports" claimed "a clinical
+#: or discharge summary", which swallowed every Indian consultation note that ends in a
+#: medicines table — the commonest shape a prescription actually arrives in. Two real
+#: prescriptions were filed as lab reports, ran the report pipeline, found no results, and
+#: showed the patient an empty analysis while four prescribed medicines went unread.
+#: The rule is now precedence-based: medicines listed anywhere make it a prescription.
+PROMPT_VERSION = "clf-2026-08-07"
 SCHEMA_VERSION = "clf-2"
 STAGE_NAME = "classifying"
 #: Classification output is small (a section, a title, a short reason). Kept tight to
@@ -92,13 +98,35 @@ DOCUMENT_TYPE_BY_SECTION: dict[str, DocumentType] = {
 }
 
 
+#: How much of a document's substance is handwritten. Ordered least to most.
+HANDWRITING_LEVELS = ("none", "some", "mostly")
+
+
 class DocumentClassification(BaseModel):
     """Validated model output. Written to the DB only after this parses cleanly."""
 
     section: DocumentSection
     title: str = Field(min_length=1, max_length=512)
+    #: Routing input for prescriptions only: a mostly-handwritten one is filed but never
+    #: extracted, because nothing could check what the model read off it. Deliberately NOT
+    #: persisted — a retry re-runs classification from the top, so this is recomputed rather
+    #: than stored, which keeps the whole feature clear of a schema change.
+    handwriting: str = Field(default="none", max_length=32)
     confidence: float
     reasoning: str = Field(default="", max_length=2000)
+
+    @field_validator("handwriting", mode="before")
+    @classmethod
+    def _known_level(cls, value: object) -> str:
+        # Out-of-vocabulary becomes "none" rather than failing the document. Getting this
+        # wrong in the safe direction means we extract a document we might have skipped —
+        # the same answer as before this field existed. Failing validation instead would
+        # lose the whole classification over an advisory field.
+        if isinstance(value, str) and value.strip().lower() in HANDWRITING_LEVELS:
+            return value.strip().lower()
+        if value not in (None, ""):
+            logger.warning("model returned handwriting %r, which is not one of the three", value)
+        return "none"
 
     @field_validator("confidence")
     @classmethod
@@ -118,10 +146,14 @@ CLASSIFICATION_JSON_SCHEMA: dict[str, Any] = {
             "enum": [member.value for member in DocumentSection],
         },
         "title": {"type": "string"},
+        #: A plain nullable string rather than a JSON-Schema enum, for the reason
+        #: PRESCRIPTION_JSON_SCHEMA gives for `form`: an enum cannot express "one of these
+        #: three, or nothing", and the validator below is the guarantee regardless.
+        "handwriting": {"type": ["string", "null"]},
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
     },
-    "required": ["section", "title", "confidence", "reasoning"],
+    "required": ["section", "title", "handwriting", "confidence", "reasoning"],
     "additionalProperties": False,
 }
 
@@ -130,21 +162,37 @@ SYSTEM_PROMPT = (
     "single uploaded document and decide which section of the app it belongs to. You do "
     "not diagnose, interpret results, or give medical advice — you only classify.\n\n"
     "Choose exactly one section:\n"
-    "- reports: a diagnostic report a clinician files as a result — laboratory report, "
-    "pathology report, or a clinical/discharge summary.\n"
+    "- reports: a diagnostic report a clinician files as a RESULT — laboratory report, "
+    "pathology report, or a test panel. What makes it a report is measured values with "
+    "reference ranges.\n"
     "- scans_imaging: imaging and its radiology report — MRI, X-ray, CT, ultrasound, and "
     "the radiologist's read of them.\n"
-    "- prescriptions: a prescription or medication order.\n"
+    "- prescriptions: any document that ORDERS OR ITEMISES MEDICINES — a prescription slip, "
+    "a doctor's consultation note whose medicines are listed at the end, a discharge "
+    "medication list, or an itemised pharmacy bill naming the drugs dispensed. The tell is "
+    "a list of medicines with any of: dose, strength, frequency, duration, or intake "
+    "instruction.\n"
     "- insurance: insurance cards, policies, claims, or coverage letters.\n"
-    "- bills: invoices, receipts, or billing statements.\n"
+    "- bills: invoices, receipts and billing statements that do NOT itemise medicines — "
+    "consultation fees, room charges, procedure or test charges.\n"
     "- vaccinations: immunisation or vaccination records.\n"
     "- medical_condition: a record describing a diagnosed condition or its history.\n"
     "- unknown: use ONLY when the document is unreadable or you cannot confidently place "
     "it in any section.\n\n"
+    "PRECEDENCE, because these overlap in practice: if the document orders or itemises "
+    "medicines, it is 'prescriptions' — even when it also carries consultation notes, "
+    "complaints, a diagnosis, a bill total, or is headed 'Consultation Summary', 'OPD "
+    "Summary' or 'Discharge Summary'. A document is only 'reports' when its substance is "
+    "measured results. A document is only 'bills' when nothing on it is a medicine.\n\n"
     "Also return:\n"
     "- title: a short, human-readable label, at most a few words (for example "
     "'Complete Blood Count' or 'Chest X-Ray'). Do not invent details; do not include "
     "long patient identifiers.\n"
+    "- handwriting: how much of the document's SUBSTANCE is handwritten rather than "
+    "printed — 'none', 'some', or 'mostly'. Judge the medicines, values and dates, not "
+    "the letterhead: a printed form whose drug names are written in by hand is 'mostly', "
+    "because the part that matters is handwritten. A printed document carrying only a "
+    "handwritten signature or stamp is 'none'.\n"
     "- confidence: your calibrated confidence between 0 and 1.\n"
     "- reasoning: one concise sentence citing what drove the decision. Do not restate "
     "patient data or clinical values.\n\n"
@@ -213,6 +261,8 @@ def classify_report(ctx: StageContext) -> None:
         raise TransientStageError("classification output failed validation") from exc
 
     _persist_classification(ctx, result)
+    # Handed to the router in memory rather than stored: see StageContext.handwriting.
+    ctx.handwriting = result.handwriting
     # Whether we can *process* this section is the router's decision, not this stage's:
     # classification succeeded either way, and a stage that rejected here would have to
     # know the pipeline table — which imports this module. See workers/stages.py.

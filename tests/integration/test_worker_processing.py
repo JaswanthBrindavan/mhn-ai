@@ -344,14 +344,17 @@ class _ClassifiesAs(FakeAIProvider):
     whatever stage follows it, and they need different payloads.
     """
 
-    def __init__(self, section: str) -> None:
+    def __init__(self, section: str, handwriting: str = "none") -> None:
         super().__init__()
         self.section = section
+        self.handwriting = handwriting
 
     def analyze_document(self, **kwargs):
         default = super().analyze_document(**kwargs)  # records the call
         if "section" in kwargs["json_schema"].get("properties", {}):
-            return structured_response(classification_payload(section=self.section))
+            return structured_response(
+                classification_payload(section=self.section, handwriting=self.handwriting)
+            )
         return default
 
 
@@ -587,6 +590,76 @@ def test_a_prescription_is_filed_and_extracted_once_the_flag_is_on(
     assert filed.content["ai"]["section_extraction"] is not None
     # Transcription only: there is no insights stage for a prescription.
     assert filed.content["ai"]["insights"] is None
+
+
+def test_a_handwritten_prescription_is_filed_but_never_read(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The one document we deliberately decline to extract.
+
+    A handwritten page has no text layer, so the name guard has nothing to reject with —
+    the document most likely to be misread is the one where every downstream check is
+    blind. So it is filed (it is the user's prescription and belongs in their section) and
+    nothing is read off it; the app asks for the printed pharmacy bill instead.
+
+    Filed, `completed`, and zero medicines: the three things that must all hold at once.
+    """
+    _, sqs, queue_url, _ = aws
+    document_id = make_document(body=text_pdf("Dr A Sharma  Rx  (handwritten)"))
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs,
+        queue_url,
+        session_factory,
+        test_settings.model_copy(update={"prescriptions_enabled": True}),
+        aws,
+        ai=_ClassifiesAs("prescriptions", handwriting="mostly"),
+    )
+
+    assert outcome is Outcome.COMPLETED
+    row = _section_row(db_session, item_id)
+    assert row is not None and row["section"] == "prescriptions"
+    # Nothing was read off the page.
+    assert row["data"]["fields"]["medicines"] == []
+    assert [f["code"] for f in row["data"]["flags"]] == ["handwritten_not_extracted"]
+
+    # Still filed, and finished rather than failed — "we did not read this" is an outcome,
+    # not an error, and a `failed` state would show the user a bug that isn't one.
+    item = _item(db_session, item_id)
+    assert item["filed_section"] == "prescriptions"
+    assert not _source_exists(db_session, document_id)
+    filed = _filed_row(db_session, item_id)
+    assert filed.filepath.startswith("prescriptions/")
+    assert filed.content["ai"]["state"] == "complete"
+
+
+def test_a_printed_prescription_is_still_extracted(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The guard against over-refusing: only `mostly` stops extraction.
+
+    A scanned printed slip has no text layer either, and must NOT be treated as
+    handwritten — extraction is vision, so a missing text layer is no reason to read less.
+    """
+    _, sqs, queue_url, _ = aws
+    document_id = make_document(body=text_pdf("Tab. DOLO 650  1-0-1 after food  5 days"))
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs,
+        queue_url,
+        session_factory,
+        test_settings.model_copy(update={"prescriptions_enabled": True}),
+        aws,
+        ai=_ClassifiesAs("prescriptions", handwriting="some"),
+    )
+
+    assert outcome is Outcome.COMPLETED
+    row = _section_row(db_session, item_id)
+    assert [m["name_clean"] for m in row["data"]["fields"]["medicines"]] == ["DOLO"]
 
 
 # --- a filed document must never be left saying "still processing" ----------

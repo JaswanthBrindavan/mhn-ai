@@ -26,6 +26,7 @@ from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
 from app.workers.stages import (
     CLASSIFY_STAGE,
+    HANDWRITTEN_PRESCRIPTION_PIPELINE,
     SECTION_PIPELINES,
     PermanentStageError,
     RejectStageError,
@@ -260,6 +261,12 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
         )
 
     pipeline = SECTION_PIPELINES.get(section)
+    if section is DocumentSection.PRESCRIPTIONS and ctx.handwriting == "mostly":
+        # File it, but read nothing off it. A handwritten page has no text layer, so the
+        # name guard cannot reject with it — the one document most likely to be misread is
+        # the one where nothing downstream can check the model. The app asks for the
+        # pharmacy bill instead, which is printed and lists the same drugs.
+        pipeline = HANDWRITTEN_PRESCRIPTION_PIPELINE
     if section is DocumentSection.PRESCRIPTIONS and not ctx.settings.prescriptions_enabled:
         # Filing is never undone, and Spring's listMyFiles still 501s for prescriptions, so
         # a filed one renders nowhere and cannot be moved back. Reject until Spring can

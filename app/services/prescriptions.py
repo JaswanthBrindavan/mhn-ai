@@ -41,7 +41,9 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import logging
 import re
 import time
+from collections import Counter
 from functools import partial
+from hashlib import sha256
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -70,7 +72,9 @@ PROMPT_VERSION = "rx-2026-08-05c"
 #: Payloads either side of a boundary are not comparable without knowing which side they
 #: came from: an rx-1 row has no form at all, which is indistinguishable from a later row
 #: whose document printed none.
-SCHEMA_VERSION = "rx-3"
+#: rx-4 added ``key`` (a stable per-line id so a confirm screen can remember which
+#: medicines a user ticked) and ``medicine_id`` (null until the catalogue resolver lands).
+SCHEMA_VERSION = "rx-4"
 STAGE_NAME = "extracting_prescription"
 
 #: A prescription is short next to a lab panel — a dozen medicines with five fields each.
@@ -311,10 +315,55 @@ def extract_prescription(ctx: StageContext) -> None:
         )
         raise TransientStageError("prescription output failed validation") from exc
 
-    kept, rejected, loose, verified = _verify_against_document(document, result.medicines)
+    kept, rejected, loose, verified, source = _verify_against_document(document, result.medicines)
     payload = _build_payload(result, kept, rejected, verified, loose)
+    if source:
+        # Read provenance, not a routing input: extraction is vision, so a missing text
+        # layer is never a reason to extract less. It is here so a medicine that later
+        # turns out wrong can be traced to "the guard could not check it" without
+        # re-running the document. Same metadata section_extraction already stores.
+        payload["source"] = source
     _persist(ctx, payload)
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
+
+
+def record_handwritten(ctx: StageContext) -> None:
+    """The whole pipeline for a handwritten prescription: record that we did not read it.
+
+    A mostly-handwritten prescription is **not** sent to the model at all. Vision would
+    return something — it always does — and on a handwritten page there is nothing that
+    could check it: the name guard needs a text layer to reject with, and a photograph of
+    handwriting has none. So the one document where a misread is most likely is also the
+    one where every downstream check is blind, and a wrong dose reaching a medication
+    reminder is the failure this refuses to risk.
+
+    The document is still **filed**, deliberately. It is the user's prescription and belongs
+    in their Prescriptions section where they can see it; only the medicines are withheld,
+    with a flag telling the app to ask for the pharmacy bill instead — a printed bill lists
+    the same drugs and can be read safely.
+
+    No model call is made, so the process log records ``"skipped"`` as both provider and
+    model rather than claiming a call that never happened.
+    """
+    payload = {
+        "section": DocumentSection.PRESCRIPTIONS.value,
+        "fields": {"medicines": [], "prescribed_date": None, "prescriber": None},
+        "flags": [
+            {
+                "code": "handwritten_not_extracted",
+                "detail": (
+                    "This prescription is handwritten, so its medicines were not read "
+                    "automatically. Upload the pharmacy bill and we will read that instead."
+                ),
+            }
+        ],
+    }
+    _persist(ctx, payload)
+    _log(ctx, outcome="succeeded", duration_ms=0)
+    logger.info(
+        "prescription_handwritten_not_extracted",
+        extra={"item_id": str(ctx.item_id), "document_id": ctx.document_id},
+    )
 
 
 # --- the guard --------------------------------------------------------------
@@ -402,13 +451,15 @@ def _appears_in(name: str, haystack: str) -> str:
 
 def _verify_against_document(
     document: Any, rows: list[PrescribedMedicine]
-) -> tuple[list[PrescribedMedicine], list[str], list[str], bool]:
+) -> tuple[list[PrescribedMedicine], list[str], list[str], bool, dict[str, object]]:
     """Split *rows* into those the document's own text supports and those it does not.
 
-    Returns ``(kept, rejected, loose, verified)``. ``loose`` is the kept names the page
-    supported only in part — see ``_appears_in``. ``verified`` is False when the check
+    Returns ``(kept, rejected, loose, verified, source)``. ``loose`` is the kept names the
+    page supported only in part — see ``_appears_in``. ``verified`` is False when the check
     could not be made at all, which the caller records as a flag rather than passing off
-    as a pass.
+    as a pass. ``source`` is the read provenance (page counts, engine, confidence), stored
+    so a wrong medicine can later be traced to "the guard could not check it" without
+    re-running the document — the same metadata ``section_extraction`` already keeps.
 
     **Only a text layer is trusted to reject with.** A rejection deletes a prescribed
     medicine, so the text it rests on has to be at least as reliable as the model. An
@@ -431,7 +482,7 @@ def _verify_against_document(
     if not rows:
         # Nothing to check costs nothing to check — and skips an OCR pass on an image,
         # which is most of the time this stage would otherwise spend.
-        return [], [], [], True
+        return [], [], [], True, {}
 
     try:
         # Text layer only. This guard will not reject a drug name on OCR output (see
@@ -441,7 +492,7 @@ def _verify_against_document(
         extracted = extract_text(document, allow_ocr=False)
     except TextExtractionError:
         logger.warning("document could not be read as text - prescription names unchecked")
-        return rows, [], [], False
+        return rows, [], [], False, {}
 
     unread = sum(1 for page in extracted.pages if page.method == "skipped")
     if unread or not extracted.text.strip():
@@ -450,7 +501,7 @@ def _verify_against_document(
             unread,
             extracted.page_count,
         )
-        return rows, [], [], False
+        return rows, [], [], False, extracted.as_metadata()
 
     haystack = _normalise(extracted.text)
     kept: list[PrescribedMedicine] = []
@@ -479,7 +530,7 @@ def _verify_against_document(
         logger.warning("%r is not on the document - dropped", name)
     for name in loose:
         logger.info("%r matched the page only in part - kept and flagged", name)
-    return kept, rejected, loose, True
+    return kept, rejected, loose, True, extracted.as_metadata()
 
 
 # --- payload ----------------------------------------------------------------
@@ -510,6 +561,37 @@ def _resolve_form(row: PrescribedMedicine) -> str | None:
     return medicines.normalize_form(row.name_as_written)
 
 
+def _medicine_key(row: PrescribedMedicine, seen: Counter[tuple[str, str, str]]) -> str:
+    """A stable id for one prescribed line, so a confirm screen can remember it.
+
+    Content-derived rather than positional or random, and each alternative fails for its
+    own reason:
+
+    - **Position in the list** breaks because the prompt requires one entry per printed
+      line *even when name and strength repeat exactly* — a consolidated bill bills the
+      same drug three times — and the payload is upserted on SQS redelivery. A re-run can
+      drop or keep a row through the name guard, so an index recorded at confirm time can
+      later address a different medicine.
+    - **A minted UUID** breaks because a re-run mints new ones and every stored reference
+      dangles.
+
+    So: the transcription itself, plus how many identical ones came before it. Stable
+    across a re-read whenever the model read the page the same way, and changing exactly
+    when the transcription changed — which is correct, because the thing that was
+    confirmed genuinely no longer exists.
+
+    Honest limit: this identifies a *transcription*, not a drug. Spring must therefore copy
+    the name and schedule onto its own row at confirm time — which its schema already
+    forces, ``medicine_tracking.name`` being NOT NULL — so a stale key costs a broken
+    back-link and never a lost medication.
+    """
+    identity = (row.name_as_written, row.strength or "", row.frequency_raw or "")
+    ordinal = seen[identity]
+    seen[identity] += 1
+    digest = sha256("\x1f".join((*identity, str(ordinal))).encode("utf-8"))
+    return digest.hexdigest()[:10]
+
+
 def _build_payload(
     result: PrescriptionFields,
     kept: list[PrescribedMedicine],
@@ -523,10 +605,16 @@ def _build_payload(
     handles a prescription the same way it handles insurance or a vaccination card.
     """
     rows: list[dict[str, Any]] = []
+    seen: Counter[tuple[str, str, str]] = Counter()
     for row in kept:
         data = row.model_dump()
         data["frequency_normalized"] = medicines.normalize_frequency(row.frequency_raw)
         data["form_normalized"] = _resolve_form(row)
+        data["key"] = _medicine_key(row, seen)
+        #: Filled by the catalogue resolver when that lands; null until then, and null is
+        #: the ordinary answer even after — a brand the catalogue does not carry is not an
+        #: error. Emitted unconditionally so the shape never branches on a setting.
+        data["medicine_id"] = None
         rows.append(data)
 
     flags: list[dict[str, Any]] = []
