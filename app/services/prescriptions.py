@@ -66,7 +66,7 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "rx-2026-08-05c"
+PROMPT_VERSION = "rx-2026-08-07"
 #: rx-3 added ``form``, the model's own classification into the nine, used only where the
 #: lookup table has nothing to say. rx-2 added ``form_raw`` and ``form_normalized``.
 #: Payloads either side of a boundary are not comparable without knowing which side they
@@ -74,7 +74,10 @@ PROMPT_VERSION = "rx-2026-08-05c"
 #: whose document printed none.
 #: rx-4 added ``key`` (a stable per-line id so a confirm screen can remember which
 #: medicines a user ticked) and ``medicine_id`` (null until the catalogue resolver lands).
-SCHEMA_VERSION = "rx-4"
+#: rx-5 added ``intake_instruction``: a document that prints food timing in its own table
+#: column was losing it entirely, because the only place the prompt asked for it was
+#: inside ``frequency_raw``.
+SCHEMA_VERSION = "rx-5"
 STAGE_NAME = "extracting_prescription"
 
 #: A prescription is short next to a lab panel — a dozen medicines with five fields each.
@@ -105,6 +108,12 @@ class PrescribedMedicine(BaseModel):
     strength: str | None = Field(default=None, max_length=128)
     composition: str | None = Field(default=None, max_length=512)
     frequency_raw: str | None = Field(default=None, max_length=256)
+    #: When to take it relative to food, when the document states that SEPARATELY from the
+    #: dosing — commonly its own table column headed "Intake Instruction". Without this
+    #: field the value had nowhere to go: rule 10 tells the model to read a table by its
+    #: columns, so it correctly took the dosing column and correctly left this one alone,
+    #: and "Post Meal" was lost on every document that prints it this way.
+    intake_instruction: str | None = Field(default=None, max_length=128)
     duration: str | None = Field(default=None, max_length=128)
 
     @field_validator("form")
@@ -164,6 +173,7 @@ PRESCRIPTION_JSON_SCHEMA: dict[str, Any] = {
                     "strength": _NULLABLE_STR,
                     "composition": _NULLABLE_STR,
                     "frequency_raw": _NULLABLE_STR,
+                    "intake_instruction": _NULLABLE_STR,
                     "duration": _NULLABLE_STR,
                 },
                 "required": [
@@ -174,6 +184,7 @@ PRESCRIPTION_JSON_SCHEMA: dict[str, Any] = {
                     "strength",
                     "composition",
                     "frequency_raw",
+                    "intake_instruction",
                     "duration",
                 ],
                 "additionalProperties": False,
@@ -240,6 +251,13 @@ SYSTEM_PROMPT = (
     "the sentence: '1-0-1', 'BD', 'Alternate day', 'Twice Daily ( 1/2 - 0 - 0 - 1/2 ) "
     "Tablet Orally Before Food'. Keep any food timing (before/after food, empty stomach), "
     "route, and fractional dose — do not stop at the dose matrix.\n"
+    "11a. intake_instruction is when to take it RELATIVE TO FOOD, when the document gives "
+    "that separately from the dosing — many prescriptions print it as its own table "
+    "column, headed 'Intake Instruction', 'Intake', 'Instruction' or 'Timing', with values "
+    "like 'Post Meal', 'After Food', 'Before Food', 'Empty Stomach', 'With Milk'. Copy that "
+    "cell for the medicine's own row. If the food timing is already inside frequency_raw "
+    "and there is no separate column, repeat it here anyway. Null when the document says "
+    "nothing about food.\n"
     "12. Copy a dose matrix slot for slot. '1 - 0 - 0 - 1' has four slots and must come "
     "back with four; do not condense it to '1 - 0 - 1' or drop a zero. The slot count is "
     "what says which time of day a dose falls on — four slots read morning/afternoon/"
@@ -608,7 +626,13 @@ def _build_payload(
     seen: Counter[tuple[str, str, str]] = Counter()
     for row in kept:
         data = row.model_dump()
-        data["frequency_normalized"] = medicines.normalize_frequency(row.frequency_raw)
+        # Normalised from the dosing AND the intake instruction together, because on a
+        # table that splits them the food timing lives in the other column: "Once a day"
+        # + "Post Meal" reads as one sentence and `with_food` falls out of it. The two
+        # fields stay separate in storage — this only joins them for parsing.
+        data["frequency_normalized"] = medicines.normalize_frequency(
+            " ".join(part for part in (row.frequency_raw, row.intake_instruction) if part) or None
+        )
         data["form_normalized"] = _resolve_form(row)
         data["key"] = _medicine_key(row, seen)
         #: Filled by the catalogue resolver when that lands; null until then, and null is
