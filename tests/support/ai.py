@@ -105,7 +105,10 @@ def prescription_payload(**overrides: Any) -> dict[str, Any]:
                 "form_raw": "Tab.",
                 "strength": "650mg",
                 "composition": "Paracetamol (650mg)",
-                "frequency_raw": "1-0-1 after food",
+                "frequency_raw": "1-0-1",
+                # Its own column on the real document this is modelled on, which is why
+                # the dosing here no longer carries the food timing.
+                "intake_instruction": "Post Meal",
                 "duration": "5 days",
             }
         ],

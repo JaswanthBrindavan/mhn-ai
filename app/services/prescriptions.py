@@ -9,17 +9,19 @@ validate with Pydantic (never repaired), check every name against the document's
 normalise the dosing notation in Python (never the model), then persist to
 ``ai_section_extractions`` and log.
 
-**The document goes to the model, not its OCR text** — the report pipeline's approach
-rather than the section pipeline's. A prescription is a layout: medicines in a table,
-dosing in a column beside them, a strength on its own line under a name. OCR flattens
-that, and a dose in the wrong row is a dosing error rather than a missing field. Many are
-also photographs of paper, where there is no text layer to flatten in the first place.
+**The document itself goes to the model** — the report pipeline's approach rather than the
+section pipeline's. A prescription is a layout: medicines in a table, dosing in a column
+beside them, a strength on its own line under a name. Flattening it to text puts a dose on
+the wrong row, which is a dosing error rather than a missing field. **No OCR runs anywhere
+in this stage.**
 
 **Names are verified against the document.** This is the one guard that makes a model
 acceptable near a drug name. Asked to read an illegible page, a model produces a
 *plausible* name — and plausible-but-wrong is the worst failure here, because a
 hallucinated drug is usually a real drug, so nothing downstream can catch it. A name the
-document does not contain is dropped and counted, not stored.
+document does not contain is dropped and counted, not stored. The guard reads the
+document's **embedded text layer** for this — text, not OCR; a page without one is
+reported as unchecked rather than checked badly.
 
 **Dosing is normalised in Python.** ``medicines.normalize_frequency`` turns "1/2 - 0 - 1/2"
 into half a tablet morning and night. The model transcribes; it never does the arithmetic.
@@ -66,7 +68,7 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "rx-2026-08-05c"
+PROMPT_VERSION = "rx-2026-08-07"
 #: rx-3 added ``form``, the model's own classification into the nine, used only where the
 #: lookup table has nothing to say. rx-2 added ``form_raw`` and ``form_normalized``.
 #: Payloads either side of a boundary are not comparable without knowing which side they
@@ -74,7 +76,10 @@ PROMPT_VERSION = "rx-2026-08-05c"
 #: whose document printed none.
 #: rx-4 added ``key`` (a stable per-line id so a confirm screen can remember which
 #: medicines a user ticked) and ``medicine_id`` (null until the catalogue resolver lands).
-SCHEMA_VERSION = "rx-4"
+#: rx-5 added ``intake_instruction``: a document that prints food timing in its own table
+#: column was losing it entirely, because the only place the prompt asked for it was
+#: inside ``frequency_raw``.
+SCHEMA_VERSION = "rx-5"
 STAGE_NAME = "extracting_prescription"
 
 #: A prescription is short next to a lab panel — a dozen medicines with five fields each.
@@ -105,6 +110,12 @@ class PrescribedMedicine(BaseModel):
     strength: str | None = Field(default=None, max_length=128)
     composition: str | None = Field(default=None, max_length=512)
     frequency_raw: str | None = Field(default=None, max_length=256)
+    #: When to take it relative to food, when the document states that SEPARATELY from the
+    #: dosing — commonly its own table column headed "Intake Instruction". Without this
+    #: field the value had nowhere to go: rule 10 tells the model to read a table by its
+    #: columns, so it correctly took the dosing column and correctly left this one alone,
+    #: and "Post Meal" was lost on every document that prints it this way.
+    intake_instruction: str | None = Field(default=None, max_length=128)
     duration: str | None = Field(default=None, max_length=128)
 
     @field_validator("form")
@@ -164,6 +175,7 @@ PRESCRIPTION_JSON_SCHEMA: dict[str, Any] = {
                     "strength": _NULLABLE_STR,
                     "composition": _NULLABLE_STR,
                     "frequency_raw": _NULLABLE_STR,
+                    "intake_instruction": _NULLABLE_STR,
                     "duration": _NULLABLE_STR,
                 },
                 "required": [
@@ -174,6 +186,7 @@ PRESCRIPTION_JSON_SCHEMA: dict[str, Any] = {
                     "strength",
                     "composition",
                     "frequency_raw",
+                    "intake_instruction",
                     "duration",
                 ],
                 "additionalProperties": False,
@@ -240,6 +253,13 @@ SYSTEM_PROMPT = (
     "the sentence: '1-0-1', 'BD', 'Alternate day', 'Twice Daily ( 1/2 - 0 - 0 - 1/2 ) "
     "Tablet Orally Before Food'. Keep any food timing (before/after food, empty stomach), "
     "route, and fractional dose — do not stop at the dose matrix.\n"
+    "11a. intake_instruction is when to take it RELATIVE TO FOOD, when the document gives "
+    "that separately from the dosing — many prescriptions print it as its own table "
+    "column, headed 'Intake Instruction', 'Intake', 'Instruction' or 'Timing', with values "
+    "like 'Post Meal', 'After Food', 'Before Food', 'Empty Stomach', 'With Milk'. Copy that "
+    "cell for the medicine's own row. If the food timing is already inside frequency_raw "
+    "and there is no separate column, repeat it here anyway. Null when the document says "
+    "nothing about food.\n"
     "12. Copy a dose matrix slot for slot. '1 - 0 - 0 - 1' has four slots and must come "
     "back with four; do not condense it to '1 - 0 - 1' or drop a zero. The slot count is "
     "what says which time of day a dose falls on — four slots read morning/afternoon/"
@@ -461,34 +481,23 @@ def _verify_against_document(
     so a wrong medicine can later be traced to "the guard could not check it" without
     re-running the document — the same metadata ``section_extraction`` already keeps.
 
-    **Only a text layer is trusted to reject with.** A rejection deletes a prescribed
-    medicine, so the text it rests on has to be at least as reliable as the model. An
-    embedded text layer is exact and qualifies. OCR of a photograph does not: measured on
-    this corpus, Tesseract read one prescription as 448 characters at 0.77 confidence and
-    lost the brand name outright, and on another found neither drug name on the page.
-    Checking against that does not catch inventions — it invents rejections, and drops a
-    real medicine silently, which is the worse of the two failures. A caller can act on a
-    flag saying "not verified"; nobody can act on a medicine that is no longer there.
-
-    So on an OCR'd document every row is kept and the payload says the names went
-    unchecked. The guard still does its work where it can actually be trusted, which is
-    every digital PDF — and those are the documents where a model has enough text to
-    hallucinate plausibly from in the first place.
+    **Only the document's embedded text layer is trusted to reject with**, because a
+    rejection deletes a prescribed medicine and the text it rests on has to be at least as
+    reliable as the model. A page with no text layer is not checked at all: every row is
+    kept and the payload says so. A caller can act on "not verified"; nobody can act on a
+    medicine that is no longer there.
     """
-    # A name with no drug in it is dropped whatever the document says, so this runs
-    # before the text is read and needs no OCR pass to decide.
+    # A name with no drug in it is dropped whatever the document says, so this needs no
+    # text at all and runs first.
     rows = [row for row in rows if _has_drug_identity(row.name_clean)]
 
     if not rows:
-        # Nothing to check costs nothing to check — and skips an OCR pass on an image,
-        # which is most of the time this stage would otherwise spend.
         return [], [], [], True, {}
 
     try:
-        # Text layer only. This guard will not reject a drug name on OCR output (see
-        # above), so running Tesseract here would be a full pass bought to be thrown
-        # away — and a photographed prescription, the common case, is the slowest one.
-        # A page that would have needed OCR comes back "skipped" and carries no text.
+        # Text layer only, never OCR: this guard rejects nothing without text it can trust,
+        # so reading a photograph would cost a full pass to arrive at "cannot verify".
+        # A page with no text layer comes back "skipped" and carries none.
         extracted = extract_text(document, allow_ocr=False)
     except TextExtractionError:
         logger.warning("document could not be read as text - prescription names unchecked")
@@ -592,6 +601,11 @@ def _medicine_key(row: PrescribedMedicine, seen: Counter[tuple[str, str, str]]) 
     return digest.hexdigest()[:10]
 
 
+def _count(items: list[str], noun: str) -> str:
+    """ "1 medicine" / "3 medicines" — so a flag reads as a sentence rather than a count."""
+    return f"{len(items)} {noun}" if len(items) == 1 else f"{len(items)} {noun}s"
+
+
 def _build_payload(
     result: PrescriptionFields,
     kept: list[PrescribedMedicine],
@@ -608,7 +622,13 @@ def _build_payload(
     seen: Counter[tuple[str, str, str]] = Counter()
     for row in kept:
         data = row.model_dump()
-        data["frequency_normalized"] = medicines.normalize_frequency(row.frequency_raw)
+        # Normalised from the dosing AND the intake instruction together, because on a
+        # table that splits them the food timing lives in the other column: "Once a day"
+        # + "Post Meal" reads as one sentence and `with_food` falls out of it. The two
+        # fields stay separate in storage — this only joins them for parsing.
+        data["frequency_normalized"] = medicines.normalize_frequency(
+            " ".join(part for part in (row.frequency_raw, row.intake_instruction) if part) or None
+        )
         data["form_normalized"] = _resolve_form(row)
         data["key"] = _medicine_key(row, seen)
         #: Filled by the catalogue resolver when that lands; null until then, and null is
@@ -617,27 +637,69 @@ def _build_payload(
         data["medicine_id"] = None
         rows.append(data)
 
+    # Every flag carries a `detail` sentence as well as its structured data. `detail` is
+    # what the app renders, and four of these five used to omit it — so a prescription with
+    # any of them showed the reader the word "undefined" where the explanation should be.
+    # The structured lists stay for anything that wants to act on them rather than read
+    # them.
     flags: list[dict[str, Any]] = []
     if rejected:
         # Surfaced rather than swallowed: a name the model produced that the page does not
         # contain is the failure mode this stage most needs to be visible.
-        flags.append({"code": "names_not_on_document", "names": rejected})
+        flags.append(
+            {
+                "code": "names_not_on_document",
+                "names": rejected,
+                "detail": (
+                    f"{_count(rejected, 'medicine')} could not be found anywhere on the "
+                    f"document and {'has' if len(rejected) == 1 else 'have'} been left "
+                    f"out: {', '.join(rejected)}."
+                ),
+            }
+        )
     if not verified:
         # The medicines below were not checked against the page. Says so plainly rather
-        # than letting an unverified result look like a verified one — see
-        # ``_verify_against_document`` for why an OCR'd page cannot reject.
-        flags.append({"code": "names_unverified", "reason": "no reliable text layer"})
+        # than letting an unverified result look like a verified one.
+        flags.append(
+            {
+                "code": "names_unverified",
+                "reason": "no reliable text layer",
+                "detail": (
+                    "The medicine names could not be checked against the document, which "
+                    "has no readable text layer. Compare them with the original."
+                ),
+            }
+        )
     if loose:
         # Kept, but the page did not literally contain the name — only most of its parts,
         # and the parts a name is split into exclude anything under three characters. That
         # is exactly where PAN-D and PANTOP become the same answer, so it is said out loud
         # rather than counted as verified.
-        flags.append({"code": "names_matched_loosely", "names": loose})
+        flags.append(
+            {
+                "code": "names_matched_loosely",
+                "names": loose,
+                "detail": (
+                    f"{_count(loose, 'name')} did not appear on the document exactly, only "
+                    f"in part. Worth checking against the original: {', '.join(loose)}."
+                ),
+            }
+        )
     unparsed = [
         r["frequency_raw"] for r in rows if r["frequency_raw"] and not r["frequency_normalized"]
     ]
     if unparsed:
-        flags.append({"code": "frequency_not_normalized", "values": unparsed})
+        flags.append(
+            {
+                "code": "frequency_not_normalized",
+                "values": unparsed,
+                "detail": (
+                    f"The dosing for {_count(unparsed, 'medicine')} could not be read into "
+                    f"a schedule, so the document's own wording is shown instead: "
+                    f"{', '.join(unparsed)}."
+                ),
+            }
+        )
 
     return {
         "section": DocumentSection.PRESCRIPTIONS.value,
