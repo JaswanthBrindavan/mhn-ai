@@ -9,17 +9,19 @@ validate with Pydantic (never repaired), check every name against the document's
 normalise the dosing notation in Python (never the model), then persist to
 ``ai_section_extractions`` and log.
 
-**The document goes to the model, not its OCR text** — the report pipeline's approach
-rather than the section pipeline's. A prescription is a layout: medicines in a table,
-dosing in a column beside them, a strength on its own line under a name. OCR flattens
-that, and a dose in the wrong row is a dosing error rather than a missing field. Many are
-also photographs of paper, where there is no text layer to flatten in the first place.
+**The document itself goes to the model** — the report pipeline's approach rather than the
+section pipeline's. A prescription is a layout: medicines in a table, dosing in a column
+beside them, a strength on its own line under a name. Flattening it to text puts a dose on
+the wrong row, which is a dosing error rather than a missing field. **No OCR runs anywhere
+in this stage.**
 
 **Names are verified against the document.** This is the one guard that makes a model
 acceptable near a drug name. Asked to read an illegible page, a model produces a
 *plausible* name — and plausible-but-wrong is the worst failure here, because a
 hallucinated drug is usually a real drug, so nothing downstream can catch it. A name the
-document does not contain is dropped and counted, not stored.
+document does not contain is dropped and counted, not stored. The guard reads the
+document's **embedded text layer** for this — text, not OCR; a page without one is
+reported as unchecked rather than checked badly.
 
 **Dosing is normalised in Python.** ``medicines.normalize_frequency`` turns "1/2 - 0 - 1/2"
 into half a tablet morning and night. The model transcribes; it never does the arithmetic.
@@ -479,34 +481,23 @@ def _verify_against_document(
     so a wrong medicine can later be traced to "the guard could not check it" without
     re-running the document — the same metadata ``section_extraction`` already keeps.
 
-    **Only a text layer is trusted to reject with.** A rejection deletes a prescribed
-    medicine, so the text it rests on has to be at least as reliable as the model. An
-    embedded text layer is exact and qualifies. OCR of a photograph does not: measured on
-    this corpus, Tesseract read one prescription as 448 characters at 0.77 confidence and
-    lost the brand name outright, and on another found neither drug name on the page.
-    Checking against that does not catch inventions — it invents rejections, and drops a
-    real medicine silently, which is the worse of the two failures. A caller can act on a
-    flag saying "not verified"; nobody can act on a medicine that is no longer there.
-
-    So on an OCR'd document every row is kept and the payload says the names went
-    unchecked. The guard still does its work where it can actually be trusted, which is
-    every digital PDF — and those are the documents where a model has enough text to
-    hallucinate plausibly from in the first place.
+    **Only the document's embedded text layer is trusted to reject with**, because a
+    rejection deletes a prescribed medicine and the text it rests on has to be at least as
+    reliable as the model. A page with no text layer is not checked at all: every row is
+    kept and the payload says so. A caller can act on "not verified"; nobody can act on a
+    medicine that is no longer there.
     """
-    # A name with no drug in it is dropped whatever the document says, so this runs
-    # before the text is read and needs no OCR pass to decide.
+    # A name with no drug in it is dropped whatever the document says, so this needs no
+    # text at all and runs first.
     rows = [row for row in rows if _has_drug_identity(row.name_clean)]
 
     if not rows:
-        # Nothing to check costs nothing to check — and skips an OCR pass on an image,
-        # which is most of the time this stage would otherwise spend.
         return [], [], [], True, {}
 
     try:
-        # Text layer only. This guard will not reject a drug name on OCR output (see
-        # above), so running Tesseract here would be a full pass bought to be thrown
-        # away — and a photographed prescription, the common case, is the slowest one.
-        # A page that would have needed OCR comes back "skipped" and carries no text.
+        # Text layer only, never OCR: this guard rejects nothing without text it can trust,
+        # so reading a photograph would cost a full pass to arrive at "cannot verify".
+        # A page with no text layer comes back "skipped" and carries none.
         extracted = extract_text(document, allow_ocr=False)
     except TextExtractionError:
         logger.warning("document could not be read as text - prescription names unchecked")
@@ -668,8 +659,7 @@ def _build_payload(
         )
     if not verified:
         # The medicines below were not checked against the page. Says so plainly rather
-        # than letting an unverified result look like a verified one — see
-        # ``_verify_against_document`` for why an OCR'd page cannot reject.
+        # than letting an unverified result look like a verified one.
         flags.append(
             {
                 "code": "names_unverified",
