@@ -41,7 +41,9 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import logging
 import re
 import time
+from collections import Counter
 from functools import partial
+from hashlib import sha256
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -70,7 +72,9 @@ PROMPT_VERSION = "rx-2026-08-05c"
 #: Payloads either side of a boundary are not comparable without knowing which side they
 #: came from: an rx-1 row has no form at all, which is indistinguishable from a later row
 #: whose document printed none.
-SCHEMA_VERSION = "rx-3"
+#: rx-4 added ``key`` (a stable per-line id so a confirm screen can remember which
+#: medicines a user ticked) and ``medicine_id`` (null until the catalogue resolver lands).
+SCHEMA_VERSION = "rx-4"
 STAGE_NAME = "extracting_prescription"
 
 #: A prescription is short next to a lab panel — a dozen medicines with five fields each.
@@ -557,6 +561,37 @@ def _resolve_form(row: PrescribedMedicine) -> str | None:
     return medicines.normalize_form(row.name_as_written)
 
 
+def _medicine_key(row: PrescribedMedicine, seen: Counter[tuple[str, str, str]]) -> str:
+    """A stable id for one prescribed line, so a confirm screen can remember it.
+
+    Content-derived rather than positional or random, and each alternative fails for its
+    own reason:
+
+    - **Position in the list** breaks because the prompt requires one entry per printed
+      line *even when name and strength repeat exactly* — a consolidated bill bills the
+      same drug three times — and the payload is upserted on SQS redelivery. A re-run can
+      drop or keep a row through the name guard, so an index recorded at confirm time can
+      later address a different medicine.
+    - **A minted UUID** breaks because a re-run mints new ones and every stored reference
+      dangles.
+
+    So: the transcription itself, plus how many identical ones came before it. Stable
+    across a re-read whenever the model read the page the same way, and changing exactly
+    when the transcription changed — which is correct, because the thing that was
+    confirmed genuinely no longer exists.
+
+    Honest limit: this identifies a *transcription*, not a drug. Spring must therefore copy
+    the name and schedule onto its own row at confirm time — which its schema already
+    forces, ``medicine_tracking.name`` being NOT NULL — so a stale key costs a broken
+    back-link and never a lost medication.
+    """
+    identity = (row.name_as_written, row.strength or "", row.frequency_raw or "")
+    ordinal = seen[identity]
+    seen[identity] += 1
+    digest = sha256("\x1f".join((*identity, str(ordinal))).encode("utf-8"))
+    return digest.hexdigest()[:10]
+
+
 def _build_payload(
     result: PrescriptionFields,
     kept: list[PrescribedMedicine],
@@ -570,10 +605,16 @@ def _build_payload(
     handles a prescription the same way it handles insurance or a vaccination card.
     """
     rows: list[dict[str, Any]] = []
+    seen: Counter[tuple[str, str, str]] = Counter()
     for row in kept:
         data = row.model_dump()
         data["frequency_normalized"] = medicines.normalize_frequency(row.frequency_raw)
         data["form_normalized"] = _resolve_form(row)
+        data["key"] = _medicine_key(row, seen)
+        #: Filled by the catalogue resolver when that lands; null until then, and null is
+        #: the ordinary answer even after — a brand the catalogue does not carry is not an
+        #: error. Emitted unconditionally so the shape never branches on a setting.
+        data["medicine_id"] = None
         rows.append(data)
 
     flags: list[dict[str, Any]] = []
