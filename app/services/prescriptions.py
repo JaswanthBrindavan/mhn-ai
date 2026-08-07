@@ -311,10 +311,55 @@ def extract_prescription(ctx: StageContext) -> None:
         )
         raise TransientStageError("prescription output failed validation") from exc
 
-    kept, rejected, loose, verified = _verify_against_document(document, result.medicines)
+    kept, rejected, loose, verified, source = _verify_against_document(document, result.medicines)
     payload = _build_payload(result, kept, rejected, verified, loose)
+    if source:
+        # Read provenance, not a routing input: extraction is vision, so a missing text
+        # layer is never a reason to extract less. It is here so a medicine that later
+        # turns out wrong can be traced to "the guard could not check it" without
+        # re-running the document. Same metadata section_extraction already stores.
+        payload["source"] = source
     _persist(ctx, payload)
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
+
+
+def record_handwritten(ctx: StageContext) -> None:
+    """The whole pipeline for a handwritten prescription: record that we did not read it.
+
+    A mostly-handwritten prescription is **not** sent to the model at all. Vision would
+    return something — it always does — and on a handwritten page there is nothing that
+    could check it: the name guard needs a text layer to reject with, and a photograph of
+    handwriting has none. So the one document where a misread is most likely is also the
+    one where every downstream check is blind, and a wrong dose reaching a medication
+    reminder is the failure this refuses to risk.
+
+    The document is still **filed**, deliberately. It is the user's prescription and belongs
+    in their Prescriptions section where they can see it; only the medicines are withheld,
+    with a flag telling the app to ask for the pharmacy bill instead — a printed bill lists
+    the same drugs and can be read safely.
+
+    No model call is made, so the process log records ``"skipped"`` as both provider and
+    model rather than claiming a call that never happened.
+    """
+    payload = {
+        "section": DocumentSection.PRESCRIPTIONS.value,
+        "fields": {"medicines": [], "prescribed_date": None, "prescriber": None},
+        "flags": [
+            {
+                "code": "handwritten_not_extracted",
+                "detail": (
+                    "This prescription is handwritten, so its medicines were not read "
+                    "automatically. Upload the pharmacy bill and we will read that instead."
+                ),
+            }
+        ],
+    }
+    _persist(ctx, payload)
+    _log(ctx, outcome="succeeded", duration_ms=0)
+    logger.info(
+        "prescription_handwritten_not_extracted",
+        extra={"item_id": str(ctx.item_id), "document_id": ctx.document_id},
+    )
 
 
 # --- the guard --------------------------------------------------------------
@@ -402,13 +447,15 @@ def _appears_in(name: str, haystack: str) -> str:
 
 def _verify_against_document(
     document: Any, rows: list[PrescribedMedicine]
-) -> tuple[list[PrescribedMedicine], list[str], list[str], bool]:
+) -> tuple[list[PrescribedMedicine], list[str], list[str], bool, dict[str, object]]:
     """Split *rows* into those the document's own text supports and those it does not.
 
-    Returns ``(kept, rejected, loose, verified)``. ``loose`` is the kept names the page
-    supported only in part — see ``_appears_in``. ``verified`` is False when the check
+    Returns ``(kept, rejected, loose, verified, source)``. ``loose`` is the kept names the
+    page supported only in part — see ``_appears_in``. ``verified`` is False when the check
     could not be made at all, which the caller records as a flag rather than passing off
-    as a pass.
+    as a pass. ``source`` is the read provenance (page counts, engine, confidence), stored
+    so a wrong medicine can later be traced to "the guard could not check it" without
+    re-running the document — the same metadata ``section_extraction`` already keeps.
 
     **Only a text layer is trusted to reject with.** A rejection deletes a prescribed
     medicine, so the text it rests on has to be at least as reliable as the model. An
@@ -431,7 +478,7 @@ def _verify_against_document(
     if not rows:
         # Nothing to check costs nothing to check — and skips an OCR pass on an image,
         # which is most of the time this stage would otherwise spend.
-        return [], [], [], True
+        return [], [], [], True, {}
 
     try:
         # Text layer only. This guard will not reject a drug name on OCR output (see
@@ -441,7 +488,7 @@ def _verify_against_document(
         extracted = extract_text(document, allow_ocr=False)
     except TextExtractionError:
         logger.warning("document could not be read as text - prescription names unchecked")
-        return rows, [], [], False
+        return rows, [], [], False, {}
 
     unread = sum(1 for page in extracted.pages if page.method == "skipped")
     if unread or not extracted.text.strip():
@@ -450,7 +497,7 @@ def _verify_against_document(
             unread,
             extracted.page_count,
         )
-        return rows, [], [], False
+        return rows, [], [], False, extracted.as_metadata()
 
     haystack = _normalise(extracted.text)
     kept: list[PrescribedMedicine] = []
@@ -479,7 +526,7 @@ def _verify_against_document(
         logger.warning("%r is not on the document - dropped", name)
     for name in loose:
         logger.info("%r matched the page only in part - kept and flagged", name)
-    return kept, rejected, loose, True
+    return kept, rejected, loose, True, extracted.as_metadata()
 
 
 # --- payload ----------------------------------------------------------------
