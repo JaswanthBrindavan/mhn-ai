@@ -610,6 +610,11 @@ def _medicine_key(row: PrescribedMedicine, seen: Counter[tuple[str, str, str]]) 
     return digest.hexdigest()[:10]
 
 
+def _count(items: list[str], noun: str) -> str:
+    """ "1 medicine" / "3 medicines" — so a flag reads as a sentence rather than a count."""
+    return f"{len(items)} {noun}" if len(items) == 1 else f"{len(items)} {noun}s"
+
+
 def _build_payload(
     result: PrescriptionFields,
     kept: list[PrescribedMedicine],
@@ -641,27 +646,70 @@ def _build_payload(
         data["medicine_id"] = None
         rows.append(data)
 
+    # Every flag carries a `detail` sentence as well as its structured data. `detail` is
+    # what the app renders, and four of these five used to omit it — so a prescription with
+    # any of them showed the reader the word "undefined" where the explanation should be.
+    # The structured lists stay for anything that wants to act on them rather than read
+    # them.
     flags: list[dict[str, Any]] = []
     if rejected:
         # Surfaced rather than swallowed: a name the model produced that the page does not
         # contain is the failure mode this stage most needs to be visible.
-        flags.append({"code": "names_not_on_document", "names": rejected})
+        flags.append(
+            {
+                "code": "names_not_on_document",
+                "names": rejected,
+                "detail": (
+                    f"{_count(rejected, 'medicine')} could not be found anywhere on the "
+                    f"document and {'has' if len(rejected) == 1 else 'have'} been left "
+                    f"out: {', '.join(rejected)}."
+                ),
+            }
+        )
     if not verified:
         # The medicines below were not checked against the page. Says so plainly rather
         # than letting an unverified result look like a verified one — see
         # ``_verify_against_document`` for why an OCR'd page cannot reject.
-        flags.append({"code": "names_unverified", "reason": "no reliable text layer"})
+        flags.append(
+            {
+                "code": "names_unverified",
+                "reason": "no reliable text layer",
+                "detail": (
+                    "The medicine names could not be checked against the document, which "
+                    "has no readable text layer. Compare them with the original."
+                ),
+            }
+        )
     if loose:
         # Kept, but the page did not literally contain the name — only most of its parts,
         # and the parts a name is split into exclude anything under three characters. That
         # is exactly where PAN-D and PANTOP become the same answer, so it is said out loud
         # rather than counted as verified.
-        flags.append({"code": "names_matched_loosely", "names": loose})
+        flags.append(
+            {
+                "code": "names_matched_loosely",
+                "names": loose,
+                "detail": (
+                    f"{_count(loose, 'name')} did not appear on the document exactly, only "
+                    f"in part. Worth checking against the original: {', '.join(loose)}."
+                ),
+            }
+        )
     unparsed = [
         r["frequency_raw"] for r in rows if r["frequency_raw"] and not r["frequency_normalized"]
     ]
     if unparsed:
-        flags.append({"code": "frequency_not_normalized", "values": unparsed})
+        flags.append(
+            {
+                "code": "frequency_not_normalized",
+                "values": unparsed,
+                "detail": (
+                    f"The dosing for {_count(unparsed, 'medicine')} could not be read into "
+                    f"a schedule, so the document's own wording is shown instead: "
+                    f"{', '.join(unparsed)}."
+                ),
+            }
+        )
 
     return {
         "section": DocumentSection.PRESCRIPTIONS.value,

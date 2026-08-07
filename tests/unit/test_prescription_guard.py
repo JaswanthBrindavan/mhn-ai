@@ -208,7 +208,12 @@ def test_a_form_outside_the_nine_is_discarded_on_the_way_in() -> None:
 def test_a_rejected_name_is_flagged_not_silently_dropped() -> None:
     result = PrescriptionFields(medicines=[], prescribed_date=None, prescriber=None)
     payload = _build_payload(result, [], ["Warfarin 5mg"])
-    assert payload["flags"] == [{"code": "names_not_on_document", "names": ["Warfarin 5mg"]}]
+    [flag] = payload["flags"]
+    assert flag["code"] == "names_not_on_document"
+    assert flag["names"] == ["Warfarin 5mg"]
+    # The dropped name has to appear in the sentence a person reads, not only in the
+    # structured list — `detail` is the only part the app renders.
+    assert "Warfarin 5mg" in flag["detail"]
 
 
 def test_a_loosely_matched_name_is_kept_and_said_out_loud() -> None:
@@ -219,7 +224,10 @@ def test_a_loosely_matched_name_is_kept_and_said_out_loud() -> None:
     """
     result = PrescriptionFields(medicines=[medicine()], prescribed_date=None, prescriber=None)
     payload = _build_payload(result, list(result.medicines), [], loose=["PAN-D"])
-    assert payload["flags"] == [{"code": "names_matched_loosely", "names": ["PAN-D"]}]
+    [flag] = payload["flags"]
+    assert flag["code"] == "names_matched_loosely"
+    assert flag["names"] == ["PAN-D"]
+    assert "PAN-D" in flag["detail"]
     # Kept, not dropped.
     assert len(payload["fields"]["medicines"]) == 1
 
@@ -243,3 +251,36 @@ def test_an_unnormalisable_frequency_is_flagged_and_kept_raw() -> None:
     assert stored["frequency_normalized"] is None
     assert stored["frequency_raw"] == "Alternate day"
     assert {f["code"] for f in payload["flags"]} == {"frequency_not_normalized"}
+
+
+def test_every_flag_carries_a_sentence_a_person_can_read() -> None:
+    """`detail` is the only part the app renders.
+
+    Four of these five used to omit it, so a prescription with a rejected name, an
+    unverified read, a loose match or an unreadable frequency showed the reader the word
+    "undefined" where the explanation should have been. Structured data alongside it is
+    for code to act on; this is what a person sees.
+    """
+    result = PrescriptionFields(
+        medicines=[medicine(frequency_raw="Alternate day")],
+        prescribed_date=None,
+        prescriber=None,
+    )
+    payload = _build_payload(
+        result,
+        list(result.medicines),
+        ["Warfarin 5mg"],
+        verified=False,
+        loose=["PAN-D"],
+    )
+
+    codes = {f["code"] for f in payload["flags"]}
+    assert codes == {
+        "names_not_on_document",
+        "names_unverified",
+        "names_matched_loosely",
+        "frequency_not_normalized",
+    }
+    for flag in payload["flags"]:
+        assert flag.get("detail"), f"{flag['code']} has no readable detail"
+        assert not flag["detail"].endswith(" "), flag["code"]
