@@ -31,10 +31,10 @@ schedule is worse than no schedule.
 **Dosage form is the table first, the model second.** ``medicines.normalize_form`` settles
 every abbreviation a document actually prints - "Tab.", "INJ", "E/D" - deterministically,
 so those answers cannot drift between runs. Only what a table genuinely cannot settle
-reaches the model: whether a topical gel is Cream or Ointment depends on its base, which
-is a property of the product rather than of the word. The model's answer is confined to
-the nine by the schema's enum and checked again on the way in, and "none of the nine"
-stays null rather than becoming the nearest box.
+reaches the model: whether something is a transdermal patch or a topical is a property of
+the product rather than of the word. The model's answer is confined to Spring's eight and
+checked again on the way in, and "none of the eight" stays null rather than becoming the
+nearest box.
 
 Idempotent: the extraction row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
@@ -68,9 +68,9 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "rx-2026-08-07"
-#: rx-3 added ``form``, the model's own classification into the nine, used only where the
-#: lookup table has nothing to say. rx-2 added ``form_raw`` and ``form_normalized``.
+PROMPT_VERSION = "rx-2026-08-08"
+#: rx-3 added ``form``, the model's own classification into the form vocabulary, used only
+#: where the lookup table has nothing to say. rx-2 added ``form_raw``/``form_normalized``.
 #: Payloads either side of a boundary are not comparable without knowing which side they
 #: came from: an rx-1 row has no form at all, which is indistinguishable from a later row
 #: whose document printed none.
@@ -103,7 +103,7 @@ class PrescribedMedicine(BaseModel):
     #: The dosage form as printed ("Tab.", "INJ", "E/D"). Kept because the abbreviations
     #: are not standardised and a reader may need to see what the document actually said.
     form_raw: str | None = Field(default=None, max_length=64)
-    #: The model's own classification into the nine, for the forms a lookup table cannot
+    #: The model's own classification into Spring's eight, for forms a lookup table cannot
     #: settle. Constrained by the schema's enum; the validator below is the second line of
     #: defence, since a schema is a request rather than a guarantee.
     form: str | None = Field(default=None, max_length=32)
@@ -130,7 +130,7 @@ class PrescribedMedicine(BaseModel):
             return None
         if value in medicines.DOSAGE_FORMS:
             return value
-        logger.warning("model returned dosage form %r, which is not one of the nine", value)
+        logger.warning("model returned dosage form %r, which is not one of the eight", value)
         return None
 
 
@@ -151,12 +151,12 @@ _NULLABLE_STR: dict[str, Any] = {"type": ["string", "null"]}
 
 #: ``form`` is a nullable string rather than a JSON-schema ``enum``, and deliberately so.
 #:
-#: An enum cannot express "one of these nine, or nothing": the SDK requires every enum
-#: member to be a string, so null cannot be a member, and an enum listing only the nine
+#: An enum cannot express "one of these eight, or nothing": the SDK requires every enum
+#: member to be a string, so null cannot be a member, and an enum listing only the eight
 #: forces a choice on a document that prints no form at all — the exact guess this field
 #: exists to avoid. Nullability is worth more here than a schema-level constraint.
 #:
-#: The vocabulary is enforced twice regardless: the prompt names the nine and forbids
+#: The vocabulary is enforced twice regardless: the prompt names the eight and forbids
 #: anything else, and ``PrescribedMedicine._known_form`` discards whatever is not one of
 #: them. A schema is a request; the validator is the guarantee.
 _FORM_FIELD: dict[str, Any] = _NULLABLE_STR
@@ -219,20 +219,19 @@ SYSTEM_PROMPT = (
     "in name_clean and the generic in composition. Never join the two, and never put a "
     "parenthesis or a slash in name_clean.\n"
     "4. form_raw is the dosage form exactly as printed, and nothing else: 'Tab.', "
-    "'TABLET', 'Cap', 'INJ', 'Syp', 'E/D', 'Powder', 'Rotacap'. Take it from wherever "
+    "'TABLET', 'Cap', 'INJ', 'Syp', 'E/D', 'Sachet', 'Rotacap'. Take it from wherever "
     "the document puts it — a prefix on the name, a column of its own, or inside a "
     "hyphen-joined run like 'DAPAGLIFLOZIN-TABLET-5MG-DAPEFY'. Do not infer it from what "
     "you know the drug to be: if the document does not print a form, return null for "
     "form_raw.\n"
-    "5. form is that same dosage form placed in ONE of these nine categories, and no "
-    "others: Tablet, Capsule, Syrup, Injection, Drops, Cream, Ointment, Inhaler, Powder. "
+    "5. form is that same dosage form placed in ONE of these eight categories, and no "
+    "others: Tablet, Capsule, Syrup, Injection, Drops, Inhaler, Patch, Cream. "
     "Judge it by how the medicine is actually given: a vial, ampoule or IV infusion is "
     "Injection; a suspension is Syrup; eye or nasal drops are Drops; a Rotacap, respule "
-    "or nebuliser solution is Inhaler; a sachet or granules are Powder. A topical gel is "
-    "Cream when it is an aqueous, non-greasy base that rubs in, and Ointment when it is "
-    "a greasy, occlusive one — decide from the product, not from the word 'gel'. If the "
-    "document prints no form, or the form is genuinely none of the nine (a suppository, "
-    "a patch, a mouthwash), return null rather than the nearest of the nine.\n"
+    "or nebuliser solution is Inhaler; a transdermal patch is Patch; a cream, ointment "
+    "or topical gel applied to the skin is Cream. If the document prints no form, or the "
+    "form is genuinely none of the eight (a suppository, a mouthwash, a sachet of "
+    "granules), return null rather than the nearest of the eight.\n"
     "6. A combination drug is ONE entry. Keep its compound strength as written "
     "('500mg + 125mg'); never split it into separate medicines.\n"
     "7. A composition line — 'Contains: PARACETAMOL (650 MG)', or an ingredient list "
@@ -546,14 +545,14 @@ def _verify_against_document(
 
 
 def _resolve_form(row: PrescribedMedicine) -> str | None:
-    """Which of the nine this medicine is, or None.
+    """Which of ``medicines.DOSAGE_FORMS`` this medicine is, or None.
 
     ``form_raw`` is authoritative when the document printed one. Within it the lookup
     table goes first: "Tab." is Tablet on every document ever printed, and a table gives
     that answer identically on every run, so an abbreviation the table knows is never put
     to a model that could answer differently tomorrow. Only what a table cannot settle
-    reaches the model — whether a topical gel is Cream or Ointment turns on whether its
-    base is aqueous or greasy, a property of the product rather than of the word "gel".
+    reaches the model — a printed word like "gel" or "spray" names no abbreviation, and
+    which form it belongs to is a property of the product rather than of the word.
 
     With no ``form_raw``, the name is the last resort, because most documents never print
     a form column at all: "Tab. DOLO 650" states it as a prefix and
