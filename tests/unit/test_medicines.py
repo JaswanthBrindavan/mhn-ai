@@ -261,17 +261,18 @@ def test_a_printed_time_of_day_beats_the_abbreviations_default(
         ("Cap", "Capsule"),
         ("Syp", "Syrup"),
         ("INJ", "Injection"),
-        # Genuine equivalents, folded into the nine rather than given values of their own.
+        # Genuine equivalents, folded in rather than given values of their own.
         ("Suspension", "Syrup"),  # dosed and taken exactly as a syrup is
         ("Vial", "Injection"),
         ("IV infusion", "Injection"),
-        ("Sachet", "Powder"),
-        ("Granules", "Powder"),
         # Indian short forms, none of them guessable. Eye and nasal drops are both Drops:
         # the site is not part of the vocabulary.
         ("E/D", "Drops"),
         ("N/D", "Drops"),
-        ("E/O", "Ointment"),
+        # An ointment folds into Cream: both go on the skin, so the base (greasy vs
+        # aqueous) is all that is lost, and that is display detail, not a route.
+        ("E/O", "Cream"),
+        ("Oint.", "Cream"),
         ("Rotacap", "Inhaler"),  # a dry-powder inhaler, not a capsule to swallow
         ("Nebuliser", "Inhaler"),
         # Taken from the name when there is no separate column for it.
@@ -286,9 +287,24 @@ def test_dosage_forms(text: str, expected: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["GEL", "Lotion", "Nasal Spray", "Suppository", "Patch", "Gargle", "Solution"],
+    # Sachet/Granules/Powder joined this list when the vocabulary became Spring's eight:
+    # a sachet of ORS is not a tablet, a capsule or a syrup, so it reports no form.
+    # "Patch" is here too — it IS one of the eight, but no document writes it as a printed
+    # abbreviation, so the lookup table has no entry and the model classifies it instead.
+    [
+        "GEL",
+        "Lotion",
+        "Nasal Spray",
+        "Suppository",
+        "Patch",
+        "Gargle",
+        "Solution",
+        "Sachet",
+        "Granules",
+        "Powder",
+    ],
 )
-def test_a_form_outside_the_nine_is_null_not_the_nearest_box(text: str) -> None:
+def test_a_form_outside_the_vocabulary_is_null_not_the_nearest_box(text: str) -> None:
     """These are real forms with no honest home in the vocabulary, so they stay null.
 
     Route is clinical. A suppository reported as a Tablet is a swallowing instruction for
@@ -305,21 +321,15 @@ def test_a_non_form_is_null(text: str | None) -> None:
 
 def test_nothing_escapes_the_published_vocabulary() -> None:
     """``DOSAGE_FORMS`` is the contract every consumer switches on, so no mapping may
-    produce a value outside it — including one added later by hand."""
+    produce a value outside it — including one added later by hand.
+
+    The list itself is Spring's, so what it must EQUAL is asserted against their own
+    migration in ``test_dosage_form_vocabulary.py`` rather than restated here — a second
+    hand-written copy is the drift this vocabulary already suffered once.
+    """
     from app.services.medicines import _FORM_SYNONYMS
 
     assert set(_FORM_SYNONYMS.values()) <= DOSAGE_FORMS
-    assert {
-        "Tablet",
-        "Capsule",
-        "Syrup",
-        "Injection",
-        "Drops",
-        "Cream",
-        "Ointment",
-        "Inhaler",
-        "Powder",
-    } == DOSAGE_FORMS
 
 
 def test_parse_dose_forms() -> None:

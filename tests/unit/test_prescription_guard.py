@@ -135,8 +135,8 @@ def test_the_lookup_table_beats_the_model_on_a_form_it_knows() -> None:
 
 
 def test_the_model_settles_what_the_table_cannot() -> None:
-    """A gel is Cream or Ointment depending on its base — a property of the product, not
-    of the word, so no lookup table can decide it."""
+    """ "GEL" is not an abbreviation any table maps — which of the eight it belongs to is a
+    property of the product, not of the word, so the model's reading is what settles it."""
     result = PrescriptionFields(
         medicines=[
             PrescribedMedicine(
@@ -157,22 +157,22 @@ def test_a_printed_form_beats_a_token_scraped_from_the_name() -> None:
     """``form_raw`` is what the document said the form was; the name is a last resort.
 
     Letting a stray "Tab." in a product name override the model's reading of the actual
-    form column would report a gel as a tablet.
+    form column would report a patch as a tablet.
     """
     result = PrescriptionFields(
         medicines=[
             PrescribedMedicine(
-                name_as_written="Tab-brand GEL 15 GM",
+                name_as_written="Tab-brand TRANSDERMAL PATCH 5MG",
                 name_clean="Tab-brand",
-                form_raw="GEL",
-                form="Ointment",
+                form_raw="PATCH",
+                form="Patch",
             )
         ],
         prescribed_date=None,
         prescriber=None,
     )
     payload = _build_payload(result, list(result.medicines), [])
-    assert payload["fields"]["medicines"][0]["form_normalized"] == "Ointment"
+    assert payload["fields"]["medicines"][0]["form_normalized"] == "Patch"
 
 
 def test_the_model_may_not_supply_a_form_the_document_never_printed() -> None:

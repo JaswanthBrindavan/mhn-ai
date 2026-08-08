@@ -57,9 +57,17 @@ logger = logging.getLogger(__name__)
 #: "12-03-25" is a perfect dose matrix by shape, and only the magnitude gives it away.
 MAX_DOSE_PER_SLOT = 10.0
 
-#: The only dosage forms this service reports. Fixed product vocabulary — nothing outside
-#: this set is ever returned, and it is not extended without that being a deliberate
-#: decision, because every consumer switches on these nine strings.
+#: The only dosage forms this service reports.
+#:
+#: **This is Spring's ``dosage_form_enum``, not ours** — the eight in their
+#: ``V1__baseline.sql`` and ``DosageForm.java``. It used to be nine of our own choosing,
+#: which is how three repos came to disagree: ``Ointment`` and ``Powder`` were emitted
+#: here and offered by the app's search filter long after Spring dropped them, so
+#: choosing either produced a 400 from ``DosageForm.valueOf`` and no results at all.
+#:
+#: Lower-cased, this set must EQUAL theirs — ``tests/unit/test_dosage_form_vocabulary.py``
+#: reads their migration and asserts it, so adding a value on either side fails the build
+#: rather than drifting quietly. Adding one here means adding it there first.
 DOSAGE_FORMS: frozenset[str] = frozenset(
     {
         "Tablet",
@@ -67,10 +75,9 @@ DOSAGE_FORMS: frozenset[str] = frozenset(
         "Syrup",
         "Injection",
         "Drops",
-        "Cream",
-        "Ointment",
         "Inhaler",
-        "Powder",
+        "Patch",
+        "Cream",
     }
 )
 
@@ -86,12 +93,17 @@ DOSAGE_FORMS: frozenset[str] = frozenset(
 #: is a dry-powder inhaler rather than a capsule to swallow.
 #:
 #: **Only genuine equivalents are mapped.** A vial and an ampoule really are Injection; a
-#: suspension really is taken like a Syrup; a sachet really is Powder. Forms with no
-#: honest home in the nine — patch, suppository, pessary, gargle, shampoo, solution,
-#: spray — are deliberately absent and normalise to None. Route is clinical, and a
-#: suppository reported as a Tablet would be a swallowing instruction for something that
-#: must not be swallowed. Null says "not one of ours"; a nearest guess says something
-#: false, and the printed text survives in ``form_raw`` either way.
+#: suspension really is taken like a Syrup. Forms with no honest home in the eight —
+#: powder, suppository, pessary, gargle, shampoo, solution, spray — are deliberately
+#: absent and normalise to None. Route is clinical, and a suppository reported as a
+#: Tablet would be a swallowing instruction for something that must not be swallowed.
+#: Null says "not one of ours"; a nearest guess says something false, and the printed
+#: text survives in ``form_raw`` either way.
+#:
+#: **Ointment folds into Cream** rather than becoming None, because both are applied to
+#: the skin: the loss is cosmetic, not a route error, so reporting Cream beats reporting
+#: nothing. **Powder does not fold anywhere** — a sachet of ORS is not a tablet, a
+#: capsule or a syrup, so it reports no form at all.
 # Grouped by the form each row maps to, with a comment per group. One entry per line would
 # triple the length and hide that grouping, which is the point of the table.
 # fmt: off
@@ -113,11 +125,15 @@ _FORM_SYNONYMS: dict[str, str] = {
     # Bare "nasal" is deliberately absent: it qualifies a route, not a device, and
     # reading it first would turn "Nasal Spray" into Drops.
     "n/d": "Drops", "nd": "Drops",
+    # Topicals. Ointment has no enum value of its own; both go on the skin, so Cream
+    # loses the base (greasy vs aqueous) and nothing about how the drug is used.
     "cream": "Cream",
-    "ointment": "Ointment", "oint": "Ointment", "e/o": "Ointment", "eo": "Ointment",
+    "ointment": "Cream", "oint": "Cream", "e/o": "Cream", "eo": "Cream",
     "inhaler": "Inhaler", "rotacap": "Inhaler", "respule": "Inhaler",
     "nebuliser": "Inhaler", "nebulizer": "Inhaler", "mdi": "Inhaler",
-    "powder": "Powder", "granules": "Powder", "sachet": "Powder", "sachets": "Powder",
+    # No entries for Patch: a transdermal patch is not written with a printed
+    # abbreviation the way "Tab" or "Inj" is. It is in DOSAGE_FORMS because `form` is
+    # the model's own classification, so it can report one from the document's words.
 }
 # fmt: on
 
@@ -314,7 +330,7 @@ ENGLISH_SLOT_LIST_RE = re.compile(
 def normalize_form(text: str | None) -> str | None:
     """The dosage form *text* names, as one of ``DOSAGE_FORMS``, or None.
 
-    None means "not one of the nine", never "probably a tablet". Route is clinical:
+    None means "not one of Spring's eight", never "probably a tablet". Route is clinical:
     reporting an injection as a tablet is worse than reporting nothing, and the printed
     text is kept in ``form_raw`` either way, so a reader loses nothing by this being null.
 
@@ -328,7 +344,7 @@ def normalize_form(text: str | None) -> str | None:
         form = _FORM_SYNONYMS.get(token)
         if form:
             return form
-    logger.info("dosage form %r is not one of the nine - left null", text)
+    logger.info("dosage form %r is not one of the eight - left null", text)
     return None
 
 
