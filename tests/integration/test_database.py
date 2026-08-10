@@ -50,10 +50,37 @@ def test_ready_endpoint_reports_up_against_live_database(api):
     # Uses the `api` fixture so S3/SQS resolve to moto; /ready now probes all three.
     response = api.get("/ready")
     assert response.status_code == 200
-    checks = response.json()["checks"]
+    body = response.json()
+    checks = body["checks"]
     assert checks["database"]["status"] == "up"
     assert checks["s3"]["status"] == "up"
     assert checks["sqs"]["status"] == "up"
+    # Reported, and reported separately from `checks`.
+    assert body["dlq"] == {"status": "up", "messages": 0}
+
+
+def test_a_full_dead_letter_queue_does_not_make_the_service_unready(api, aws):
+    """Depth is visibility, never a health signal.
+
+    A message in the DLQ is a document nobody is processing — worth surfacing, and no
+    reason whatsoever to take a working service out of rotation. It is also not
+    necessarily recent: a message with an unreadable body is skipped without being
+    deleted and lands here after the queue's own maxReceiveCount, then stays for ever.
+    Gating readiness on that would mean one stale message from months ago permanently
+    failing every deploy's health check.
+    """
+    _, sqs, _, dlq = aws
+    for _ in range(3):
+        sqs.send_message(QueueUrl=dlq, MessageBody='{"stranded": true}')
+
+    response = api.get("/ready")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["dlq"]["messages"] == 3
+    # And it stayed out of the readiness calculation entirely.
+    assert "dlq" not in body["checks"]
 
 
 def test_run_item_carries_the_auto_filing_columns(db_session) -> None:

@@ -6,11 +6,14 @@ they change. Cache reads bill at ~0.1x input, cache writes at ~1.25x input (5-mi
 TTL) — the standard Anthropic multipliers.
 """
 
+import logging
 import re
 from dataclasses import dataclass
 from decimal import Decimal
 
 from app.integrations.ai.base import AIUsage
+
+logger = logging.getLogger(__name__)
 
 _PER_MILLION = Decimal(1_000_000)
 _CACHE_READ_MULTIPLIER = Decimal("0.1")
@@ -27,8 +30,11 @@ class ModelPrice:
     output_per_million: Decimal
 
 
-#: Keyed by exact model id. Extend as models are adopted; an unknown model costs 0 and
-#: is flagged by the caller rather than silently mispriced.
+#: Keyed by exact model id. Extend as models are adopted. An unpriced model costs 0 and
+#: is WARNED about here — the comment used to say the caller flagged it, and no caller
+#: ever did. That silence is exactly how Haiku's real cost stayed hidden until PR #7: the
+#: table was keyed by alias while the API returned a dated snapshot, so every Haiku stage
+#: logged $0 and the money column looked fine.
 PRICES: dict[str, ModelPrice] = {
     "claude-opus-4-8": ModelPrice(Decimal("5.00"), Decimal("25.00")),
     "claude-opus-4-7": ModelPrice(Decimal("5.00"), Decimal("25.00")),
@@ -43,10 +49,16 @@ PRICES: dict[str, ModelPrice] = {
 
 
 def estimate_cost_usd(model: str, usage: AIUsage) -> Decimal:
-    """Best-effort USD cost for one call. Returns 0 for an unpriced model."""
+    """Best-effort USD cost for one call. Returns 0 for an unpriced model, and says so."""
     # Exact match first; then retry with any dated snapshot suffix stripped.
     price = PRICES.get(model) or PRICES.get(_DATE_SUFFIX.sub("", model))
     if price is None:
+        # A zero in the cost column is indistinguishable from a stage that made no call,
+        # so an unpriced model quietly understates spend across every document it touches.
+        # Warn rather than raise: a missing price must never fail a document that has
+        # already been paid for and processed. (A stage that made no call never reaches
+        # here — log_process skips the estimate when there is no usage to price.)
+        logger.warning("model_not_priced", extra={"model": model})
         return Decimal("0")
 
     input_rate = price.input_per_million

@@ -10,8 +10,8 @@ loses that race.
 **Messages are published only after the transaction commits.** SQS delivery can be
 faster than a transaction; publishing first lets a worker receive an item id that no
 committed row matches yet. Publishing after means the worst case is a committed item
-that never got a message — visible as `pending`, and recoverable by the stale-item
-sweep. That failure is recoverable; the other is a phantom.
+that never got a message — which is recorded as `failed` with `publish_failed` and can
+be retried through the normal endpoint. That failure is visible; the other is a phantom.
 """
 
 import logging
@@ -19,6 +19,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select, text, update
@@ -68,6 +69,10 @@ _CANCELLABLE = {status.value for status in CANCELLABLE_STATUSES}
 #: How many source files to HeadObject at once. Small enough not to hammer S3 or
 #: exhaust the botocore connection pool, large enough that a big batch is not serial.
 _VALIDATION_CONCURRENCY = 8
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _source_keys(session: Session, document_ids: list[int]) -> dict[int, str]:
@@ -291,6 +296,37 @@ def _mark_queued(session: Session, item_ids: set[uuid.UUID]) -> None:
     session.commit()
 
 
+def _mark_publish_failed(session: Session, item_ids: set[uuid.UUID]) -> None:
+    """Terminally fail items whose message never reached the queue.
+
+    Nothing consumes an item that has no message. It used to be left ``pending`` on the
+    reasoning that a stale-item sweep would pick it up — but no sweep was ever built, so
+    the document simply stopped for ever: no message, no error, no retry, and a ``202``
+    telling the caller it had been accepted.
+
+    ``failed`` is the honest state. It is visible on the run and on
+    ``GET /v1/documents/{id}/status``, and it is retryable through the existing retry
+    endpoint, which re-submits the document down this same path. Guarded on ``pending``
+    like the queued transition, so a worker that somehow did receive the message wins.
+    """
+    if not item_ids:
+        return
+    session.execute(
+        update(AiProcessingRunItem)
+        .where(
+            AiProcessingRunItem.id.in_(item_ids),
+            AiProcessingRunItem.status == RunItemStatus.PENDING.value,
+        )
+        .values(
+            status=RunItemStatus.FAILED.value,
+            last_error_code="publish_failed",
+            last_error_message="Could not enqueue the document for processing; retry it",
+            completed_at=_now(),
+        )
+    )
+    session.commit()
+
+
 def create_run(
     session: Session,
     payload: CreateRunRequest,
@@ -414,9 +450,16 @@ def create_run(
     published = _publish(sqs, settings, publishable)
     if published:
         _mark_queued(session, published)
-        for entry in publishable:
-            if entry.item_id in published:
-                entry.status = RunItemStatus.QUEUED.value
+    # Anything that did not make it onto the queue has no consumer and never will, so it
+    # is failed rather than left looking accepted. See _mark_publish_failed.
+    unpublished = {entry.item_id for entry in publishable} - published
+    _mark_publish_failed(session, unpublished)
+    for entry in publishable:
+        entry.status = (
+            RunItemStatus.QUEUED.value if entry.item_id in published else RunItemStatus.FAILED.value
+        )
+        if entry.item_id in unpublished:
+            entry.error_code = "publish_failed"
 
     return CreateRunResponse(
         run_id=run_id,
@@ -441,9 +484,10 @@ def _publish(
 ) -> set[uuid.UUID]:
     """Enqueue committed items. Returns the ids that made it onto the queue.
 
-    A publish failure is not fatal. The item stays `pending`, which the stale-item
-    sweep treats as retryable — better than failing a request whose work is already
-    durably recorded.
+    A publish failure does not fail the *request* — the run and its items are already
+    committed, and the caller is told per document what happened. The caller marks
+    whatever is missing from this set as ``failed``: an item with no message has no
+    consumer, so calling it ``pending`` would be describing work nobody will do.
     """
     if not entries:
         return set()
@@ -538,9 +582,10 @@ def cancel_run(session: Session, run_id: uuid.UUID) -> CancelRunResponse:
 
     cancellable = [item.id for item in run.items if item.status in _CANCELLABLE]
     unaffected = [item.id for item in run.items if item.status not in _CANCELLABLE]
+    cancelled: list[uuid.UUID] = []
 
     if cancellable:
-        cancelled = (
+        cancelled = list(
             session.execute(
                 update(AiProcessingRunItem)
                 .where(
@@ -567,8 +612,14 @@ def cancel_run(session: Session, run_id: uuid.UUID) -> CancelRunResponse:
         for item_id in cancelled:
             filing.mark_content_failed(session, item_id)
 
+    # `cancelled`, not `cancellable`: the same distinction the loop above already relies on.
+    # An item that raced to a terminal state between the read and the UPDATE was not
+    # cancelled, and reporting it as though it were tells Spring a completed document was
+    # stopped. Anything that fell out of the guard is reported as unaffected, which is what
+    # it now is.
+    raced = [item_id for item_id in cancellable if item_id not in set(cancelled)]
     return CancelRunResponse(
         run_id=run_id,
-        cancelled_item_ids=cancellable,
-        unaffected_item_ids=unaffected,
+        cancelled_item_ids=cancelled,
+        unaffected_item_ids=unaffected + raced,
     )

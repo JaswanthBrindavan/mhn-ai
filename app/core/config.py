@@ -28,13 +28,24 @@ class Settings(BaseSettings):
     s3_force_path_style: bool = False
     s3_bucket: str = ""
     sqs_queue_url: str = ""
+    # Read by /ready, to report how many messages are sitting in the dead-letter queue.
+    # It is NOT how the DLQ is configured: the redrive policy and its maxReceiveCount are
+    # attributes of the main queue in AWS, and this service neither sets nor verifies them.
+    # What it does is make the depth visible — a message here is a document nobody is
+    # processing, and until this existed the only way to notice was to open the console.
+    # Empty simply omits the report.
+    #
+    # No sqs_max_receive_count: that one really was read by nothing, and it belongs to the
+    # queue. Check `aws sqs get-queue-attributes` for the policy, not this file.
     sqs_dlq_url: str = ""
-    sqs_max_receive_count: int = 5
 
     # --- Worker -------------------------------------------------------------
     worker_max_concurrency: int = 4
     max_attempts: int = 3
-    stale_item_timeout_seconds: int = 900
+    # No stale_item_timeout_seconds: it was the threshold for a stale-item reaper that was
+    # promised in five places and never built. A publish failure now ends the item `failed`
+    # rather than waiting for a sweep that does not exist. If the reaper is ever built, the
+    # setting comes back with it.
     # How long a received message stays invisible while a worker holds it. The
     # heartbeat re-extends this before it lapses, so a stage may run longer than
     # this value without the message being redelivered.
