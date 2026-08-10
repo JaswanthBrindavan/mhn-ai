@@ -313,7 +313,15 @@ def comparator_flag(
 
 #: Words meaning "none detected". Against a numeric range they read as zero — a urine
 #: glucose of "Nil" against "0 - 2" is in range, and saying so is arithmetic, not judgement.
-_ABSENT_TERMS = frozenset({"nil", "none", "negative", "absent", "not detected", "nd", "no"})
+#:
+#: **"nd" is deliberately absent.** On an Indian lab report it means "Not Detected" often
+#: and "Not Done" often enough, and the two are opposites for this purpose: read as absent,
+#: a test that was never performed becomes 0.0 against its range and comes back
+#: ``normal`` — a clean result reported for an assay nobody ran. Every other decision in
+#: this module refuses when the readings disagree; this one may not make an exception for
+#: a two-letter abbreviation. The cost is that a genuine "ND" goes unflagged, which is the
+#: recoverable direction.
+_ABSENT_TERMS = frozenset({"nil", "none", "negative", "absent", "not detected", "no"})
 #: Words meaning "found". Prefixes, because labs qualify them: "Present 3+(500-1000 mg/dl)".
 #: Checked with startswith so "not detected" is never read as "detected".
 _PRESENT_PREFIXES = ("present", "positive", "detected", "reactive", "seen")
@@ -409,13 +417,29 @@ def enrich_result(
     ``override_bounds`` is the R&D-approved ideal range for the patient's age group; when
     given it drives the abnormal flag instead of the report's printed reference range, and
     ``range_source`` is forced to ``"ideal_range"``. Without it, behaviour is unchanged
-    (bounds parsed from ``reference_range``, ``range_source`` stays ``"report_range"``)."""
+    (bounds parsed from ``reference_range``, ``range_source`` stays ``"report_range"``).
+
+    Two fields exist so a consumer can tell WHAT the flag was decided against:
+
+    * ``flagged_against`` — the bounds that actually produced the flag, rendered. With an
+      approved ideal range in play this is NOT the printed range, and anything quoting a
+      limit to the reader has to use this one or it will cite a limit the value never
+      crossed. The insights stage does exactly that.
+    * ``range_source`` — ``"ideal_range"``, ``"report_range"``, or ``"none"`` when the
+      report printed no reference range at all. ``"report_range"`` with a null flag means
+      a range was there and could not be decided; ``"none"`` means there was nothing to
+      check against in the first place, which is a different problem with a different fix
+      (curate the THP master, not the parser).
+    """
     value = parse_number(result.get("value"))
+    printed_range = result.get("reference_range")
     if override_bounds is not None:
         bounds: tuple[float | None, float | None] | None = override_bounds
         range_source = "ideal_range"
     else:
-        bounds = parse_reference_range(result.get("reference_range"), gender)
+        bounds = parse_reference_range(printed_range, gender)
+        if not (printed_range or "").strip():
+            range_source = "none"
     conv = convert_unit(result.get("test_name", ""), value, result.get("unit"))
 
     # Values that are not plain numbers still carry decidable information. A censored
@@ -439,12 +463,41 @@ def enrich_result(
         "value_numeric": value,
         "abnormal_flag": flag,
         "range_source": range_source,
+        "flagged_against": render_bounds(bounds),
         "matched_parameter": matched_parameter,
         "matched_group": matched_group,
         "normalized_value": conv[0] if conv else None,
         "normalized_unit": conv[1] if conv else None,
         "normalized": conv is not None,
     }
+
+
+def _number(value: float) -> str:
+    """13.0 -> '13', 8.6 -> '8.6'. A trailing '.0' reads as false precision to a patient."""
+    return f"{value:g}"
+
+
+def render_bounds(bounds: tuple[float | None, float | None] | None) -> str | None:
+    """The bounds the flag was computed against, as a person would read them.
+
+    Rendered from the bounds rather than copied from the printed text, because the two
+    differ exactly when it matters: an approved ideal range replaces the printed one, and
+    the printed text is also frequently decorated ("Desirable : 2.5-3.0", "45-129U/L").
+
+    The comparators mirror ``abnormal_flag``: it flags high only when ``value > high``, so
+    a one-sided range parsed from "< 200" permits 200 itself and is rendered ``<= 200``.
+    Anything quoting a limit must quote the one the comparison actually used.
+    """
+    if bounds is None:
+        return None
+    low, high = bounds
+    if low is not None and high is not None:
+        return f"{_number(low)} - {_number(high)}"
+    if high is not None:
+        return f"<= {_number(high)}"
+    if low is not None:
+        return f">= {_number(low)}"
+    return None
 
 
 def canon_unit(unit: str) -> str:
@@ -490,6 +543,14 @@ if __name__ == "__main__":  # pragma: no cover - self-check
     assert enrich_result(_b12)["abnormal_flag"] == "low"
     assert enrich_result(_b12)["value_numeric"] is None
     assert enrich_result(_b12)["value"] == "< 148"
+    # The limit the flag was decided against, rendered as the comparison behaves. With an
+    # ideal-range override this is NOT the printed range, which is the whole reason it
+    # exists — see tests/unit/test_flagged_against.py.
+    assert enrich_result(_b12)["flagged_against"] == "187 - 833"
+    assert enrich_result(_b12)["range_source"] == "report_range"
+    _ideal = enrich_result(_b12, override_bounds=(200.0, 900.0))
+    assert _ideal["flagged_against"] == "200 - 900" and _ideal["range_source"] == "ideal_range"
+    assert enrich_result({**_b12, "reference_range": None})["range_source"] == "none"
 
     # Decorated ranges: a trailing unit, a label, a ratio notation, a word comparator.
     assert parse_reference_range("90 - 120 mg/dl") == (90.0, 120.0)

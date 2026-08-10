@@ -377,3 +377,23 @@ def test_the_category_split_reaches_a_real_result():
         {"test_name": "CEA", "value": "0.93", "unit": "ng/mL", "reference_range": _CEA}
     )
     assert enriched["abnormal_flag"] == "normal"
+
+
+def test_not_done_is_never_read_as_not_detected() -> None:
+    """ "ND" means both, and they are opposites here.
+
+    Read as absent, it becomes 0.0 against the range and comes back `normal` — a clean
+    result published for an assay nobody ran, on a report a person will act on. Every
+    other decision in this module refuses when the readings disagree; a two-letter
+    abbreviation is not the place to start making exceptions.
+
+    The cost is a genuine "Not Detected" going unflagged, which is recoverable.
+    """
+    row = {"test_name": "Urine Glucose", "value": "ND", "unit": None, "reference_range": "0 - 2"}
+
+    assert enrich_result(row)["abnormal_flag"] is None
+
+    # The unambiguous spellings still work, so nothing real was lost.
+    for spelling in ("Nil", "Absent", "Not Detected", "Negative"):
+        checked = enrich_result({**row, "value": spelling})
+        assert checked["abnormal_flag"] == "normal", spelling
