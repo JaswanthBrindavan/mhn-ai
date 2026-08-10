@@ -96,5 +96,6 @@ class RetryResponse(BaseModel):
     document_id: int
     item_id: uuid.UUID
     run_id: uuid.UUID
-    #: `queued` once re-published; `pending` if publishing failed (the sweep retries it).
+    #: `queued` once re-published; `failed` with `publish_failed` if it could not be
+    #: enqueued, which is retryable through this same endpoint.
     status: str
