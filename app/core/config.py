@@ -28,11 +28,16 @@ class Settings(BaseSettings):
     s3_force_path_style: bool = False
     s3_bucket: str = ""
     sqs_queue_url: str = ""
-    # No sqs_dlq_url / sqs_max_receive_count here. Both were defined, advertised, and read
-    # by nothing: the dead-letter queue and its maxReceiveCount are attributes of the queue
-    # in AWS, not something this service configures or verifies. Carrying them implied the
-    # redrive policy was managed here — which matters, because "it will end up in the DLQ"
-    # is load-bearing reasoning in app/integrations/sqs.py. Check the queue, not this file.
+    # Read by /ready, to report how many messages are sitting in the dead-letter queue.
+    # It is NOT how the DLQ is configured: the redrive policy and its maxReceiveCount are
+    # attributes of the main queue in AWS, and this service neither sets nor verifies them.
+    # What it does is make the depth visible — a message here is a document nobody is
+    # processing, and until this existed the only way to notice was to open the console.
+    # Empty simply omits the report.
+    #
+    # No sqs_max_receive_count: that one really was read by nothing, and it belongs to the
+    # queue. Check `aws sqs get-queue-attributes` for the policy, not this file.
+    sqs_dlq_url: str = ""
 
     # --- Worker -------------------------------------------------------------
     worker_max_concurrency: int = 4
