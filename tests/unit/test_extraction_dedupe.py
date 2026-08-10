@@ -55,3 +55,42 @@ def test_distinct_tests_are_kept():
 
 def test_empty_input_is_fine():
     assert _dedupe_results([]) == []
+
+
+def _dated(name: str, value: str, observed_date: str | None) -> ExtractedLabResult:
+    return ExtractedLabResult(test_name=name, value=value, observed_date=observed_date)
+
+
+def test_the_same_test_on_two_dates_is_two_results() -> None:
+    """A cumulative report's whole point is the trend, and a name-only key ate it.
+
+    Indian labs print serial reports: creatinine in January and again in June, one row
+    each. Keyed on the name alone these collapsed to whichever copy scored higher on
+    `_informativeness` — not even the more recent one — so a rising creatinine was stored
+    as a single value with nothing to compare it to, and nothing downstream could tell.
+    """
+    rows = [_dated("Creatinine", "0.9", "2026-01-14"), _dated("Creatinine", "1.6", "2026-06-02")]
+
+    kept = _dedupe_results(rows)
+
+    assert [r.value for r in kept] == ["0.9", "1.6"]
+
+
+def test_the_double_pass_still_collapses_when_the_dates_agree() -> None:
+    """The case dedupe exists for is untouched: same test, same date, one row kept."""
+    rows = [_dated("Creatinine", "0.9", "2026-01-14"), _dated("Creatinine", "0.9", "2026-01-14")]
+
+    assert len(_dedupe_results(rows)) == 1
+
+
+def test_a_duplicate_where_only_one_copy_is_dated_survives_as_two() -> None:
+    """Deliberate, and the safe direction.
+
+    We cannot tell "the model dated one copy and not the other" from "two genuine
+    observations, one undated". A visible duplicate is something a reader can see and a
+    curator can fix; a dropped observation is invisible to both. Same trade `INSTRUCTION`
+    already makes by asking for completeness and cleaning up afterwards.
+    """
+    rows = [_dated("Creatinine", "0.9", None), _dated("Creatinine", "0.9", "2026-01-14")]
+
+    assert len(_dedupe_results(rows)) == 2

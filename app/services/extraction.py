@@ -43,10 +43,12 @@ STAGE_NAME = "extracting"
 #:
 #: Measured, not guessed: 8192 was 82% used on a 100-result document; a 128-result panel
 #: (Vivek_Health_Report_Condensed, 2026-08-03) used 11,679 — 73% of 16000. That is far
-#: too close for a ceiling whose failure mode is expensive: a truncated response fails
-#: Pydantic, is recorded as `invalid_model_output`, and is treated as TRANSIENT, so it
-#: retries and fails identically every time — `StructuredResponse.truncated` is still not
-#: checked anywhere (see docs/FUTURE.md).
+#: too close for a ceiling whose failure mode is a whole report's results going missing.
+#:
+#: Truncation IS detected now — ``check_response`` below raises ``PermanentStageError``
+#: with ``response_truncated`` after one attempt (PR #26). This comment used to say it was
+#: unchecked, which stopped being true six lines below itself. Detection is not a reason to
+#: lower the ceiling, though: a caught truncation is still a document that produced nothing.
 #:
 #: Headroom here is nearly free. Extraction runs on Gemini Flash-Lite at $1.50/M output,
 #: so the 8000-token increase costs at most $0.012 on a document that actually needs it,
@@ -234,7 +236,7 @@ def _informativeness(row: ExtractedLabResult) -> tuple[int, int, int]:
 
 
 def _dedupe_results(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
-    """One row per test name, keeping the most informative and the original order.
+    """One row per test name PER OBSERVATION DATE, keeping the most informative.
 
     Demanding completeness (see ``INSTRUCTION``) can make a model emit its summary pass AND
     its full pass, repeating some tests. Measured on a 17-page report: 124 rows for 98
@@ -248,11 +250,21 @@ def _dedupe_results(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
     ``BILIRUBIN - DIRECT`` are one test, as are ``HDL / LDL RATIO`` and ``HDL/LDL RATIO``.
     Two genuinely different analytes never differ by spacing alone, and the stored
     ``test_name`` is untouched — this only decides what counts as a repeat.
+
+    **``observed_date`` is part of the key, and that is not cosmetic.** A cumulative report
+    lists the same analyte on several dates — creatinine in January and again in June — and
+    a name-only key collapsed them to whichever copy scored higher on
+    ``_informativeness``, which is not even "the most recent". The trend is the whole point
+    of such a report, and losing half of it is silent.
+
+    Two rows for one test where only one carries a date therefore both survive. That is the
+    deliberate direction: a duplicate is visible to the reader and fixable, a dropped
+    observation is neither. Same trade the completeness instruction already makes.
     """
-    best: dict[str, ExtractedLabResult] = {}
-    order: list[str] = []
+    best: dict[tuple[str, str], ExtractedLabResult] = {}
+    order: list[tuple[str, str]] = []
     for row in rows:
-        key = "".join(row.test_name.lower().split())
+        key = ("".join(row.test_name.lower().split()), (row.observed_date or "").strip())
         if key not in best:
             best[key] = row
             order.append(key)
