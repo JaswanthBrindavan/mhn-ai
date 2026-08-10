@@ -111,7 +111,10 @@ def aws() -> Iterator[tuple]:
 @pytest.fixture
 def test_settings(aws) -> Settings:
     """Settings pointed at the moto resources rather than the developer's .env."""
-    _, _, queue_url, dlq = aws
+    # The DLQ is still created by the `aws` fixture — the redrive policy is a property of
+    # the queue, and a test that exercises redelivery wants it to exist — but Settings no
+    # longer carries its URL, because nothing in the application ever read it.
+    _, _, queue_url, _ = aws
     base = get_settings()
     return Settings(
         database_url=base.database_url,
@@ -119,7 +122,6 @@ def test_settings(aws) -> Settings:
         aws_region=REGION,
         s3_bucket=BUCKET,
         sqs_queue_url=queue_url,
-        sqs_dlq_url=dlq,
         max_file_bytes=1_000_000,
     )
 

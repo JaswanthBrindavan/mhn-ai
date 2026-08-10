@@ -28,13 +28,19 @@ class Settings(BaseSettings):
     s3_force_path_style: bool = False
     s3_bucket: str = ""
     sqs_queue_url: str = ""
-    sqs_dlq_url: str = ""
-    sqs_max_receive_count: int = 5
+    # No sqs_dlq_url / sqs_max_receive_count here. Both were defined, advertised, and read
+    # by nothing: the dead-letter queue and its maxReceiveCount are attributes of the queue
+    # in AWS, not something this service configures or verifies. Carrying them implied the
+    # redrive policy was managed here — which matters, because "it will end up in the DLQ"
+    # is load-bearing reasoning in app/integrations/sqs.py. Check the queue, not this file.
 
     # --- Worker -------------------------------------------------------------
     worker_max_concurrency: int = 4
     max_attempts: int = 3
-    stale_item_timeout_seconds: int = 900
+    # No stale_item_timeout_seconds: it was the threshold for a stale-item reaper that was
+    # promised in five places and never built. A publish failure now ends the item `failed`
+    # rather than waiting for a sweep that does not exist. If the reaper is ever built, the
+    # setting comes back with it.
     # How long a received message stays invisible while a worker holds it. The
     # heartbeat re-extends this before it lapses, so a stage may run longer than
     # this value without the message being redelivered.

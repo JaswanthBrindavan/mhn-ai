@@ -32,15 +32,6 @@ from app.models.processing import AiProcessingRunItem
 logger = logging.getLogger(__name__)
 
 _TERMINAL = {status.value for status in TERMINAL_STATUSES}
-# Non-terminal states a claim may start or resume from.
-_CLAIMABLE = {
-    RunItemStatus.PENDING.value,
-    RunItemStatus.QUEUED.value,
-    RunItemStatus.PROCESSING.value,
-    RunItemStatus.CLASSIFYING.value,
-    RunItemStatus.EXTRACTING.value,
-    RunItemStatus.GENERATING_INSIGHTS.value,
-}
 
 
 class ClaimOutcome(StrEnum):
@@ -268,6 +259,3 @@ def fail_item(
         )
     )
     return _execute_update(session, stmt) == 1
-
-
-CLAIMABLE_STATUSES = _CLAIMABLE
