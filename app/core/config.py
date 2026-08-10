@@ -42,10 +42,15 @@ class Settings(BaseSettings):
     # --- Worker -------------------------------------------------------------
     worker_max_concurrency: int = 4
     max_attempts: int = 3
-    # No stale_item_timeout_seconds: it was the threshold for a stale-item reaper that was
-    # promised in five places and never built. A publish failure now ends the item `failed`
-    # rather than waiting for a sweep that does not exist. If the reaper is ever built, the
-    # setting comes back with it.
+    # How long a non-terminal item may sit untouched before the reaper re-queues it
+    # (app/workers/reaper.py). Must stay comfortably above the longest SINGLE stage, not
+    # the longest pipeline: `updated_at` moves at each stage transition, so a live worker
+    # is only invisible to the sweep for the length of one stage. Measured worst case is
+    # insight generation at ~75s, against this 900s.
+    #
+    # The heartbeat does NOT keep this fresh — it extends SQS visibility and touches no
+    # row — so do not lower this on the assumption that it does.
+    stale_item_timeout_seconds: int = 900
     # How long a received message stays invisible while a worker holds it. The
     # heartbeat re-extends this before it lapses, so a stage may run longer than
     # this value without the message being redelivered.
