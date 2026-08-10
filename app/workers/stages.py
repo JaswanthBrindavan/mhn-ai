@@ -40,11 +40,13 @@ from app.workers.stagetypes import (
 
 __all__ = [
     "CLASSIFY_STAGE",
+    "HANDWRITTEN_PRESCRIPTION_PIPELINE",
     "SECTION_PIPELINES",
     "PermanentStageError",
     "RejectStageError",
     "Stage",
     "StageContext",
+    "StageStep",
     "TransientStageError",
 ]
 

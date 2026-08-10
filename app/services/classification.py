@@ -10,9 +10,11 @@ looks it up in ``SECTION_PIPELINES``. Rejecting here would mean importing that t
 which imports this module — and it would also misreport a correct classification of an
 unhandled section as a failure of this stage.
 
-The move into the ``reports`` table (INSERT the row, write ``reports.content``, DELETE the
-``unclassified_files`` row) happens after extraction and insights, so a document is only
-moved once its content is ready — not here.
+Filing — INSERT the section row, write its ``content``, DELETE the ``unclassified_files``
+row, move the S3 object — happens in ``app.services.filing`` immediately AFTER this stage,
+so the document reaches its section within seconds and the later stages update the row in
+place. (This note used to say filing waited until the end of the pipeline; it has not
+since 2026-08-01.) Not here either way: this stage classifies and nothing else.
 
 Idempotent: the classification and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.

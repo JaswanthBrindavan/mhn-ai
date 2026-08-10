@@ -45,10 +45,17 @@ class ContentState(StrEnum):
 
 
 #: Version of the content["ai"] shape, so consumers can migrate on change.
-#: 2.1 — each insight is now four explanatory parts (what_it_is / why_it_varies /
-#: risk_context / suggestions) rather than a single `body`.
+#:
+#: 2.1 — insights became multi-part rather than a single `body`. The shape moved again
+#:       afterwards, to the app's six fields (heading + risk_patterns render Risk Patterns,
+#:       suggestion_heading + suggestions render Suggestions, what_it_is / why_it_varies the
+#:       explanatory body) WITHOUT another bump, because no consumer keys off this value.
 #: 2.0 — the payload is now written at filing time, before extraction has run, and gained
-#: `state` and `section_extraction`. 1.1 was report-only and written once, at the move.
+#:       `state` and `section_extraction`. 1.1 was report-only and written once, at the move.
+#:
+#: Nothing branches on it today: mhn-react types it as an opaque string and Spring never
+#: reads it. That is why the drift above was harmless — and why it is worth knowing before
+#: anyone starts treating it as a contract.
 CONTENT_SCHEMA_VERSION = "2.1"
 
 

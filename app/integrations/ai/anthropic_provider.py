@@ -4,9 +4,13 @@ This is the one place that talks to the model. It cannot be exercised in CI (a r
 call costs money and is non-deterministic), so it is kept small and its request shape
 is asserted with a stub client in unit tests.
 
-Documents go through the Files API rather than inline base64: our 25 MB size limit
-would inflate to ~34 MB of base64 and exceed the 32 MB request cap, and a stored file
-can be reused across stages (classification now, extraction next).
+Documents go through the Files API rather than inline base64: ``MAX_FILE_BYTES`` is
+50 MiB, which would inflate to ~67 MB of base64 and blow past the 32 MB request cap.
+
+The uploaded file is deleted in a ``finally`` after every call, so it is **not** shared
+between stages — an earlier version of this note claimed it was. Reuse would not help
+anyway: classification sends the first two pages only and extraction sends the whole
+document, so the two stages upload different bytes.
 """
 
 import io
@@ -31,7 +35,13 @@ logger = logging.getLogger(__name__)
 #: that actually sends it — rather than assumed by the logger.
 PROVIDER_NAME = "anthropic"
 
-DEFAULT_MODEL = "claude-opus-4-8"
+#: Used only when ``AI_MODEL`` is unset. Haiku, not a frontier model, and that is the
+#: point: this default governs classification and extraction, the two stages the cost
+#: work exists to keep cheap. It was ``claude-opus-4-8`` — left over from the first
+#: classification spike — so an environment that simply forgot to set ``AI_MODEL`` ran
+#: every document through a model 5x the input price, correctly billed and nowhere
+#: announced. Set ``AI_MODEL`` explicitly; the factory warns when it falls back here.
+DEFAULT_MODEL = "claude-haiku-4-5"
 _FILES_BETA = "files-api-2025-04-14"
 
 # The Files API rejects filenames with forbidden characters (path separators, etc.).
