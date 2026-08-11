@@ -62,13 +62,14 @@ from app.services.ai_logging import (
     sanitize_validation_error,
 )
 from app.services.classification import DocumentSection
+from app.services.dates import iso_date
 from app.services.ocr import TextExtractionError, extract_text
 from app.services.source_loading import load_source_document
 from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "rx-2026-08-08"
+PROMPT_VERSION = "rx-2026-08-11"
 #: rx-3 added ``form``, the model's own classification into the form vocabulary, used only
 #: where the lookup table has nothing to say. rx-2 added ``form_raw``/``form_normalized``.
 #: Payloads either side of a boundary are not comparable without knowing which side they
@@ -84,9 +85,16 @@ STAGE_NAME = "extracting_prescription"
 
 #: A prescription is short next to a lab panel — a dozen medicines with five fields each.
 #: Measured over 21 real documents: 280 output tokens on average, the largest a 14-page
-#: consolidated pharmacy bill at 5,852. 8192 leaves room for that without paying for it
-#: on the ordinary case, since max_tokens is a ceiling and not an allocation.
-PRESCRIPTION_MAX_TOKENS = 8192
+#: consolidated pharmacy bill at 5,852.
+#:
+#: Raised 8192 -> 16384 on ``extraction.py``'s own reasoning, because the numbers are the
+#: same argument: that bill used 71% of the old ceiling, and extraction raised its own when
+#: a panel reached 73%. Rule 13 requires one entry per printed line even where a drug
+#: repeats, so a consolidated document's tail is longer than the average suggests. Headroom
+#: is nearly free — max_tokens is a ceiling and not an allocation, so this costs nothing on
+#: the ordinary document. Truncation is caught cleanly now (one ``response_truncated``
+#: rather than a retry loop), but a caught truncation is still a bill that produced nothing.
+PRESCRIPTION_MAX_TOKENS = 16384
 
 #: How much of a name must be found in the document's text, as a ratio of its characters.
 #: Not 1.0: a reader tidies as it reads ("TAB. DOLO 650" for "TAB DOLO 650"), and an exact
@@ -269,7 +277,9 @@ SYSTEM_PROMPT = (
     "medicine is often billed again on another date or page — each is a separate purchase "
     "and gets its own entry, even when name and strength repeat exactly.\n\n"
     "Also return prescribed_date (the date the prescription is dated) and prescriber (the "
-    "doctor or hospital named on it), or null for either if not shown."
+    "doctor or hospital named on it), or null for either if not shown.\n"
+    "Dates: return DD/MM/YYYY, digits only. Never a month name, never a clock time. "
+    '"23rd December 2021" -> "23/12/2021". Use null when the document does not state it.'
 )
 
 #: Completeness has to be demanded explicitly — the same lesson ``extraction`` records for
@@ -419,8 +429,18 @@ def _has_drug_identity(name: str) -> bool:
     while naming no medicine at all. A row like that is not a hallucination — it is a
     misread heading or a stray table cell — and storing it as a prescribed medicine would
     be wrong in a way no downstream reader could detect.
+
+    **A part carrying a digit counts however short it is.** The length test alone read
+    "short" as "not a drug" and dropped ``D3`` — two characters, and one of the most
+    commonly prescribed things in India ("Tab D3 60K", the weekly vitamin D dose). ``K2``
+    went the same way. No dosage form is written with a digit in it, so a digit is enough
+    to tell a drug from the furniture, and the name still has to appear on the page before
+    anything is stored.
     """
-    return any(len(part) > 2 and part not in _FORM_WORDS for part in _NOT_ALNUM.split(name.lower()))
+    return any(
+        (len(part) > 2 or any(c.isdigit() for c in part)) and part not in _FORM_WORDS
+        for part in _NOT_ALNUM.split(name.lower())
+    )
 
 
 #: The three answers ``_appears_in`` can give, strongest first. ``PARTIAL`` is kept but
@@ -487,11 +507,16 @@ def _verify_against_document(
     medicine that is no longer there.
     """
     # A name with no drug in it is dropped whatever the document says, so this needs no
-    # text at all and runs first.
+    # text at all and runs first. Dropped names join `rejected` rather than vanishing:
+    # this was the one path in the stage that removed a medicine and recorded nothing, so
+    # a filtered prescription and an empty one looked identical to every reader.
+    nameless = [row.name_as_written for row in rows if not _has_drug_identity(row.name_clean)]
     rows = [row for row in rows if _has_drug_identity(row.name_clean)]
+    for name in nameless:
+        logger.warning("%r names no drug - dropped", name)
 
     if not rows:
-        return [], [], [], True, {}
+        return [], nameless, [], True, {}
 
     try:
         # Text layer only, never OCR: this guard rejects nothing without text it can trust,
@@ -500,7 +525,7 @@ def _verify_against_document(
         extracted = extract_text(document, allow_ocr=False)
     except TextExtractionError:
         logger.warning("document could not be read as text - prescription names unchecked")
-        return rows, [], [], False, {}
+        return rows, nameless, [], False, {}
 
     unread = sum(1 for page in extracted.pages if page.method == "skipped")
     if unread or not extracted.text.strip():
@@ -509,7 +534,7 @@ def _verify_against_document(
             unread,
             extracted.page_count,
         )
-        return rows, [], [], False, extracted.as_metadata()
+        return rows, nameless, [], False, extracted.as_metadata()
 
     haystack = _normalise(extracted.text)
     kept: list[PrescribedMedicine] = []
@@ -538,7 +563,7 @@ def _verify_against_document(
         logger.warning("%r is not on the document - dropped", name)
     for name in loose:
         logger.info("%r matched the page only in part - kept and flagged", name)
-    return kept, rejected, loose, True, extracted.as_metadata()
+    return kept, nameless + rejected, loose, True, extracted.as_metadata()
 
 
 # --- payload ----------------------------------------------------------------
@@ -645,13 +670,20 @@ def _build_payload(
     if rejected:
         # Surfaced rather than swallowed: a name the model produced that the page does not
         # contain is the failure mode this stage most needs to be visible.
+        #
+        # Two reasons land here and the wording covers both, because a reader only needs to
+        # know a row was left out and which one. A name the page never mentions is a
+        # possible invention; a name that is only a dosage form ("Tablet") is printed all
+        # over the page and names no drug, so "not found on the document" would be untrue
+        # of it. The second used to be dropped in silence — the one path in this stage that
+        # removed a medicine and recorded nothing.
         flags.append(
             {
                 "code": "names_not_on_document",
                 "names": rejected,
                 "detail": (
-                    f"{_count(rejected, 'medicine')} could not be found anywhere on the "
-                    f"document and {'has' if len(rejected) == 1 else 'have'} been left "
+                    f"{_count(rejected, 'entry')} could not be matched to a medicine on "
+                    f"the document and {'has' if len(rejected) == 1 else 'have'} been left "
                     f"out: {', '.join(rejected)}."
                 ),
             }
@@ -704,7 +736,14 @@ def _build_payload(
         "section": DocumentSection.PRESCRIPTIONS.value,
         "fields": {
             "medicines": rows,
-            "prescribed_date": result.prescribed_date,
+            # Normalised here rather than trusted from the model, exactly as every
+            # SectionSpec date is. This stage has its own pipeline rather than a spec, so
+            # it never inherited either half — no date rule in the prompt and no
+            # iso_date() on the way out — and stored "23rd December 2021" verbatim. The
+            # app declares this field a date and renders anything that is not ISO
+            # unchanged, so one prescription read "Dated: 23rd December 2021" and the next
+            # "Dated: 15/01/2026", decided by how the document happened to print it.
+            "prescribed_date": iso_date(result.prescribed_date),
             "prescriber": result.prescriber,
         },
         "flags": flags,
