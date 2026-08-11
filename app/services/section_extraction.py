@@ -64,7 +64,7 @@ from app.workers.stagetypes import RejectStageError, StageContext, TransientStag
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "sec-2026-08-05"
+PROMPT_VERSION = "sec-2026-08-11"
 SCHEMA_VERSION = "sec-2"
 STAGE_NAME = "extracting_section"
 
@@ -157,10 +157,13 @@ def build_payload(
     for name in spec.currency_fields:
         fields[name] = normalise_currency(fields.get(name))
 
+    flags = _date_flags(spec, fields)
+    flags.extend(_drop_unsourced_summary(spec, fields))
+
     payload: dict[str, Any] = {
         "section": spec.section.value,
         "fields": fields,
-        "flags": _date_flags(spec, fields),
+        "flags": flags,
     }
     if extracted is not None:
         payload["source"] = extracted.as_metadata()
@@ -189,6 +192,52 @@ def _date_flags(spec: SectionSpec, fields: dict[str, Any]) -> list[dict[str, str
                 }
             )
     return flags
+
+
+def _drop_unsourced_summary(spec: SectionSpec, fields: dict[str, Any]) -> list[dict[str, str]]:
+    """Delete a patient-facing summary that has nothing behind it, and say so.
+
+    A scan report's ``summary`` is written ABOUT the radiologist's impression and
+    findings, not transcribed from the document. When neither is present there is no read
+    to put into plain words — and asked for three to six sentences anyway, a model fills
+    the gap. Measured on this prompt with a bare X-ray image's burned-in header:
+
+        "The radiologist reviewed the pictures and found no broken bones, no problems
+         with the heart or lungs, and no other abnormalities. Everything looked normal."
+
+    Nothing in that document says a radiologist saw it, or mentions heart or lungs. It is
+    a false all-clear on a chest X-ray, produced from two stamped words, and it is the
+    worst output this service can generate.
+
+    So Python decides, exactly as it decides abnormal flags, dates and money: a summary
+    survives only when something it could have been written from survives. The factual
+    fields are untouched — scan type, body part, date and facility are transcription, and
+    the user is still shown "Chest X-Ray, 12 March" for an image with no report.
+
+    The flag fires whenever there is no read, whether or not a summary had to be deleted —
+    with the prompt tightened the model usually returns null on its own, and an empty card
+    with no explanation reads as "the AI failed" rather than "there was nothing here to
+    read". That is the same absence-versus-failure confusion the pending-document note
+    had. Saying it plainly is the point of the feature, not a side effect of the guard.
+    """
+    if not spec.summary_field or not spec.summary_sources:
+        return []
+    if any(fields.get(name) for name in spec.summary_sources):
+        return []
+
+    # Nothing to summarise. Delete any summary the model wrote anyway, and say why the
+    # card is empty either way.
+    fields[spec.summary_field] = None
+    return [
+        {
+            "code": "no_radiologist_read",
+            "field": spec.summary_field,
+            "detail": (
+                "No radiologist's report was found in this document — only the scan "
+                "itself. It is saved and you can open it any time."
+            ),
+        }
+    ]
 
 
 #: Below this mean Tesseract confidence the read is unreliable enough that a missing

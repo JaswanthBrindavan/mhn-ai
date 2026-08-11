@@ -250,11 +250,29 @@ _SCAN_PROMPT = (
     "  You are still not a doctor: no diagnosis, no advice, no reassurance or alarm "
     "beyond what the report itself says. The radiologist's exact wording is preserved "
     "in impression, so nothing is lost by keeping this plain.\n"
-    "  For example: 'This was an X-ray of the left knee. The knee is the joint in the "
-    "middle of your leg. The pictures did not show any broken bones or other problems. "
-    "Everything looked normal.'\n"
+    "  For example, where the report states the knee is normal: 'This was an X-ray of "
+    "the left knee. The knee is the joint in the middle of your leg. The report says the "
+    "pictures did not show any problems.'\n"
+    "    * The summary RESTATES impression and findings in plainer words. It may not add "
+    "anything they do not contain. If the impression is one short phrase, the summary is "
+    "one or two plain sentences — do not expand it. NEVER name an organ, a structure or a "
+    "condition the document does not mention: an impression reading 'Normal study' "
+    "becomes 'The report says this scan looked normal', NOT a list of the parts that were "
+    "checked and found healthy.\n"
+    "    * NEVER state or imply that a radiologist reviewed, reported on or cleared the "
+    "images unless the document says so. A scan image carrying only a header, a "
+    "technologist's note or a stamp has not been reported on.\n"
+    "    * A technologist's working note ('repeat done, patient moved', exposure "
+    "settings) is not a finding and does not belong in the summary at all.\n"
     "- impression: the radiologist's impression or conclusion, as printed.\n"
     "- findings: at most 5 short key findings, most important first.\n\n"
+    "**Many uploads are the IMAGE alone — an X-ray or scan with a burned-in header and no "
+    "radiologist's report anywhere in the text.** That is expected and is not a failure. "
+    "Transcribe the factual fields you can read (scan_type, body_part, scan_date, "
+    "facility) and return null for summary and impression and an empty findings list. Do "
+    "not describe what the picture might show: you are reading TEXT, you cannot see the "
+    "image, and a reassuring sentence about a scan nobody reported on is the most harmful "
+    "thing you could write here.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
 )
 
@@ -339,6 +357,20 @@ class SectionSpec:
     #: Fields holding a currency, resolved to an ISO-4217 code. Listed explicitly rather
     #: than found by name so the rule is visible in the spec, like every other field.
     currency_fields: tuple[str, ...] = ()
+    #: A patient-facing field written ABOUT other fields rather than transcribed from the
+    #: document, and the fields it must be written from. When none of those carries
+    #: anything, the summary has no source and is dropped — see ``interpretation_flag``.
+    #:
+    #: Only scans have one, and it is the field that made this necessary: asked for three
+    #: to six sentences, a model handed a bare X-ray image's burned-in header produced
+    #: "The radiologist reviewed the pictures and found no problems with the heart or
+    #: lungs. Everything looked normal." No radiologist read that document. Python decides
+    #: whether there was anything to summarise, for the same reason it decides abnormal
+    #: flags and dates: a prompt is a request, and this one is a false all-clear.
+    summary_field: str | None = None
+    #: What the summary must be written from. Non-empty in any of these means there is a
+    #: read to put into plain words.
+    summary_sources: tuple[str, ...] = ()
 
 
 INSTRUCTION_PREFIX = (
@@ -371,6 +403,8 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         system_prompt=_SCAN_PROMPT,
         max_tokens=4096,
         date_fields=("scan_date",),
+        summary_field="summary",
+        summary_sources=("impression", "findings"),
     ),
     DocumentSection.VACCINATIONS: SectionSpec(
         section=DocumentSection.VACCINATIONS,
