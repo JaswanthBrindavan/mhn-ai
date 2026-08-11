@@ -29,6 +29,7 @@ from app.schemas.results import (
     RetryResponse,
 )
 from app.schemas.runs import CreateRunRequest, SubmittedDocument
+from app.services import filing
 from app.services import runs as runs_service
 from app.services.classification import (
     DOCUMENT_TYPE_BY_SECTION,
@@ -237,6 +238,95 @@ def retry_document(
                 )
             ]
         ),
+        request_id,
+        s3=s3,
+        sqs=sqs,
+        settings=settings,
+    )
+    submitted = result.items[0]
+    return RetryResponse(
+        document_id=document_id,
+        item_id=submitted.item_id,
+        run_id=result.run_id,
+        status=submitted.status,
+    )
+
+
+def refile_document(
+    session: Session,
+    document_id: int,
+    request_id: str | None,
+    *,
+    s3: "S3Client",
+    sqs: "SQSClient",
+    settings: "Settings",
+) -> RetryResponse:
+    """Accept this service's classification: move the document there and process it.
+
+    The one action offered on a document flagged ``section_mismatch`` — filed where the
+    user put it, with nothing read from it. There is no general section-to-section mover
+    and this is not one: the destination is always the section we detected, because that is
+    the only one we have an opinion about.
+
+    Refused for anything else. A document that was actually processed is not movable at
+    all: its stored results describe the section it is in, and moving it would leave a lab
+    report's insights attached to a row in Insurance.
+
+    The move and the reprocessing are separate steps on purpose. Once the row has moved and
+    the run item points at it, an ordinary submission does the rest — ``_source_keys``
+    resolves the new key from that item, and ``filing._adopt_prior_filing`` finds a prior
+    filing whose section now matches, so the stages update the moved row rather than filing
+    a second copy. ``intended_section`` is deliberately not carried over: the user has just
+    accepted our reading, so there is no competing intent left to compare against.
+    """
+    item = _latest_item(session, document_id)
+    if item is None:
+        raise ApiError(404, "no_ai_result", "No AI result exists for this document")
+
+    if item.section_row_id is None or item.filed_section is None:
+        raise ApiError(
+            409,
+            "not_filed",
+            "This document has not been filed into a section",
+            {"status": item.status},
+        )
+
+    clf = _classification(session, item.id)
+    if clf is None:
+        raise ApiError(409, "not_classified_yet", "This document has not been classified yet")
+
+    if clf.section == item.filed_section:
+        raise ApiError(
+            409,
+            "already_in_detected_section",
+            "This document is already in the section it was classified as",
+            {"filed_section": item.filed_section},
+        )
+
+    detected = DocumentSection(clf.section)
+    if detected not in filing.SECTION_TABLES:
+        # `bills`, `medical_condition`, `unknown`: we never file these, so there is nowhere
+        # to move it TO. The app does not offer the action for them either.
+        raise ApiError(
+            409,
+            "section_not_filable",
+            f"Documents classified as {clf.section} are not filed by this service",
+            {"detected_section": clf.section},
+        )
+
+    filing.refile_to_detected(
+        session,
+        s3,
+        item_id=item.id,
+        section_row_id=item.section_row_id,
+        from_section=DocumentSection(item.filed_section),
+        to_section=detected,
+        bucket=settings.s3_bucket,
+    )
+
+    result = runs_service.create_run(
+        session,
+        CreateRunRequest(documents=[SubmittedDocument(document_id=document_id)]),
         request_id,
         s3=s3,
         sqs=sqs,

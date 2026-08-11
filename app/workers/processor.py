@@ -20,7 +20,7 @@ from app.integrations.sqs import ReceivedMessage, delete_message
 from app.models.ai_results import AiReportClassification
 from app.models.enums import RunItemStatus
 from app.models.processing import AiProcessingRunItem
-from app.services import assembly, filing, processing
+from app.services import assembly, filing, processing, section_extraction
 from app.services.classification import DocumentSection
 from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
@@ -171,10 +171,10 @@ def _process(
             )
             return Outcome.RETRY
 
-    if outcome is Outcome.COMPLETED:
-        _ack(sqs, settings, message)
-    elif outcome is Outcome.CANCELLED:
-        # cancelled is terminal and set by the API; just drop the message.
+    if outcome in (Outcome.COMPLETED, Outcome.CANCELLED, Outcome.REJECTED):
+        # All terminal. `cancelled` is set by the API, and `rejected` here is the
+        # filed-against-our-classification path, which handles its own bookkeeping rather
+        # than raising — see _file_against_classification.
         _ack(sqs, settings, message)
     return outcome
 
@@ -229,6 +229,70 @@ def _source_key(session: Session, item_id: UUID) -> str:
     return str(value) if value else ""
 
 
+def _file_against_classification(
+    ctx: StageContext, session: Session, *, intended: DocumentSection, detected: DocumentSection
+) -> Outcome:
+    """The user filed it under one section and we read it as another. File it their way.
+
+    Their choice wins on WHERE, ours wins on WHETHER. The document goes to the section they
+    picked — an upload category or a move out of Unclassified is an explicit instruction —
+    and the pipeline does not run, because running an insurance policy through the scan
+    extractor produces confident nonsense. The disagreement is recorded as a flag, which is
+    also what unlocks the "Move to <detected>" action.
+
+    This replaces rejecting-and-leaving-it-in-intake, which read as the safe option and was
+    not: `moveUnclassified` publishes nothing and deletes the source object, so the
+    re-filing the design told users to do was the one action that made a document
+    permanently unprocessable.
+
+    Ends `rejected` with `section_mismatch` as before — it is routing, not an error, and
+    Spring is told not to surface it as one. What is new is that `section_row_id` and
+    `filed_section` are set, so the caller can see both where it went and where we think it
+    belongs.
+    """
+    if intended not in filing.SECTION_TABLES:
+        # `bills` / `medical_condition`: no table binding here, so we cannot file it and
+        # Spring keeps its own mover for those. Unchanged behaviour — stays in intake.
+        raise RejectStageError(
+            "section_mismatch",
+            f"Filed under {intended.value} but classified as {detected.value}",
+        )
+
+    section_row_id = filing.file_document(
+        session,
+        ctx.s3,
+        item_id=ctx.item_id,
+        document_id=ctx.document_id,
+        section=intended,
+        content=assembly.build_content(
+            session, ctx.item_id, state=assembly.ContentState.CLASSIFIED
+        ),
+        bucket=ctx.settings.s3_bucket,
+        expected=_IN_PROGRESS,
+    )
+    if section_row_id is None:
+        return Outcome.CANCELLED
+
+    section_extraction.record_section_mismatch(ctx, intended, detected)
+    filing.write_content(
+        session,
+        ctx.item_id,
+        assembly.build_content(session, ctx.item_id, state=assembly.ContentState.COMPLETE),
+    )
+    processing.reject_item(
+        session,
+        ctx.item_id,
+        code="section_mismatch",
+        message=f"Filed under {intended.value} but classified as {detected.value}",
+        expected=_IN_PROGRESS,
+    )
+    logger.info(
+        "item_rejected",
+        extra={"item_id": str(ctx.item_id), "reason": "section_mismatch"},
+    )
+    return Outcome.REJECTED
+
+
 def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     """Classify, file, then run whatever that section needs, honouring cancellation.
 
@@ -253,12 +317,7 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
 
     intended = _intended_section(session, ctx.item_id)
     if intended is not None and intended is not section:
-        # The user uploaded into one section and the document belongs to another. Stop
-        # before paying for extraction; the document stays in intake for them to re-file.
-        raise RejectStageError(
-            "section_mismatch",
-            f"Uploaded into {intended.value} but classified as {section.value}",
-        )
+        return _file_against_classification(ctx, session, intended=intended, detected=section)
 
     pipeline = SECTION_PIPELINES.get(section)
     if section is DocumentSection.PRESCRIPTIONS and ctx.handwriting == "mostly":

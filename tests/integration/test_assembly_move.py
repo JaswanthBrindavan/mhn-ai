@@ -142,6 +142,12 @@ def test_content_at_filing_time_carries_only_the_classification(db_session, make
     assert content["extraction"] is None
     assert content["section_extraction"] is None
     assert content["insights"] is None
+    # The intake id, carried because filing DELETES the row it names. It is the only
+    # identifier `/refile` and `/status` accept, and once the document is filed the app
+    # reaches it through its section row — so without this the payload is the last place
+    # the two ids are connected, and the mismatch flag would offer an action nothing
+    # could address.
+    assert content["document_id"] == document_id
 
 
 def test_completed_report_content_has_extraction_and_insights(db_session, make_document):
