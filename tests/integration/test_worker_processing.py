@@ -489,14 +489,55 @@ def test_an_upload_into_the_matching_section_behaves_identically(
     assert content["insights"] is None
 
 
-def test_a_section_mismatch_stops_at_classification_and_files_nothing(
+def test_a_section_mismatch_files_where_the_user_put_it_and_reads_nothing(
     db_session, make_document, session_factory, test_settings, aws
 ):
-    """Uploaded into Reports, but it is an insurance policy. Stop before paying for
-    extraction, and leave the document where the user can re-file it."""
+    """Uploaded into Reports, but it is an insurance policy.
+
+    Their choice wins on WHERE, ours wins on WHETHER. The document goes to Reports because
+    that is where they filed it; the pipeline does not run, because reading an insurance
+    policy with the report extractor produces confident nonsense.
+
+    **This test used to assert the opposite** — that nothing was filed and the document
+    stayed in intake "where the user can re-file it". That recovery was the trap: Spring's
+    `moveUnclassified` publishes nothing and deletes the source object, so re-filing by hand
+    was the one action that made a document permanently unprocessable. Rewritten rather
+    than deleted, because it is the test that pins the decision either way.
+    """
     _, sqs, queue_url, _ = aws
     s3 = aws[0]
     item_id, run_id, document_id = _seed_item(db_session, make_document, intended_section="reports")
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs, queue_url, session_factory, test_settings, aws, ai=_ClassifiesAs("insurance")
+    )
+
+    # Still `rejected` / `section_mismatch`: routing, not an error, and Spring is told not
+    # to surface it as one. What is new is that it was filed while being rejected.
+    assert outcome is Outcome.REJECTED
+    item = _item(db_session, item_id)
+    assert item["last_error_code"] == "section_mismatch"
+    assert item["filed_section"] == "reports"
+    assert item["section_row_id"] is not None
+    # Filed like any other document: out of intake, object relocated under the section.
+    assert not _source_exists(db_session, document_id)
+    assert item["source_key"].startswith("reports/")
+    assert object_exists(s3, test_settings.s3_bucket, item["source_key"]) is True
+    # And read: nothing. The payload carries the disagreement instead of fields.
+    row = _section_row(db_session, item_id)
+    assert row["data"]["fields"] == {}
+    assert [f["code"] for f in row["data"]["flags"]] == ["section_mismatch"]
+    assert "insurance document" in row["data"]["flags"][0]["detail"]
+
+
+def test_a_mismatch_into_a_section_we_cannot_file_stays_in_intake(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """`bills` and `medical_condition` have no table binding here, so there is nowhere to
+    put it. Unchanged behaviour: rejected, still in intake, Spring keeps its own mover."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document, intended_section="bills")
     publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     outcome = _process(
@@ -507,11 +548,7 @@ def test_a_section_mismatch_stops_at_classification_and_files_nothing(
     item = _item(db_session, item_id)
     assert item["last_error_code"] == "section_mismatch"
     assert item["section_row_id"] is None
-    # Still in intake, object untouched.
     assert _source_exists(db_session, document_id)
-    assert object_exists(s3, test_settings.s3_bucket, item["source_key"]) is True
-    # Nothing was extracted: the mismatch is caught before the section's stages run.
-    assert _section_row(db_session, item_id) is None
 
 
 @pytest.mark.parametrize("section", ["bills", "medical_condition", "prescriptions", "unknown"])

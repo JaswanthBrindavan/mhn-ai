@@ -144,6 +144,71 @@ def extract_section(ctx: StageContext) -> None:
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
 
 
+def record_section_mismatch(
+    ctx: StageContext, filed_section: DocumentSection, detected_section: DocumentSection
+) -> None:
+    """Record that a document was filed where the USER put it, not where we placed it.
+
+    The document goes to the section the user chose — an upload category or a move out of
+    Unclassified is an explicit instruction, and refusing it left the document stranded in
+    Unclassified with no working recovery at all. What is withheld is the pipeline: we do
+    not transcribe an insurance policy with the scan extractor because someone filed it
+    under Scans.
+
+    The flag is what makes that state legible, and it is also the permission: the app shows
+    a "Move to <detected>" action only on a document carrying this, so a correctly filed
+    one cannot be shuffled around. Written as an ``ai_section_extractions`` row with no
+    fields, exactly as ``prescriptions.record_handwritten`` does for a page we deliberately
+    did not read — which means the existing content envelope and the app's existing flag
+    rendering both work with no change.
+
+    No model call is made, so the process log records ``"skipped"`` for provider and model
+    rather than claiming one that never happened.
+    """
+    payload: dict[str, Any] = {
+        "section": filed_section.value,
+        "fields": {},
+        "flags": [
+            {
+                "code": "section_mismatch",
+                "field": "",
+                "detail": (
+                    f"This looks like {_article(detected_section)}, not "
+                    f"{_article(filed_section)}. It has been saved here because that is "
+                    f"where you filed it, and nothing was read from it."
+                ),
+            }
+        ],
+    }
+    _persist(ctx, filed_section, payload)
+    _log(ctx, outcome="succeeded", duration_ms=0)
+    logger.info(
+        "document_filed_against_classification",
+        extra={
+            "item_id": str(ctx.item_id),
+            "filed_section": filed_section.value,
+            "detected_section": detected_section.value,
+        },
+    )
+
+
+#: Section names as a person would say them, for the sentence above.
+_SECTION_LABEL = {
+    DocumentSection.REPORTS: "a lab report",
+    DocumentSection.SCANS_IMAGING: "a scan report",
+    DocumentSection.INSURANCE: "an insurance document",
+    DocumentSection.VACCINATIONS: "a vaccination record",
+    DocumentSection.PRESCRIPTIONS: "a prescription",
+    DocumentSection.BILLS: "a bill",
+    DocumentSection.MEDICAL_CONDITION: "a medical condition record",
+    DocumentSection.UNKNOWN: "something we could not identify",
+}
+
+
+def _article(section: DocumentSection) -> str:
+    return _SECTION_LABEL.get(section, section.value.replace("_", " "))
+
+
 def build_payload(
     spec: SectionSpec, result: BaseModel, extracted: ExtractedText | None = None
 ) -> dict[str, Any]:
