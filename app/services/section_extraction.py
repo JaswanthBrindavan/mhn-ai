@@ -55,7 +55,7 @@ from app.services.ai_logging import (
     sanitize_validation_error,
 )
 from app.services.classification import DocumentSection
-from app.services.dates import in_order, iso_date
+from app.services.dates import add_interval, in_order, iso_date
 from app.services.money import normalise_amount, normalise_currency
 from app.services.ocr import ExtractedText, TextExtractionError, extract_text
 from app.services.section_specs import INSTRUCTION_PREFIX, SectionSpec, spec_for
@@ -65,7 +65,9 @@ from app.workers.stagetypes import RejectStageError, StageContext, TransientStag
 logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "sec-2026-08-11"
-SCHEMA_VERSION = "sec-2"
+#: sec-3 added ``next_due_interval``: a vaccination record stating "due after 4 weeks"
+#: rather than a date. The model used to compute that date; Python does now.
+SCHEMA_VERSION = "sec-3"
 STAGE_NAME = "extracting_section"
 
 
@@ -156,6 +158,10 @@ def build_payload(
         fields[name] = normalise_amount(fields.get(name))
     for name in spec.currency_fields:
         fields[name] = normalise_currency(fields.get(name))
+    for target, start, interval in spec.derived_from_interval:
+        # A printed date wins; this only fills the gap the model was told to leave.
+        if not fields.get(target):
+            fields[target] = add_interval(fields.get(start), fields.get(interval))
 
     flags = _date_flags(spec, fields)
     flags.extend(_drop_unsourced_summary(spec, fields))
