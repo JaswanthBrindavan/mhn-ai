@@ -135,7 +135,11 @@ def test_scan_payload_normalises_a_study_timestamp():
         scan_type="X-Ray",
         body_part="Left Knee",
         scan_date="31/08/2021 18:11:28",
-        summary="An X-ray of the left knee. Everything looks normal.",
+        # An impression, because this fixture was itself an instance of the bug the
+        # summary guard now catches: three sentences saying everything looks normal, with
+        # no radiologist's read anywhere behind them. See test_scan_summary_guard.py.
+        impression="No acute bony injury.",
+        summary="An X-ray of the left knee. The report says nothing was broken.",
         findings=[],
     )
     payload = build_payload(spec, fields)
