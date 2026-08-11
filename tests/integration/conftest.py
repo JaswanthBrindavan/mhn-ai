@@ -119,6 +119,8 @@ def test_settings(aws) -> Settings:
         aws_region=REGION,
         s3_bucket=BUCKET,
         sqs_queue_url=queue_url,
+        # Read by /ready to report the queue's depth. Nothing else in the application
+        # reads it — the redrive policy itself lives on the main queue in AWS.
         sqs_dlq_url=dlq,
         max_file_bytes=1_000_000,
     )

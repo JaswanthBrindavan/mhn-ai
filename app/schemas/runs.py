@@ -98,11 +98,13 @@ class RunItemResponse(BaseModel):
 class SubmittedItem(BaseModel):
     document_id: int
     item_id: uuid.UUID
-    #: `queued` once the message is on the queue. Stays `pending` if publishing
-    #: failed — the item is durable and the stale-item sweep will retry it.
+    #: `queued` once the message is on the queue; `failed` with `publish_failed` if it
+    #: could not be enqueued, since nothing consumes an item that has no message. Retry
+    #: that one through the normal retry endpoint.
     status: str
     outcome: SubmitOutcome
-    #: Set when the item was rejected at submit, e.g. unsupported_content_type.
+    #: Set when the item was rejected at submit (e.g. unsupported_content_type) or could
+    #: not be enqueued (`publish_failed`).
     error_code: str | None = None
 
 
@@ -113,6 +115,14 @@ class CreateRunResponse(BaseModel):
 
 
 class RunProgress(BaseModel):
+    """One field per ``RunItemStatus``, and it must stay that way.
+
+    ``get_run`` builds this with ``RunProgress(total=..., **dict(counts))`` over the
+    statuses present on the run, so a status with no field here is an unexpected keyword
+    argument — which makes the whole run-read endpoint 500 rather than merely omitting a
+    number. ``tests/unit/test_run_progress_covers_every_status.py`` asserts the two agree.
+    """
+
     total: int
     pending: int = 0
     queued: int = 0

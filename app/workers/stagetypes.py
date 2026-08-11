@@ -32,6 +32,25 @@ class RejectStageError(Exception):
         self.message = message
 
 
+class PermanentStageError(Exception):
+    """A genuine processing failure that retrying cannot fix. Terminal, ends ``failed``.
+
+    Distinct from ``RejectStageError`` because the two mean opposite things to the caller:
+    a rejection is *routing* — Spring is explicitly told not to surface it as an error —
+    while this is a failure a person may need to act on.
+
+    Distinct from ``TransientStageError`` because some failures are deterministic. A
+    response cut off at the token ceiling fails validation identically on every attempt,
+    so treating it as transient burns the full attempt cap at full price to arrive at the
+    same place.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass
 class StageContext:
     item_id: UUID
@@ -46,6 +65,11 @@ class StageContext:
     s3: "S3Client"
     ai: AIProvider
     settings: Settings
+    #: How much of the document is handwritten, set by the classification stage and read by
+    #: the router in the same pass. Carried here rather than persisted because a retry
+    #: re-runs classification from the top, so there is nothing to remember between runs —
+    #: which keeps this feature clear of a schema change. "none" until classify has run.
+    handwriting: str = "none"
 
 
 Stage = Callable[[StageContext], None]

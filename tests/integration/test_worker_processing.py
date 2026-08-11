@@ -275,6 +275,40 @@ def test_reject_stage_marks_rejected_and_acks(
     assert _queue_depth(sqs, queue_url) == 0  # terminal → dropped
 
 
+def test_a_permanent_stage_failure_fails_the_item_without_spending_retries(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """A truncated response fails identically on every attempt, so retrying it only
+    pays the bill again. It ends `failed` rather than `rejected`: rejection means the
+    document was routed rather than processed, and Spring is told not to show that as
+    an error."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    from app.models.enums import RunItemStatus as S
+    from app.workers.stages import PermanentStageError
+
+    def _truncated(_ctx) -> None:
+        raise PermanentStageError("response_truncated", "hit the output token ceiling")
+
+    monkeypatch.setattr("app.workers.processor.CLASSIFY_STAGE", (S.CLASSIFYING, _truncated))
+
+    outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
+
+    assert outcome is Outcome.FAILED
+    assert _status(db_session, item_id) == S.FAILED.value
+    row = db_session.execute(
+        text("SELECT last_error_code, attempt_count FROM ai_processing_run_items WHERE id=:id"),
+        {"id": item_id},
+    ).one()
+    assert row.last_error_code == "response_truncated"
+    # One attempt, not the cap: the point of the change is that the other two are never
+    # spent on a failure that cannot come out differently.
+    assert row.attempt_count == 1
+    assert _queue_depth(sqs, queue_url) == 0  # terminal → dropped, not redelivered
+
+
 # --- attempt cap ------------------------------------------------------------
 
 
@@ -310,14 +344,17 @@ class _ClassifiesAs(FakeAIProvider):
     whatever stage follows it, and they need different payloads.
     """
 
-    def __init__(self, section: str) -> None:
+    def __init__(self, section: str, handwriting: str = "none") -> None:
         super().__init__()
         self.section = section
+        self.handwriting = handwriting
 
     def analyze_document(self, **kwargs):
         default = super().analyze_document(**kwargs)  # records the call
         if "section" in kwargs["json_schema"].get("properties", {}):
-            return structured_response(classification_payload(section=self.section))
+            return structured_response(
+                classification_payload(section=self.section, handwriting=self.handwriting)
+            )
         return default
 
 
@@ -452,14 +489,55 @@ def test_an_upload_into_the_matching_section_behaves_identically(
     assert content["insights"] is None
 
 
-def test_a_section_mismatch_stops_at_classification_and_files_nothing(
+def test_a_section_mismatch_files_where_the_user_put_it_and_reads_nothing(
     db_session, make_document, session_factory, test_settings, aws
 ):
-    """Uploaded into Reports, but it is an insurance policy. Stop before paying for
-    extraction, and leave the document where the user can re-file it."""
+    """Uploaded into Reports, but it is an insurance policy.
+
+    Their choice wins on WHERE, ours wins on WHETHER. The document goes to Reports because
+    that is where they filed it; the pipeline does not run, because reading an insurance
+    policy with the report extractor produces confident nonsense.
+
+    **This test used to assert the opposite** — that nothing was filed and the document
+    stayed in intake "where the user can re-file it". That recovery was the trap: Spring's
+    `moveUnclassified` publishes nothing and deletes the source object, so re-filing by hand
+    was the one action that made a document permanently unprocessable. Rewritten rather
+    than deleted, because it is the test that pins the decision either way.
+    """
     _, sqs, queue_url, _ = aws
     s3 = aws[0]
     item_id, run_id, document_id = _seed_item(db_session, make_document, intended_section="reports")
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs, queue_url, session_factory, test_settings, aws, ai=_ClassifiesAs("insurance")
+    )
+
+    # Still `rejected` / `section_mismatch`: routing, not an error, and Spring is told not
+    # to surface it as one. What is new is that it was filed while being rejected.
+    assert outcome is Outcome.REJECTED
+    item = _item(db_session, item_id)
+    assert item["last_error_code"] == "section_mismatch"
+    assert item["filed_section"] == "reports"
+    assert item["section_row_id"] is not None
+    # Filed like any other document: out of intake, object relocated under the section.
+    assert not _source_exists(db_session, document_id)
+    assert item["source_key"].startswith("reports/")
+    assert object_exists(s3, test_settings.s3_bucket, item["source_key"]) is True
+    # And read: nothing. The payload carries the disagreement instead of fields.
+    row = _section_row(db_session, item_id)
+    assert row["data"]["fields"] == {}
+    assert [f["code"] for f in row["data"]["flags"]] == ["section_mismatch"]
+    assert "insurance document" in row["data"]["flags"][0]["detail"]
+
+
+def test_a_mismatch_into_a_section_we_cannot_file_stays_in_intake(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """`bills` and `medical_condition` have no table binding here, so there is nowhere to
+    put it. Unchanged behaviour: rejected, still in intake, Spring keeps its own mover."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document, intended_section="bills")
     publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     outcome = _process(
@@ -470,18 +548,20 @@ def test_a_section_mismatch_stops_at_classification_and_files_nothing(
     item = _item(db_session, item_id)
     assert item["last_error_code"] == "section_mismatch"
     assert item["section_row_id"] is None
-    # Still in intake, object untouched.
     assert _source_exists(db_session, document_id)
-    assert object_exists(s3, test_settings.s3_bucket, item["source_key"]) is True
-    # Nothing was extracted: the mismatch is caught before the section's stages run.
-    assert _section_row(db_session, item_id) is None
 
 
 @pytest.mark.parametrize("section", ["bills", "medical_condition", "prescriptions", "unknown"])
 def test_a_section_with_no_pipeline_is_rejected_by_the_router(
     db_session, make_document, session_factory, test_settings, aws, section
 ):
-    """Routing, not failure: no extractor exists, so the document stays where it is."""
+    """Routing, not failure: no extractor exists, so the document stays where it is.
+
+    ``prescriptions`` is here for a different reason from the other three: it *has* an
+    extractor, and is held behind ``PRESCRIPTIONS_ENABLED`` until Spring can list a filed
+    prescription. Off, it must be indistinguishable from a section with no pipeline at
+    all — which is what this asserts. The mirror, with the flag on, is the next test.
+    """
     _, sqs, queue_url, _ = aws
     item_id, run_id, document_id = _seed_item(db_session, make_document)
     publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
@@ -505,6 +585,118 @@ def test_a_section_with_no_pipeline_is_rejected_by_the_router(
         ).scalar_one()
         == section
     )
+
+
+def test_a_prescription_is_filed_and_extracted_once_the_flag_is_on(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The mirror of the case above: ``PRESCRIPTIONS_ENABLED`` is the only difference.
+
+    Kept beside it so the flag's two halves are read together. The reject path is what
+    ships today; this is what the flag turns on, and it is the test that fails if a later
+    fix to the dose normaliser or the name guard breaks the pipeline.
+    """
+    _, sqs, queue_url, _ = aws
+    # The stage verifies every name against the document's own text, so the page has to
+    # actually print the medicine the model claims to have read off it.
+    document_id = make_document(body=text_pdf("Tab. DOLO 650  1-0-1 after food  5 days"))
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs,
+        queue_url,
+        session_factory,
+        test_settings.model_copy(update={"prescriptions_enabled": True}),
+        aws,
+        ai=_ClassifiesAs("prescriptions"),
+    )
+
+    assert outcome is Outcome.COMPLETED
+    row = _section_row(db_session, item_id)
+    assert row is not None and row["section"] == "prescriptions"
+    assert [m["name_clean"] for m in row["data"]["fields"]["medicines"]] == ["DOLO"]
+
+    item = _item(db_session, item_id)
+    assert item["filed_section"] == "prescriptions"
+    # Out of intake and into Spring's own prescriptions table, under its own prefix.
+    assert not _source_exists(db_session, document_id)
+    filed = _filed_row(db_session, item_id)
+    assert filed.filepath.startswith("prescriptions/")
+    assert filed.content["ai"]["state"] == "complete"
+    assert filed.content["ai"]["section_extraction"] is not None
+    # Transcription only: there is no insights stage for a prescription.
+    assert filed.content["ai"]["insights"] is None
+
+
+def test_a_handwritten_prescription_is_filed_but_never_read(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The one document we deliberately decline to extract.
+
+    A handwritten page has no text layer, so the name guard has nothing to reject with —
+    the document most likely to be misread is the one where every downstream check is
+    blind. So it is filed (it is the user's prescription and belongs in their section) and
+    nothing is read off it; the app asks for the printed pharmacy bill instead.
+
+    Filed, `completed`, and zero medicines: the three things that must all hold at once.
+    """
+    _, sqs, queue_url, _ = aws
+    document_id = make_document(body=text_pdf("Dr A Sharma  Rx  (handwritten)"))
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs,
+        queue_url,
+        session_factory,
+        test_settings.model_copy(update={"prescriptions_enabled": True}),
+        aws,
+        ai=_ClassifiesAs("prescriptions", handwriting="mostly"),
+    )
+
+    assert outcome is Outcome.COMPLETED
+    row = _section_row(db_session, item_id)
+    assert row is not None and row["section"] == "prescriptions"
+    # Nothing was read off the page.
+    assert row["data"]["fields"]["medicines"] == []
+    assert [f["code"] for f in row["data"]["flags"]] == ["handwritten_not_extracted"]
+
+    # Still filed, and finished rather than failed — "we did not read this" is an outcome,
+    # not an error, and a `failed` state would show the user a bug that isn't one.
+    item = _item(db_session, item_id)
+    assert item["filed_section"] == "prescriptions"
+    assert not _source_exists(db_session, document_id)
+    filed = _filed_row(db_session, item_id)
+    assert filed.filepath.startswith("prescriptions/")
+    assert filed.content["ai"]["state"] == "complete"
+
+
+def test_a_printed_prescription_is_still_extracted(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The guard against over-refusing: only `mostly` stops extraction.
+
+    A scanned printed slip has no text layer either, and must NOT be treated as
+    handwritten — extraction is vision, so a missing text layer is no reason to read less.
+    """
+    _, sqs, queue_url, _ = aws
+    document_id = make_document(body=text_pdf("Tab. DOLO 650  1-0-1 after food  5 days"))
+    item_id, run_id, _ = _seed_item(db_session, lambda **_: document_id)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs,
+        queue_url,
+        session_factory,
+        test_settings.model_copy(update={"prescriptions_enabled": True}),
+        aws,
+        ai=_ClassifiesAs("prescriptions", handwriting="some"),
+    )
+
+    assert outcome is Outcome.COMPLETED
+    row = _section_row(db_session, item_id)
+    assert [m["name_clean"] for m in row["data"]["fields"]["medicines"]] == ["DOLO"]
 
 
 # --- a filed document must never be left saying "still processing" ----------

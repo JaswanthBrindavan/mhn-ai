@@ -20,13 +20,15 @@ from app.integrations.sqs import ReceivedMessage, delete_message
 from app.models.ai_results import AiReportClassification
 from app.models.enums import RunItemStatus
 from app.models.processing import AiProcessingRunItem
-from app.services import assembly, filing, processing
+from app.services import assembly, filing, processing, section_extraction
 from app.services.classification import DocumentSection
 from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
 from app.workers.stages import (
     CLASSIFY_STAGE,
+    HANDWRITTEN_PRESCRIPTION_PIPELINE,
     SECTION_PIPELINES,
+    PermanentStageError,
     RejectStageError,
     StageContext,
     StageStep,
@@ -49,6 +51,8 @@ class Outcome(StrEnum):
     SKIPPED_TERMINAL = "skipped_terminal"
     NOT_FOUND = "not_found"
     GAVE_UP = "gave_up"
+    #: A deterministic failure the attempt cap would only pay to repeat.
+    FAILED = "failed"
     #: Left on the queue for redelivery; the only outcome that does not delete.
     RETRY = "retry"
 
@@ -143,6 +147,21 @@ def _process(
             logger.info("item_rejected", extra={"item_id": str(item_id), "reason": exc.code})
             _ack(sqs, settings, message)
             return Outcome.REJECTED
+        except PermanentStageError as exc:
+            # Deterministic failure — a truncated response fails the same way every
+            # time — so spend no further attempts on it. Ends `failed`, not `rejected`:
+            # rejection means the document was routed rather than processed, and Spring
+            # is told not to show that as an error. This one is one.
+            processing.fail_item(
+                session, item_id, code=exc.code, message=exc.message, expected=_IN_PROGRESS
+            )
+            filing.mark_content_failed(session, item_id)
+            logger.warning(
+                "item_permanent_failure",
+                extra={"item_id": str(item_id), "reason": exc.code},
+            )
+            _ack(sqs, settings, message)
+            return Outcome.FAILED
         except TransientStageError as exc:
             # Leave the item where it is and do NOT delete: redelivery retries it,
             # and the attempt cap in claim_item eventually gives up.
@@ -152,10 +171,10 @@ def _process(
             )
             return Outcome.RETRY
 
-    if outcome is Outcome.COMPLETED:
-        _ack(sqs, settings, message)
-    elif outcome is Outcome.CANCELLED:
-        # cancelled is terminal and set by the API; just drop the message.
+    if outcome in (Outcome.COMPLETED, Outcome.CANCELLED, Outcome.REJECTED):
+        # All terminal. `cancelled` is set by the API, and `rejected` here is the
+        # filed-against-our-classification path, which handles its own bookkeeping rather
+        # than raising — see _file_against_classification.
         _ack(sqs, settings, message)
     return outcome
 
@@ -210,6 +229,70 @@ def _source_key(session: Session, item_id: UUID) -> str:
     return str(value) if value else ""
 
 
+def _file_against_classification(
+    ctx: StageContext, session: Session, *, intended: DocumentSection, detected: DocumentSection
+) -> Outcome:
+    """The user filed it under one section and we read it as another. File it their way.
+
+    Their choice wins on WHERE, ours wins on WHETHER. The document goes to the section they
+    picked — an upload category or a move out of Unclassified is an explicit instruction —
+    and the pipeline does not run, because running an insurance policy through the scan
+    extractor produces confident nonsense. The disagreement is recorded as a flag, which is
+    also what unlocks the "Move to <detected>" action.
+
+    This replaces rejecting-and-leaving-it-in-intake, which read as the safe option and was
+    not: `moveUnclassified` publishes nothing and deletes the source object, so the
+    re-filing the design told users to do was the one action that made a document
+    permanently unprocessable.
+
+    Ends `rejected` with `section_mismatch` as before — it is routing, not an error, and
+    Spring is told not to surface it as one. What is new is that `section_row_id` and
+    `filed_section` are set, so the caller can see both where it went and where we think it
+    belongs.
+    """
+    if intended not in filing.SECTION_TABLES:
+        # `bills` / `medical_condition`: no table binding here, so we cannot file it and
+        # Spring keeps its own mover for those. Unchanged behaviour — stays in intake.
+        raise RejectStageError(
+            "section_mismatch",
+            f"Filed under {intended.value} but classified as {detected.value}",
+        )
+
+    section_row_id = filing.file_document(
+        session,
+        ctx.s3,
+        item_id=ctx.item_id,
+        document_id=ctx.document_id,
+        section=intended,
+        content=assembly.build_content(
+            session, ctx.item_id, state=assembly.ContentState.CLASSIFIED
+        ),
+        bucket=ctx.settings.s3_bucket,
+        expected=_IN_PROGRESS,
+    )
+    if section_row_id is None:
+        return Outcome.CANCELLED
+
+    section_extraction.record_section_mismatch(ctx, intended, detected)
+    filing.write_content(
+        session,
+        ctx.item_id,
+        assembly.build_content(session, ctx.item_id, state=assembly.ContentState.COMPLETE),
+    )
+    processing.reject_item(
+        session,
+        ctx.item_id,
+        code="section_mismatch",
+        message=f"Filed under {intended.value} but classified as {detected.value}",
+        expected=_IN_PROGRESS,
+    )
+    logger.info(
+        "item_rejected",
+        extra={"item_id": str(ctx.item_id), "reason": "section_mismatch"},
+    )
+    return Outcome.REJECTED
+
+
 def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     """Classify, file, then run whatever that section needs, honouring cancellation.
 
@@ -234,14 +317,21 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
 
     intended = _intended_section(session, ctx.item_id)
     if intended is not None and intended is not section:
-        # The user uploaded into one section and the document belongs to another. Stop
-        # before paying for extraction; the document stays in intake for them to re-file.
-        raise RejectStageError(
-            "section_mismatch",
-            f"Uploaded into {intended.value} but classified as {section.value}",
-        )
+        return _file_against_classification(ctx, session, intended=intended, detected=section)
 
     pipeline = SECTION_PIPELINES.get(section)
+    if section is DocumentSection.PRESCRIPTIONS and ctx.handwriting == "mostly":
+        # File it, but read nothing off it. A handwritten page has no text layer, so the
+        # name guard cannot reject with it — the one document most likely to be misread is
+        # the one where nothing downstream can check the model. The app asks for the
+        # pharmacy bill instead, which is printed and lists the same drugs.
+        pipeline = HANDWRITTEN_PRESCRIPTION_PIPELINE
+    if section is DocumentSection.PRESCRIPTIONS and not ctx.settings.prescriptions_enabled:
+        # Filing is never undone, and Spring's listMyFiles still 501s for prescriptions, so
+        # a filed one renders nowhere and cannot be moved back. Reject until Spring can
+        # display it — routing, and the same answer as before the extractor existed.
+        # Remove this branch (and the setting) once that is true.
+        pipeline = None
     if pipeline is None:
         # Correctly classified, just not a section this service processes. Routing, not
         # failure: the document stays in unclassified_files with its section recorded.

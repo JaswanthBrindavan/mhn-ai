@@ -14,6 +14,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import FrameType
 
@@ -24,6 +25,7 @@ from app.integrations.ai.factory import get_ai_provider
 from app.integrations.aws import get_s3_client, get_sqs_client
 from app.integrations.sqs import ReceivedMessage, receive_messages
 from app.workers.processor import process_message
+from app.workers.reaper import sweep_stale_items
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,11 @@ class Worker:
         self._pool = ThreadPoolExecutor(
             max_workers=settings.worker_max_concurrency, thread_name_prefix="report-worker"
         )
+        # A third of the staleness window, so an item is picked up well before it has sat
+        # for two full windows. Swept immediately on startup — a worker coming back after
+        # a crash is exactly when there is something to recover.
+        self._sweep_interval = max(30.0, settings.stale_item_timeout_seconds / 3)
+        self._last_sweep = float("-inf")
 
     def request_shutdown(self, signum: int, _frame: FrameType | None) -> None:
         logger.info("worker_shutdown_signal", extra={"signal": signum})
@@ -72,6 +79,8 @@ class Worker:
 
     def _loop(self) -> None:
         while not self._shutdown.is_set():
+            self._maybe_sweep()
+
             batch = self._acquire_slots()
             if batch == 0:
                 continue  # shutdown requested while waiting for a slot
@@ -95,6 +104,33 @@ class Worker:
             self._release(batch - len(messages))
             for message in messages:
                 self._submit(message)
+
+    def _maybe_sweep(self) -> None:
+        """Run the stale-item sweep, at most once per interval.
+
+        In the poll loop rather than a thread of its own: the loop already wakes every
+        ``sqs_wait_time_seconds`` at worst, so a timestamp check is enough and there is no
+        second thread to shut down cleanly. Every replica sweeps — ``FOR UPDATE SKIP
+        LOCKED`` makes that safe, and it means recovery does not depend on one nominated
+        worker being the one that is alive.
+        """
+        now = time.monotonic()
+        if now - self._last_sweep < self._sweep_interval:
+            return
+        self._last_sweep = now
+
+        session = SessionLocal()
+        try:
+            touched = sweep_stale_items(session, self._sqs, self._settings)
+            if touched:
+                logger.info("stale_sweep_touched_items", extra={"count": touched})
+        except Exception:
+            # A sweep failure must never take the worker down; it consumes no message and
+            # the next tick tries again.
+            logger.exception("stale_sweep_failed")
+            session.rollback()
+        finally:
+            session.close()
 
     def _acquire_slots(self) -> int:
         """Block for one slot, then grab any others immediately available."""

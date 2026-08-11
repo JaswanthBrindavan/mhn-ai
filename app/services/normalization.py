@@ -77,6 +77,62 @@ _CORE_RE = re.compile(
 )
 
 
+#: One band of an interpretation scale: a comparator, a pair, or a bare number.
+_BAND = r"(?:[<>≤≥]=?\s*)?-?\d+(?:\.\d+)?(?:\s*[-–—]\s*-?\d+(?:\.\d+)?)?"  # noqa: RUF001
+_BAND_LABEL = r"[A-Za-z][A-Za-z ]*?"
+#: Scales print the band first (">= 90 : Normal 60 - 89 : Mild Decrease") or the label
+#: first ("Low: <70 Normal: 70-99 High: >=100"). Both are one grade per band.
+_BAND_THEN_LABEL_RE = re.compile(
+    rf"(?P<band>{_BAND})\s*:\s*(?P<label>{_BAND_LABEL})(?=\s*(?:[<>≤≥]|-?\d|$))"
+)
+_LABEL_THEN_BAND_RE = re.compile(rf"(?P<label>{_BAND_LABEL})\s*:\s*(?P<band>{_BAND})")
+#: The grade that means "in range". A scale naming none of these is one we cannot read.
+_NORMAL_BAND_LABELS = frozenset(
+    {
+        "normal",
+        "normal range",
+        "within normal limits",
+        "desirable",
+        "optimal",
+        "healthy",
+        "adequate",
+        "acceptable",
+        "sufficient",
+        "sufficiency",
+    }
+)
+
+
+def _scale_bands(text: str) -> list[tuple[str, str]] | None:
+    """(label, band) pairs when this is a multi-band interpretation scale, else None.
+
+    Two or more bands, because one is not a scale — "Desirable : 2.5-3.0" is a single
+    range wearing a label, and the existing label-stripping already reads it correctly.
+    """
+    for pattern in (_BAND_THEN_LABEL_RE, _LABEL_THEN_BAND_RE):
+        found = [
+            (m.group("label").strip(), m.group("band").strip()) for m in pattern.finditer(text)
+        ]
+        if len(found) >= 2:
+            return found
+    return None
+
+
+def _normal_band(bands: list[tuple[str, str]]) -> str | None:
+    """The band the report itself calls normal, or None if it names no such grade.
+
+    Returning None matters as much as returning the band. Before this, a scale was read
+    by taking its FIRST numeric bound, which is right only when the normal grade happens
+    to be printed first — "Low: <70 Normal: 70-99 High: >=100" flagged a value of 85 as
+    high, and a healthy vitamin D of 45 came back high against a deficiency band. A wrong
+    flag is not recoverable; an unflagged result is.
+    """
+    for label, band in bands:
+        if label.strip().lower() in _NORMAL_BAND_LABELS:
+            return band
+    return None
+
+
 def _select_gender_range(text: str, gender: str | None) -> str | None:
     """The segment for this patient's sex, or None when the choice can't be made.
 
@@ -123,6 +179,13 @@ def parse_reference_range(
     selected = _select_gender_range(text.strip(), gender)
     if selected is None:
         return None
+    # A multi-band scale is read by the band it labels normal, never by whichever bound
+    # happens to be printed first. A scale naming no normal grade is left unparsed.
+    if bands := _scale_bands(selected):
+        normal = _normal_band(bands)
+        if normal is None:
+            return None
+        selected = normal
     s = _clean_range_text(selected)
     if m := _RANGE_RE.match(s):
         return float(m.group(1)), float(m.group(2))
@@ -145,6 +208,58 @@ def abnormal_flag(
     if high is not None and value > high:
         return "high"
     return "normal"
+
+
+#: Every comparator threshold printed anywhere in a range, with its operator.
+_THRESHOLD_RE = re.compile(r"(?P<op>[<>≤≥]=?)\s*(?P<number>-?\d+(?:\.\d+)?)")
+
+
+def category_split_flag(value: float | None, reference_range: str | None) -> str | None:
+    """Flag against a range split by a category we do not know, when every half agrees.
+
+    Some ranges depend on something the report does not tell us about the patient. CEA
+    prints "Non Smokers (Past / Never Smoked) - <5 Smokers (current) - <10": without
+    knowing whether this person smokes, neither threshold is *the* threshold — but a
+    result of 0.93 is under both, so it is normal whichever applies, and a result of 12
+    is over both.
+
+    This is the same rule the sex split follows, applied where the category cannot be
+    resolved instead of where it can: decide only when every possible reading agrees. A
+    value of 7 satisfies one threshold and violates the other, so it stays unflagged.
+
+    Returns None unless there are at least two thresholds, so an ordinary one-sided range
+    is left to ``parse_reference_range``, which reads it properly.
+    """
+    if value is None or reference_range is None:
+        return None
+
+    thresholds = [
+        (m.group("op").replace("≤", "<=").replace("≥", ">="), float(m.group("number")))
+        for m in _THRESHOLD_RE.finditer(reference_range)
+    ]
+    if len(thresholds) < 2:
+        return None
+
+    directions = {op[0] for op, _ in thresholds}
+    if len(directions) != 1:
+        # Thresholds pointing opposite ways describe bands, not one boundary drawn twice.
+        return None
+
+    satisfied = [
+        value < x
+        if op == "<"
+        else value <= x
+        if op == "<="
+        else value > x
+        if op == ">"
+        else value >= x
+        for op, x in thresholds
+    ]
+    if all(satisfied):
+        return "normal"
+    if not any(satisfied):
+        return "high" if directions == {"<"} else "low"
+    return None
 
 
 _COMPARATOR_RE = re.compile(r"^(?P<op>[<>≤≥]=?)\s*(?P<number>-?\d+(?:[\d,]*\d)?(?:\.\d+)?)$")
@@ -198,7 +313,15 @@ def comparator_flag(
 
 #: Words meaning "none detected". Against a numeric range they read as zero — a urine
 #: glucose of "Nil" against "0 - 2" is in range, and saying so is arithmetic, not judgement.
-_ABSENT_TERMS = frozenset({"nil", "none", "negative", "absent", "not detected", "nd", "no"})
+#:
+#: **"nd" is deliberately absent.** On an Indian lab report it means "Not Detected" often
+#: and "Not Done" often enough, and the two are opposites for this purpose: read as absent,
+#: a test that was never performed becomes 0.0 against its range and comes back
+#: ``normal`` — a clean result reported for an assay nobody ran. Every other decision in
+#: this module refuses when the readings disagree; this one may not make an exception for
+#: a two-letter abbreviation. The cost is that a genuine "ND" goes unflagged, which is the
+#: recoverable direction.
+_ABSENT_TERMS = frozenset({"nil", "none", "negative", "absent", "not detected", "no"})
 #: Words meaning "found". Prefixes, because labs qualify them: "Present 3+(500-1000 mg/dl)".
 #: Checked with startswith so "not detected" is never read as "detected".
 _PRESENT_PREFIXES = ("present", "positive", "detected", "reactive", "seen")
@@ -294,13 +417,29 @@ def enrich_result(
     ``override_bounds`` is the R&D-approved ideal range for the patient's age group; when
     given it drives the abnormal flag instead of the report's printed reference range, and
     ``range_source`` is forced to ``"ideal_range"``. Without it, behaviour is unchanged
-    (bounds parsed from ``reference_range``, ``range_source`` stays ``"report_range"``)."""
+    (bounds parsed from ``reference_range``, ``range_source`` stays ``"report_range"``).
+
+    Two fields exist so a consumer can tell WHAT the flag was decided against:
+
+    * ``flagged_against`` — the bounds that actually produced the flag, rendered. With an
+      approved ideal range in play this is NOT the printed range, and anything quoting a
+      limit to the reader has to use this one or it will cite a limit the value never
+      crossed. The insights stage does exactly that.
+    * ``range_source`` — ``"ideal_range"``, ``"report_range"``, or ``"none"`` when the
+      report printed no reference range at all. ``"report_range"`` with a null flag means
+      a range was there and could not be decided; ``"none"`` means there was nothing to
+      check against in the first place, which is a different problem with a different fix
+      (curate the THP master, not the parser).
+    """
     value = parse_number(result.get("value"))
+    printed_range = result.get("reference_range")
     if override_bounds is not None:
         bounds: tuple[float | None, float | None] | None = override_bounds
         range_source = "ideal_range"
     else:
-        bounds = parse_reference_range(result.get("reference_range"), gender)
+        bounds = parse_reference_range(printed_range, gender)
+        if not (printed_range or "").strip():
+            range_source = "none"
     conv = convert_unit(result.get("test_name", ""), value, result.get("unit"))
 
     # Values that are not plain numbers still carry decidable information. A censored
@@ -308,22 +447,57 @@ def enrich_result(
     # match what the range expects. Keeping both in Python matters: otherwise the
     # comparison silently falls to the model, which the extraction prompt forbids.
     flag = abnormal_flag(value, bounds)
-    if flag is None and value is None:
-        flag = comparator_flag(result.get("value"), bounds) or qualitative_flag(
-            result.get("value"), result.get("reference_range"), bounds
-        )
+    if flag is None:
+        if value is None:
+            flag = comparator_flag(result.get("value"), bounds) or qualitative_flag(
+                result.get("value"), result.get("reference_range"), bounds
+            )
+        elif bounds is None:
+            # A numeric value whose range resolved to no bounds at all. It can still be
+            # decided when the range prints several thresholds that all agree — a range
+            # split by a category (smoker / non-smoker) we were never told.
+            flag = category_split_flag(value, result.get("reference_range"))
 
     return {
         **result,
         "value_numeric": value,
         "abnormal_flag": flag,
         "range_source": range_source,
+        "flagged_against": render_bounds(bounds),
         "matched_parameter": matched_parameter,
         "matched_group": matched_group,
         "normalized_value": conv[0] if conv else None,
         "normalized_unit": conv[1] if conv else None,
         "normalized": conv is not None,
     }
+
+
+def _number(value: float) -> str:
+    """13.0 -> '13', 8.6 -> '8.6'. A trailing '.0' reads as false precision to a patient."""
+    return f"{value:g}"
+
+
+def render_bounds(bounds: tuple[float | None, float | None] | None) -> str | None:
+    """The bounds the flag was computed against, as a person would read them.
+
+    Rendered from the bounds rather than copied from the printed text, because the two
+    differ exactly when it matters: an approved ideal range replaces the printed one, and
+    the printed text is also frequently decorated ("Desirable : 2.5-3.0", "45-129U/L").
+
+    The comparators mirror ``abnormal_flag``: it flags high only when ``value > high``, so
+    a one-sided range parsed from "< 200" permits 200 itself and is rendered ``<= 200``.
+    Anything quoting a limit must quote the one the comparison actually used.
+    """
+    if bounds is None:
+        return None
+    low, high = bounds
+    if low is not None and high is not None:
+        return f"{_number(low)} - {_number(high)}"
+    if high is not None:
+        return f"<= {_number(high)}"
+    if low is not None:
+        return f">= {_number(low)}"
+    return None
 
 
 def canon_unit(unit: str) -> str:
@@ -369,6 +543,14 @@ if __name__ == "__main__":  # pragma: no cover - self-check
     assert enrich_result(_b12)["abnormal_flag"] == "low"
     assert enrich_result(_b12)["value_numeric"] is None
     assert enrich_result(_b12)["value"] == "< 148"
+    # The limit the flag was decided against, rendered as the comparison behaves. With an
+    # ideal-range override this is NOT the printed range, which is the whole reason it
+    # exists — see tests/unit/test_flagged_against.py.
+    assert enrich_result(_b12)["flagged_against"] == "187 - 833"
+    assert enrich_result(_b12)["range_source"] == "report_range"
+    _ideal = enrich_result(_b12, override_bounds=(200.0, 900.0))
+    assert _ideal["flagged_against"] == "200 - 900" and _ideal["range_source"] == "ideal_range"
+    assert enrich_result({**_b12, "reference_range": None})["range_source"] == "none"
 
     # Decorated ranges: a trailing unit, a label, a ratio notation, a word comparator.
     assert parse_reference_range("90 - 120 mg/dl") == (90.0, 120.0)
@@ -423,3 +605,26 @@ if __name__ == "__main__":  # pragma: no cover - self-check
     assert _over["abnormal_flag"] == "high"  # ideal range 70-90: 95 is high
     assert _over["range_source"] == "ideal_range"
     assert _over["matched_group"] == "adult all"
+
+    # A multi-band interpretation scale is read by the band the report labels normal,
+    # never by whichever bound is printed first. eGFR prints normal first; a lipid or
+    # vitamin D scale prints it in the middle, and taking the first bound flagged healthy
+    # values as high.
+    assert parse_reference_range(">= 90 : Normal 60 - 89 : Mild Decrease") == (90.0, None)
+    assert parse_reference_range("Low: <70 Normal: 70-99 High: >=100") == (70.0, 99.0)
+    assert parse_reference_range("Deficiency: <20 Insufficiency: 20-29 Sufficiency: 30-100") == (
+        30.0,
+        100.0,
+    )
+    # A scale naming no normal grade is refused rather than guessed at.
+    assert parse_reference_range("Grade I: <10 Grade II: 10-20 Grade III: >20") is None
+    # One labelled range is not a scale; the existing label stripping still reads it.
+    assert parse_reference_range("Desirable : 2.5-3.0") == (2.5, 3.0)
+
+    # A range split by a category we were never told (smoker / non-smoker): decide only
+    # when every threshold agrees, exactly as the sex split does.
+    _cea = "Non Smokers (Past / Never Smoked) - <5 Smokers (current) - <10"
+    assert category_split_flag(0.93, _cea) == "normal"  # under both
+    assert category_split_flag(12.0, _cea) == "high"  # over both
+    assert category_split_flag(7.0, _cea) is None  # depends on which applies
+    assert category_split_flag(3.0, "< 5") is None  # one threshold is not a split

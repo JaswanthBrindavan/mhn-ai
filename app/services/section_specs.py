@@ -52,11 +52,25 @@ class Exclusion(BaseModel):
 
 class InsuranceFields(BaseModel):
     """Validated insurance policy fields. Empty lists are valid (a receipt or ID card
-    carries dates and an insurer but no benefit schedule)."""
+    carries dates and an insurer but no benefit schedule).
+
+    ``currency`` is separate from the amounts on purpose: the symbol is usually printed
+    once in a column header rather than beside each number, and often survives text
+    extraction as a stray character. See ``app.services.money``, which normalises all
+    three after validation.
+
+    The money caps are generous because a cap the model is not told about is not a limit
+    — it is a paid failure. Over-long output fails validation, which this stage treats as
+    transient, so it retries the whole call. The prompt asks for digits only; the caps sit
+    well above that so a wordier answer is normalised rather than retried.
+    """
 
     insurer: str | None = Field(default=None, max_length=256)
     policy_name: str | None = Field(default=None, max_length=256)
     policy_type: str | None = Field(default=None, max_length=128)
+    currency: str | None = Field(default=None, max_length=32)
+    sum_insured: str | None = Field(default=None, max_length=64)
+    premium_amount: str | None = Field(default=None, max_length=64)
     co_pay: str | None = Field(default=None, max_length=128)
     start_date: str | None = Field(default=None, max_length=64)
     end_date: str | None = Field(default=None, max_length=64)
@@ -70,6 +84,9 @@ _INSURANCE_SCHEMA: dict[str, Any] = {
         "insurer": _NULLABLE_STR,
         "policy_name": _NULLABLE_STR,
         "policy_type": _NULLABLE_STR,
+        "currency": _NULLABLE_STR,
+        "sum_insured": _NULLABLE_STR,
+        "premium_amount": _NULLABLE_STR,
         "co_pay": _NULLABLE_STR,
         "start_date": _NULLABLE_STR,
         "end_date": _NULLABLE_STR,
@@ -96,6 +113,9 @@ _INSURANCE_SCHEMA: dict[str, Any] = {
         "insurer",
         "policy_name",
         "policy_type",
+        "currency",
+        "sum_insured",
+        "premium_amount",
         "co_pay",
         "start_date",
         "end_date",
@@ -113,16 +133,45 @@ _INSURANCE_PROMPT = (
     "- insurer: the insurance company or scheme name.\n"
     "- policy_name: the product name, if printed.\n"
     "- policy_type: a short type, e.g. 'Health Insurance (Family Floater)'.\n"
-    "- co_pay: the co-payment the insured bears per claim, as printed. Null if none.\n"
+    "- currency: the ISO-4217 code of the money on this document — 'INR' for Indian "
+    "rupees, three letters, nothing else. The symbol is often printed ONCE in a column "
+    "header ('Sum Insured (₹)') rather than beside each figure, and may reach you as a "
+    "stray character such as ` or ? because the text layer could not resolve it. Words "
+    "count as evidence too: 'Rs', 'Rs.', or an amount spelled out ('RUPEES FIFTY-TWO "
+    "THOUSAND ... ONLY'). Null only if the document shows no currency anywhere.\n"
+    "- sum_insured: the total sum insured for the policy. DIGITS AS PRINTED and nothing "
+    "else — '300,000.00', never 'Rs 300,000', never words. Not the cumulative bonus "
+    "('CB Amount'), not a per-benefit sub-limit, not one member's share.\n"
+    "- premium_amount: the TOTAL premium payable, including tax — the figure the "
+    "customer actually paid. Where the document prints a breakdown (basic premium, "
+    "loadings, service tax, total), return the total, not a component. Digits as "
+    "printed.\n"
+    "- co_pay: the co-payment the insured bears per claim, as printed ('20%', 'Rs 1,000 "
+    "per claim'). Null if the document does not mention a co-payment at all.\n"
     "- start_date / end_date: the policy period.\n"
-    "- covered_conditions: at most 5, most important first. These are the medical "
-    "conditions, treatments, or benefits the policy covers — NOT the insured people. "
-    "cap is the stated limit or sum for that condition, or null.\n"
-    "- exclusions: at most 5, most important first. What the policy does not cover.\n\n"
+    "- covered_conditions: EVERY medical condition, treatment or benefit this document "
+    "states is covered — NOT the insured people. In the order the document prints them, "
+    "with no ranking and no limit on how many. Copy each name VERBATIM from the "
+    "document; do not paraphrase it, tidy it, or translate it into a condition name of "
+    "your own. cap is the stated limit or sum for that item, as printed, or null.\n"
+    "- exclusions: EVERY item this document states is NOT covered, under the same "
+    "rules.\n\n"
     "Rules:\n"
     + _NO_INVENTION_RULE
     + _DATE_RULE
-    + "- A schedule, receipt, or ID card usually has no benefit list. Return empty "
+    + "- A benefit table is often printed in two columns and read across them, so one "
+    "line can splice two unrelated entries together. Emit only entries that read as a "
+    "whole benefit. A stray fragment left over from the splice — a bare number, or a "
+    "phrase like 'Claims free' — is not a benefit and must not be listed as one.\n"
+    "- NEVER add an item to covered_conditions or exclusions because the product name, "
+    "the insurer, or a similar policy you have seen implies it. Only what THIS document "
+    "prints. A person will be told they are covered for exactly what you list, and being "
+    "told they are covered for something they are not is the worst thing you can do "
+    "here.\n"
+    "- Many schedules print the benefits but leave the exclusions to a separate policy "
+    "wording document. When this document defers to one ('refer the Policy Wordings'), "
+    "return an empty list. Do not supply the missing side from general knowledge.\n"
+    "- A schedule, receipt, or ID card usually has no benefit list. Return empty "
     "lists rather than inferring cover from the product name.\n"
 )
 
@@ -201,11 +250,29 @@ _SCAN_PROMPT = (
     "  You are still not a doctor: no diagnosis, no advice, no reassurance or alarm "
     "beyond what the report itself says. The radiologist's exact wording is preserved "
     "in impression, so nothing is lost by keeping this plain.\n"
-    "  For example: 'This was an X-ray of the left knee. The knee is the joint in the "
-    "middle of your leg. The pictures did not show any broken bones or other problems. "
-    "Everything looked normal.'\n"
+    "  For example, where the report states the knee is normal: 'This was an X-ray of "
+    "the left knee. The knee is the joint in the middle of your leg. The report says the "
+    "pictures did not show any problems.'\n"
+    "    * The summary RESTATES impression and findings in plainer words. It may not add "
+    "anything they do not contain. If the impression is one short phrase, the summary is "
+    "one or two plain sentences — do not expand it. NEVER name an organ, a structure or a "
+    "condition the document does not mention: an impression reading 'Normal study' "
+    "becomes 'The report says this scan looked normal', NOT a list of the parts that were "
+    "checked and found healthy.\n"
+    "    * NEVER state or imply that a radiologist reviewed, reported on or cleared the "
+    "images unless the document says so. A scan image carrying only a header, a "
+    "technologist's note or a stamp has not been reported on.\n"
+    "    * A technologist's working note ('repeat done, patient moved', exposure "
+    "settings) is not a finding and does not belong in the summary at all.\n"
     "- impression: the radiologist's impression or conclusion, as printed.\n"
     "- findings: at most 5 short key findings, most important first.\n\n"
+    "**Many uploads are the IMAGE alone — an X-ray or scan with a burned-in header and no "
+    "radiologist's report anywhere in the text.** That is expected and is not a failure. "
+    "Transcribe the factual fields you can read (scan_type, body_part, scan_date, "
+    "facility) and return null for summary and impression and an empty findings list. Do "
+    "not describe what the picture might show: you are reading TEXT, you cannot see the "
+    "image, and a reassuring sentence about a scan nobody reported on is the most harmful "
+    "thing you could write here.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
 )
 
@@ -222,6 +289,19 @@ class VaccinationFields(BaseModel):
     dose_info: str | None = Field(default=None, max_length=128)
     date_given: str | None = Field(default=None, max_length=64)
     next_due_date: str | None = Field(default=None, max_length=64)
+    #: The interval a record states INSTEAD of a next date — "after 4 weeks". Transcribed
+    #: as printed; ``dates.add_interval`` turns it into ``next_due_date``.
+    #:
+    #: It exists because the model was doing that arithmetic. Asked to return "the start
+    #: of the window" for "due after 4 weeks", it returned a date appearing nowhere in the
+    #: document — and for vaccinations that value is written to
+    #: ``vaccinations.next_due_on``, which drives Spring's reminder index. A model's date
+    #: maths decided when a parent is reminded to bring a child back.
+    #:
+    #: Keeping the phrase also gives the stored date its provenance for free: a
+    #: ``next_due_date`` beside a non-null interval was derived, one beside a null
+    #: interval was printed on the document.
+    next_due_interval: str | None = Field(default=None, max_length=64)
     facility: str | None = Field(default=None, max_length=256)
 
 
@@ -233,6 +313,7 @@ _VACCINATION_SCHEMA: dict[str, Any] = {
         "dose_info": _NULLABLE_STR,
         "date_given": _NULLABLE_STR,
         "next_due_date": _NULLABLE_STR,
+        "next_due_interval": _NULLABLE_STR,
         "facility": _NULLABLE_STR,
     },
     "required": [
@@ -241,6 +322,7 @@ _VACCINATION_SCHEMA: dict[str, Any] = {
         "dose_info",
         "date_given",
         "next_due_date",
+        "next_due_interval",
         "facility",
     ],
     "additionalProperties": False,
@@ -256,12 +338,20 @@ _VACCINATION_PROMPT = (
     "- vaccine_name: the vaccine itself, e.g. 'Covishield', 'Tetanus Toxoid'.\n"
     "- dose_info: e.g. 'Dose 2 of 2', 'Booster', '1st dose'.\n"
     "- date_given: the date this dose was administered.\n"
-    "- next_due_date: the NEXT scheduled dose only. Null if the record shows none or "
-    "the series is complete.\n"
-    "  If the record gives a WINDOW rather than a single day — 'Between 31 Jan 2022 and "
-    "14 Feb 2022', 'due after 4 weeks', '31/01/2022 - 14/02/2022' — return the START of "
-    "that window, the day the dose first becomes due. Do not return null just because the "
-    "record states a range: a stated next dose is the whole point of this field.\n"
+    "- next_due_date: the next dose's date, ONLY where the record prints an actual date. "
+    "Null if it shows none, says the series is complete, or gives an interval instead of "
+    "a date.\n"
+    "  Where it prints a WINDOW of dates — 'Between 31 Jan 2022 and 14 Feb 2022', "
+    "'31/01/2022 - 14/02/2022' — return the START of that window, the day the dose first "
+    "becomes due. Do not return null just because the record states a range.\n"
+    "- next_due_interval: where the record states HOW LONG until the next dose instead of "
+    "a date — 'due after 4 weeks', 'next dose in 6 months', 'after 6-8 weeks' — copy that "
+    "phrase as printed. Null when the record prints an actual date, or says nothing.\n"
+    "  **Never calculate a date from an interval.** Do not add four weeks to the date "
+    "given and return the result: that date is printed nowhere on the document, it "
+    "decides when a person is reminded to come back for a dose, and the arithmetic "
+    "belongs in code where it can be checked. Put the phrase here and leave next_due_date "
+    "null.\n"
     "- facility: the vaccination centre or hospital NAME only, not its address.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
 )
@@ -284,6 +374,31 @@ class SectionSpec:
     date_fields: tuple[str, ...]
     #: (earlier, later) pairs where the later date may not precede the earlier one.
     date_order: tuple[tuple[str, str], ...] = ()
+    #: Money fields, reduced to a bare decimal string before storage — same reason as
+    #: dates: the model transcribes, Python decides.
+    amount_fields: tuple[str, ...] = ()
+    #: Fields holding a currency, resolved to an ISO-4217 code. Listed explicitly rather
+    #: than found by name so the rule is visible in the spec, like every other field.
+    currency_fields: tuple[str, ...] = ()
+    #: A patient-facing field written ABOUT other fields rather than transcribed from the
+    #: document, and the fields it must be written from. When none of those carries
+    #: anything, the summary has no source and is dropped — see ``interpretation_flag``.
+    #:
+    #: Only scans have one, and it is the field that made this necessary: asked for three
+    #: to six sentences, a model handed a bare X-ray image's burned-in header produced
+    #: "The radiologist reviewed the pictures and found no problems with the heart or
+    #: lungs. Everything looked normal." No radiologist read that document. Python decides
+    #: whether there was anything to summarise, for the same reason it decides abnormal
+    #: flags and dates: a prompt is a request, and this one is a false all-clear.
+    summary_field: str | None = None
+    #: What the summary must be written from. Non-empty in any of these means there is a
+    #: read to put into plain words.
+    summary_sources: tuple[str, ...] = ()
+    #: (target, start, interval) — fill ``target`` by adding the interval a document
+    #: STATED to ``start``, when the document printed no date of its own. The model
+    #: transcribes the phrase and Python does the arithmetic, for the same reason abnormal
+    #: flags and money are computed here. A printed date always wins over a derived one.
+    derived_from_interval: tuple[tuple[str, str, str], ...] = ()
 
 
 INSTRUCTION_PREFIX = (
@@ -299,9 +414,15 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         model=InsuranceFields,
         json_schema=_INSURANCE_SCHEMA,
         system_prompt=_INSURANCE_PROMPT,
-        max_tokens=4096,
+        # Raised with the benefit lists: they are no longer capped at five, and a group
+        # policy can print a long schedule. Truncation is not free — a cut-off response
+        # fails validation, which this stage treats as transient, so it is retried at
+        # full price and fails identically each time.
+        max_tokens=8192,
         date_fields=("start_date", "end_date"),
         date_order=(("start_date", "end_date"),),
+        amount_fields=("sum_insured", "premium_amount"),
+        currency_fields=("currency",),
     ),
     DocumentSection.SCANS_IMAGING: SectionSpec(
         section=DocumentSection.SCANS_IMAGING,
@@ -310,6 +431,8 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         system_prompt=_SCAN_PROMPT,
         max_tokens=4096,
         date_fields=("scan_date",),
+        summary_field="summary",
+        summary_sources=("impression", "findings"),
     ),
     DocumentSection.VACCINATIONS: SectionSpec(
         section=DocumentSection.VACCINATIONS,
@@ -319,6 +442,8 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         max_tokens=2048,
         date_fields=("date_given", "next_due_date"),
         date_order=(("date_given", "next_due_date"),),
+        # The model transcribes the phrase; this derives the date. See VaccinationFields.
+        derived_from_interval=(("next_due_date", "date_given", "next_due_interval"),),
     ),
 }
 

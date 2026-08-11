@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from app.integrations.ai.base import AIProviderError
 from app.services.section_extraction import extract_section
+from app.services.section_specs import VaccinationFields
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 from tests.integration.conftest import document_key
 from tests.support.ai import FakeAIProvider, structured_response
@@ -290,11 +291,10 @@ def test_the_section_prompt_is_the_one_sent(db_session, aws, test_settings, make
 
     call = ai.calls[-1]
     assert "vaccination record" in call["system"]
-    assert set(call["json_schema"]["properties"]) == {
-        "title",
-        "vaccine_name",
-        "dose_info",
-        "date_given",
-        "next_due_date",
-        "facility",
-    }
+    # Derived from the model rather than restated: this list used to be a fourth
+    # hand-written copy of the vaccination fields, so adding `next_due_interval` broke a
+    # test that was checking prompt routing and had no opinion about the field set.
+    # Comparing the two also asserts something worth asserting — that the schema the model
+    # is sent and the model that validates its answer describe the same shape.
+    assert set(call["json_schema"]["properties"]) == set(VaccinationFields.model_fields)
+    assert set(call["json_schema"]["required"]) == set(VaccinationFields.model_fields)

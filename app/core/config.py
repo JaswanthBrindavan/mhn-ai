@@ -28,12 +28,28 @@ class Settings(BaseSettings):
     s3_force_path_style: bool = False
     s3_bucket: str = ""
     sqs_queue_url: str = ""
+    # Read by /ready, to report how many messages are sitting in the dead-letter queue.
+    # It is NOT how the DLQ is configured: the redrive policy and its maxReceiveCount are
+    # attributes of the main queue in AWS, and this service neither sets nor verifies them.
+    # What it does is make the depth visible — a message here is a document nobody is
+    # processing, and until this existed the only way to notice was to open the console.
+    # Empty simply omits the report.
+    #
+    # No sqs_max_receive_count: that one really was read by nothing, and it belongs to the
+    # queue. Check `aws sqs get-queue-attributes` for the policy, not this file.
     sqs_dlq_url: str = ""
-    sqs_max_receive_count: int = 5
 
     # --- Worker -------------------------------------------------------------
     worker_max_concurrency: int = 4
     max_attempts: int = 3
+    # How long a non-terminal item may sit untouched before the reaper re-queues it
+    # (app/workers/reaper.py). Must stay comfortably above the longest SINGLE stage, not
+    # the longest pipeline: `updated_at` moves at each stage transition, so a live worker
+    # is only invisible to the sweep for the length of one stage. Measured worst case is
+    # insight generation at ~75s, against this 900s.
+    #
+    # The heartbeat does NOT keep this fresh — it extends SQS visibility and touches no
+    # row — so do not lower this on the assumption that it does.
     stale_item_timeout_seconds: int = 900
     # How long a received message stays invisible while a worker holds it. The
     # heartbeat re-extends this before it lapses, so a stage may run longer than
@@ -60,7 +76,9 @@ class Settings(BaseSettings):
     ai_model: str = ""
     # Insights run on their own model (typically a stronger one); empty falls back to ai_model.
     ai_model_insights: str = ""
-    ai_max_tokens: int = 16000
+    # No global token ceiling: every stage sets its own, because they differ by an order
+    # of magnitude (a classification label against a 130-result panel). A single setting
+    # here was read by nothing while appearing to govern all of them.
     anthropic_api_key: str = ""
 
     # Per-stage provider overrides. Empty = same provider as everything else (the default,
@@ -75,6 +93,13 @@ class Settings(BaseSettings):
     ai_model_classification: str = ""
     extraction_provider: str = ""
     ai_model_extraction: str = ""
+    # Prescriptions are read by the same mechanism but measured separately: the document
+    # goes to the model as a file (layout carries the dosing), and many are photographs
+    # rather than digital PDFs. Measured on 21 real prescriptions and bills, Gemini
+    # gemini-3.1-flash-lite read every one at ~2,100 in / 280 out tokens; the larger
+    # flash tiers returned 503 on nearly every request. See app/services/prescriptions.py.
+    prescription_provider: str = ""
+    ai_model_prescription: str = ""
     google_api_key: str = ""
 
     # --- Ideal ranges (approved-THP override) -------------------------------
@@ -85,6 +110,15 @@ class Settings(BaseSettings):
     # points at, and an empty master would send every test to the fallback worklist. Flip
     # on once they exist and carry approved rows. See app/services/ideal_ranges.py.
     ideal_ranges_enabled: bool = False
+
+    # --- Prescriptions ------------------------------------------------------
+    # When on, a document classified as a prescription is filed into Spring's
+    # `prescriptions` table and extracted. OFF by default because filing is never undone
+    # and Spring's `listMyFiles` still returns 501 for this section: a filed prescription
+    # would render nowhere, and could not be moved back. Rejected while off, exactly as
+    # before the extractor existed — the document stays visible in Unclassified.
+    # Flip on once Spring lists and serves prescriptions.
+    prescriptions_enabled: bool = False
 
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""

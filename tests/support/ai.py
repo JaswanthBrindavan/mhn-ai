@@ -25,15 +25,21 @@ def structured_response(
     model: str = "claude-opus-4-8",
     stop_reason: str | None = "end_turn",
     usage: AIUsage = DEFAULT_USAGE,
+    provider: str = "anthropic",
 ) -> StructuredResponse:
     text = payload if isinstance(payload, str) else json.dumps(payload)
-    return StructuredResponse(text=text, model=model, stop_reason=stop_reason, usage=usage)
+    return StructuredResponse(
+        text=text, provider=provider, model=model, stop_reason=stop_reason, usage=usage
+    )
 
 
 def classification_payload(**overrides: Any) -> dict[str, Any]:
     payload = {
         "section": "reports",
         "title": "Complete Blood Count",
+        # Printed unless a test says otherwise. "mostly" is the only value that changes
+        # routing, and only for prescriptions.
+        "handwriting": "none",
         "confidence": 0.96,
         "reasoning": "Structured lab result values with reference ranges.",
     }
@@ -83,6 +89,36 @@ def insights_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def prescription_payload(**overrides: Any) -> dict[str, Any]:
+    """A canned prescription reading.
+
+    Hand-written rather than derived, because unlike a ``SectionSpec`` this schema has
+    required fields with meaning: the stage checks every name against the document's own
+    text before storing it, so a payload of nulls would be dropped by the guard and a test
+    asserting "one medicine was stored" would fail for the wrong reason.
+    """
+    payload: dict[str, Any] = {
+        "medicines": [
+            {
+                "name_as_written": "Tab. DOLO 650",
+                "name_clean": "DOLO",
+                "form_raw": "Tab.",
+                "strength": "650mg",
+                "composition": "Paracetamol (650mg)",
+                "frequency_raw": "1-0-1",
+                # Its own column on the real document this is modelled on, which is why
+                # the dosing here no longer carries the food timing.
+                "intake_instruction": "Post Meal",
+                "duration": "5 days",
+            }
+        ],
+        "prescribed_date": "18/09/2024",
+        "prescriber": "Dr A Sharma",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def section_payload(section: DocumentSection | str, **overrides: Any) -> dict[str, Any]:
     """A minimal valid payload **built from that section's own schema**.
 
@@ -111,6 +147,7 @@ _PAYLOAD_BY_PROPERTY: dict[str, Any] = {
     "section": classification_payload,
     "results": extraction_payload,
     "insights": insights_payload,
+    "medicines": prescription_payload,
 }
 
 

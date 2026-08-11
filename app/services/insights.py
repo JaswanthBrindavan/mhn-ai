@@ -25,6 +25,7 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import json
 import logging
 import time
+from functools import partial
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
@@ -33,17 +34,24 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
 from app.models.ai_results import AiReportExtraction, AiReportInsight
-from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
+from app.services.ai_logging import (
+    check_response,
+    elapsed_ms,
+    log_process,
+    sanitize_validation_error,
+)
 from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ins-2026-08-03c"
+PROMPT_VERSION = "ins-2026-08-10"
 SCHEMA_VERSION = "ins-4"
 STAGE_NAME = "generating_insights"
 #: Headroom, not a target: the fields are individually capped and a typical report now
-#: lands well under this. Kept generous because a truncated response fails validation and
-#: burns three paid retries — StructuredResponse.truncated is not checked anywhere yet.
+#: lands well under this. Truncation IS detected — ``check_response`` ends the item
+#: ``failed`` with ``response_truncated`` after one attempt rather than burning the cap
+#: (PR #26); this comment used to claim otherwise. Kept generous anyway, because a caught
+#: truncation is still a report whose insights never reached the reader.
 INSIGHTS_MAX_TOKENS = 16384
 
 #: Stored with every insights payload. Informational framing is not left to the model.
@@ -153,7 +161,7 @@ SYSTEM_PROMPT = (
     "- NEVER give emergency instructions or tell the reader to seek urgent care.\n"
     "- Base every statement ONLY on the structured results provided. Do not infer, "
     "convert, or invent values, units, or ranges. Every number you cite must appear in "
-    "the input.\n"
+    "the input, and any limit you quote must come from that result's 'flagged_against'.\n"
     "- The 'abnormal_flag' field is authoritative: it was computed by the system, not by "
     "you. Do not re-judge whether a value is in range.\n"
     "- Do NOT add a 'discuss this with your doctor/healthcare provider' line to your "
@@ -187,7 +195,9 @@ SYSTEM_PROMPT = (
     "up when you eat a lot of red meat or shellfish, drink alcohol, or do not drink "
     "enough water.'\n"
     "- risk_patterns: TWO OR THREE SHORT LINES, AT MOST 60 WORDS. Start with the "
-    "value and the limit it crossed, taken from the input. Then say "
+    "value and the limit it crossed. The limit MUST be taken from 'flagged_against', "
+    "which is the range the result was actually checked against — never a number from "
+    "anywhere else. Then say "
     "plainly what that can lead to. 'Uric acid "
     "is 8.6, above the normal top of 8.0. Staying this high can cause sudden joint pain "
     "and, over time, kidney stones.' Say when something is only mild — 'this is only "
@@ -262,15 +272,14 @@ def generate_insights(ctx: StageContext) -> None:
 
     duration_ms = elapsed_ms(started)
 
-    if response.refused:
-        _log(
-            ctx,
-            outcome="refused",
-            error_code="model_refusal",
-            response=response,
-            duration_ms=duration_ms,
-        )
-        raise TransientStageError("insights refused by safety classifier")
+    # Refusal (transient) and truncation (permanent) are the same check for every
+    # stage, so it lives in one place; partial binds this stage's own log helper.
+    check_response(
+        response,
+        log=partial(_log, ctx),
+        duration_ms=duration_ms,
+        what="insights",
+    )
 
     try:
         result = DocumentInsights.model_validate_json(response.text)
@@ -321,9 +330,21 @@ def _load_extraction(ctx: StageContext) -> dict[str, Any]:
 
 def _context_json(extraction: dict[str, Any]) -> str:
     """The subset of the extraction the model may reason over — including OUR abnormal
-    flag, so it uses the deterministic verdict rather than re-judging ranges."""
+    flag, so it uses the deterministic verdict rather than re-judging ranges.
+
+    ``flagged_against`` is here and ``reference_range`` is NOT, and that is the point. The
+    two are the same number until an approved ideal range is in play, and then they are
+    not: the flag is computed against R&D's age-bracket bounds while the report goes on
+    printing the lab's own. A model shown only the printed range would write "8.6, above
+    the normal top of 8.0" about a value that crossed a different limit entirely — citing
+    a number the reader can see on their own report, beside a verdict it does not support.
+
+    Sending one range rather than both is deliberate. The prompt tells the model to quote
+    the limit that was crossed; given two, it has to choose, and that is a judgement this
+    stage exists to keep away from the model.
+    """
     rows = [
-        {k: r.get(k) for k in ("test_name", "value", "unit", "reference_range", "abnormal_flag")}
+        {k: r.get(k) for k in ("test_name", "value", "unit", "flagged_against", "abnormal_flag")}
         for r in extraction.get("results", [])
     ]
     return json.dumps({"results": rows, "report_date": extraction.get("report_date")})

@@ -4,9 +4,13 @@ This is the one place that talks to the model. It cannot be exercised in CI (a r
 call costs money and is non-deterministic), so it is kept small and its request shape
 is asserted with a stub client in unit tests.
 
-Documents go through the Files API rather than inline base64: our 25 MB size limit
-would inflate to ~34 MB of base64 and exceed the 32 MB request cap, and a stored file
-can be reused across stages (classification now, extraction next).
+Documents go through the Files API rather than inline base64: ``MAX_FILE_BYTES`` is
+50 MiB, which would inflate to ~67 MB of base64 and blow past the 32 MB request cap.
+
+The uploaded file is deleted in a ``finally`` after every call, so it is **not** shared
+between stages — an earlier version of this note claimed it was. Reuse would not help
+anyway: classification sends the first two pages only and extraction sends the whole
+document, so the two stages upload different bytes.
 """
 
 import io
@@ -26,7 +30,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-4-8"
+#: Written to every ``ai_process_logs`` row this provider produces. That column is the
+#: audit trail for which vendor received a document, so it is set here — beside the call
+#: that actually sends it — rather than assumed by the logger.
+PROVIDER_NAME = "anthropic"
+
+#: Used only when ``AI_MODEL`` is unset. Haiku, not a frontier model, and that is the
+#: point: this default governs classification and extraction, the two stages the cost
+#: work exists to keep cheap. It was ``claude-opus-4-8`` — left over from the first
+#: classification spike — so an environment that simply forgot to set ``AI_MODEL`` ran
+#: every document through a model 5x the input price, correctly billed and nowhere
+#: announced. Set ``AI_MODEL`` explicitly; the factory warns when it falls back here.
+DEFAULT_MODEL = "claude-haiku-4-5"
 _FILES_BETA = "files-api-2025-04-14"
 
 # The Files API rejects filenames with forbidden characters (path separators, etc.).
@@ -150,6 +165,7 @@ def _to_structured_response(response: Any, model: str) -> StructuredResponse:
     usage = response.usage
     return StructuredResponse(
         text=text,
+        provider=PROVIDER_NAME,
         model=getattr(response, "model", model),
         stop_reason=getattr(response, "stop_reason", None),
         usage=AIUsage(

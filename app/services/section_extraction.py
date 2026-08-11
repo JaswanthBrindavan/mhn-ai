@@ -4,8 +4,11 @@ The report pipeline is classify -> extract -> insights. This is the whole post-f
 pipeline for the three sections that are transcribed rather than interpreted — insurance,
 scans/imaging and vaccinations — writing their fields to ``ai_section_extractions`` and
 stopping. There is no insights stage for them: there is nothing clinical to interpret.
-The sections that remain rejected are those with no extractor (``prescriptions``) and
-those that are manual-upload-only by product decision (``bills``, ``medical_condition``).
+``prescriptions`` has its own stage rather than a spec here — ``app.services.prescriptions``
+sends the document itself rather than its OCR text, because the dosing sits in a column
+beside the medicine and flattening that puts a dose on the wrong row. The sections that
+remain rejected are those that are manual-upload-only by product decision (``bills``,
+``medical_condition``).
 
 Flow: read this item's classification to learn the section, reload the source object,
 extract its TEXT (embedded layer first, Tesseract OCR for image-only pages), ask the
@@ -21,7 +24,9 @@ Dates are normalised here rather than trusted from the model, for the same reaso
 extraction computes abnormal flags in Python: a deterministic rule beats a prompt. An
 unreadable date becomes null rather than a guess, and a section whose dates are
 inverted (an end before its start) is recorded as a data-quality flag rather than
-silently stored as fact.
+silently stored as fact. Money goes the same way (``app.services.money``): amounts are
+reduced to a bare decimal string and the currency to an ISO code, because a symbol
+printed in a column header rarely survives text extraction intact.
 
 Idempotent: the extraction row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
@@ -34,6 +39,7 @@ nothing else.
 
 import logging
 import time
+from functools import partial
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -42,9 +48,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
 from app.models.ai_results import AiReportClassification, AiSectionExtraction
-from app.services.ai_logging import elapsed_ms, log_process, sanitize_validation_error
+from app.services.ai_logging import (
+    check_response,
+    elapsed_ms,
+    log_process,
+    sanitize_validation_error,
+)
 from app.services.classification import DocumentSection
-from app.services.dates import in_order, iso_date
+from app.services.dates import add_interval, in_order, iso_date
+from app.services.money import normalise_amount, normalise_currency
 from app.services.ocr import ExtractedText, TextExtractionError, extract_text
 from app.services.section_specs import INSTRUCTION_PREFIX, SectionSpec, spec_for
 from app.services.source_loading import load_source_document
@@ -52,8 +64,10 @@ from app.workers.stagetypes import RejectStageError, StageContext, TransientStag
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "sec-2026-07-27"
-SCHEMA_VERSION = "sec-1"
+PROMPT_VERSION = "sec-2026-08-11"
+#: sec-3 added ``next_due_interval``: a vaccination record stating "due after 4 weeks"
+#: rather than a date. The model used to compute that date; Python does now.
+SCHEMA_VERSION = "sec-3"
 STAGE_NAME = "extracting_section"
 
 
@@ -102,15 +116,14 @@ def extract_section(ctx: StageContext) -> None:
 
     duration_ms = elapsed_ms(started)
 
-    if response.refused:
-        _log(
-            ctx,
-            outcome="refused",
-            error_code="model_refusal",
-            response=response,
-            duration_ms=duration_ms,
-        )
-        raise TransientStageError("section extraction refused by safety classifier")
+    # Refusal (transient) and truncation (permanent) are the same check for every
+    # stage, so it lives in one place; partial binds this stage's own log helper.
+    check_response(
+        response,
+        log=partial(_log, ctx),
+        duration_ms=duration_ms,
+        what="section extraction",
+    )
 
     try:
         result = spec.model.model_validate_json(response.text)
@@ -131,6 +144,71 @@ def extract_section(ctx: StageContext) -> None:
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
 
 
+def record_section_mismatch(
+    ctx: StageContext, filed_section: DocumentSection, detected_section: DocumentSection
+) -> None:
+    """Record that a document was filed where the USER put it, not where we placed it.
+
+    The document goes to the section the user chose — an upload category or a move out of
+    Unclassified is an explicit instruction, and refusing it left the document stranded in
+    Unclassified with no working recovery at all. What is withheld is the pipeline: we do
+    not transcribe an insurance policy with the scan extractor because someone filed it
+    under Scans.
+
+    The flag is what makes that state legible, and it is also the permission: the app shows
+    a "Move to <detected>" action only on a document carrying this, so a correctly filed
+    one cannot be shuffled around. Written as an ``ai_section_extractions`` row with no
+    fields, exactly as ``prescriptions.record_handwritten`` does for a page we deliberately
+    did not read — which means the existing content envelope and the app's existing flag
+    rendering both work with no change.
+
+    No model call is made, so the process log records ``"skipped"`` for provider and model
+    rather than claiming one that never happened.
+    """
+    payload: dict[str, Any] = {
+        "section": filed_section.value,
+        "fields": {},
+        "flags": [
+            {
+                "code": "section_mismatch",
+                "field": "",
+                "detail": (
+                    f"This looks like {_article(detected_section)}, not "
+                    f"{_article(filed_section)}. It has been saved here because that is "
+                    f"where you filed it, and nothing was read from it."
+                ),
+            }
+        ],
+    }
+    _persist(ctx, filed_section, payload)
+    _log(ctx, outcome="succeeded", duration_ms=0)
+    logger.info(
+        "document_filed_against_classification",
+        extra={
+            "item_id": str(ctx.item_id),
+            "filed_section": filed_section.value,
+            "detected_section": detected_section.value,
+        },
+    )
+
+
+#: Section names as a person would say them, for the sentence above.
+_SECTION_LABEL = {
+    DocumentSection.REPORTS: "a lab report",
+    DocumentSection.SCANS_IMAGING: "a scan report",
+    DocumentSection.INSURANCE: "an insurance document",
+    DocumentSection.VACCINATIONS: "a vaccination record",
+    DocumentSection.PRESCRIPTIONS: "a prescription",
+    DocumentSection.BILLS: "a bill",
+    DocumentSection.MEDICAL_CONDITION: "a medical condition record",
+    DocumentSection.UNKNOWN: "something we could not identify",
+}
+
+
+def _article(section: DocumentSection) -> str:
+    return _SECTION_LABEL.get(section, section.value.replace("_", " "))
+
+
 def build_payload(
     spec: SectionSpec, result: BaseModel, extracted: ExtractedText | None = None
 ) -> dict[str, Any]:
@@ -141,11 +219,22 @@ def build_payload(
     fields = result.model_dump()
     for name in spec.date_fields:
         fields[name] = iso_date(fields.get(name))
+    for name in spec.amount_fields:
+        fields[name] = normalise_amount(fields.get(name))
+    for name in spec.currency_fields:
+        fields[name] = normalise_currency(fields.get(name))
+    for target, start, interval in spec.derived_from_interval:
+        # A printed date wins; this only fills the gap the model was told to leave.
+        if not fields.get(target):
+            fields[target] = add_interval(fields.get(start), fields.get(interval))
+
+    flags = _date_flags(spec, fields)
+    flags.extend(_drop_unsourced_summary(spec, fields))
 
     payload: dict[str, Any] = {
         "section": spec.section.value,
         "fields": fields,
-        "flags": _date_flags(spec, fields),
+        "flags": flags,
     }
     if extracted is not None:
         payload["source"] = extracted.as_metadata()
@@ -174,6 +263,52 @@ def _date_flags(spec: SectionSpec, fields: dict[str, Any]) -> list[dict[str, str
                 }
             )
     return flags
+
+
+def _drop_unsourced_summary(spec: SectionSpec, fields: dict[str, Any]) -> list[dict[str, str]]:
+    """Delete a patient-facing summary that has nothing behind it, and say so.
+
+    A scan report's ``summary`` is written ABOUT the radiologist's impression and
+    findings, not transcribed from the document. When neither is present there is no read
+    to put into plain words — and asked for three to six sentences anyway, a model fills
+    the gap. Measured on this prompt with a bare X-ray image's burned-in header:
+
+        "The radiologist reviewed the pictures and found no broken bones, no problems
+         with the heart or lungs, and no other abnormalities. Everything looked normal."
+
+    Nothing in that document says a radiologist saw it, or mentions heart or lungs. It is
+    a false all-clear on a chest X-ray, produced from two stamped words, and it is the
+    worst output this service can generate.
+
+    So Python decides, exactly as it decides abnormal flags, dates and money: a summary
+    survives only when something it could have been written from survives. The factual
+    fields are untouched — scan type, body part, date and facility are transcription, and
+    the user is still shown "Chest X-Ray, 12 March" for an image with no report.
+
+    The flag fires whenever there is no read, whether or not a summary had to be deleted —
+    with the prompt tightened the model usually returns null on its own, and an empty card
+    with no explanation reads as "the AI failed" rather than "there was nothing here to
+    read". That is the same absence-versus-failure confusion the pending-document note
+    had. Saying it plainly is the point of the feature, not a side effect of the guard.
+    """
+    if not spec.summary_field or not spec.summary_sources:
+        return []
+    if any(fields.get(name) for name in spec.summary_sources):
+        return []
+
+    # Nothing to summarise. Delete any summary the model wrote anyway, and say why the
+    # card is empty either way.
+    fields[spec.summary_field] = None
+    return [
+        {
+            "code": "no_radiologist_read",
+            "field": spec.summary_field,
+            "detail": (
+                "No radiologist's report was found in this document — only the scan "
+                "itself. It is saved and you can open it any time."
+            ),
+        }
+    ]
 
 
 #: Below this mean Tesseract confidence the read is unreliable enough that a missing

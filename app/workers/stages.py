@@ -27,9 +27,11 @@ from app.models.enums import RunItemStatus
 from app.services.classification import DocumentSection, classify_report
 from app.services.extraction import extract_report
 from app.services.insights import generate_insights
+from app.services.prescriptions import extract_prescription, record_handwritten
 from app.services.section_extraction import extract_section
 from app.services.section_specs import SUPPORTED_SECTIONS
 from app.workers.stagetypes import (
+    PermanentStageError,
     RejectStageError,
     Stage,
     StageContext,
@@ -38,10 +40,13 @@ from app.workers.stagetypes import (
 
 __all__ = [
     "CLASSIFY_STAGE",
+    "HANDWRITTEN_PRESCRIPTION_PIPELINE",
     "SECTION_PIPELINES",
+    "PermanentStageError",
     "RejectStageError",
     "Stage",
     "StageContext",
+    "StageStep",
     "TransientStageError",
 ]
 
@@ -67,4 +72,24 @@ SECTION_PIPELINES: dict[DocumentSection, list[StageStep]] = {
         section: [(RunItemStatus.EXTRACTING, extract_section)]
         for section in sorted(SUPPORTED_SECTIONS, key=lambda s: s.value)
     },
+    #: Prescriptions have their own stage rather than a ``SECTION_SPECS`` entry. The
+    #: generic stage sends OCR text, and a prescription is a layout: the dose sits in a
+    #: column beside the medicine, and flattening that puts a dose on the wrong row.
+    #: ``extract_prescription`` sends the document itself, checks every name against the
+    #: page, and normalises the dosing notation in Python.
+    #:
+    #: Listed after the expansion above so this wins outright if a ``prescriptions`` spec
+    #: is ever added there, rather than the two silently disagreeing about the stage.
+    DocumentSection.PRESCRIPTIONS: [
+        (RunItemStatus.EXTRACTING, extract_prescription),
+    ],
 }
+
+#: What a mostly-handwritten prescription runs instead of ``SECTION_PIPELINES``: it is
+#: filed like any other, and then the only "extraction" is a record saying we did not read
+#: it and why. A pipeline rather than a special case in the router, so it goes through the
+#: same guarded stage runner — cancellation, logging and content assembly all behave
+#: identically to every other document. See ``prescriptions.record_handwritten``.
+HANDWRITTEN_PRESCRIPTION_PIPELINE: list[StageStep] = [
+    (RunItemStatus.EXTRACTING, record_handwritten),
+]

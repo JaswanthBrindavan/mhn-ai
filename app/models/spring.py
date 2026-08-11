@@ -10,10 +10,10 @@ declaration cannot drift into being mistaken for the authoritative schema.
 
 **Row access, not schema.** ``unclassified_files`` is read-only except for the documented
 filing move: once a document is classified into a section this service processes, it
-INSERTs a row into **that section's table** (``reports``, ``scans_imaging``, ``insurance``
-or ``vaccinations``), writes the row's ``content``, and DELETEs the source
-``unclassified_files`` row. The THP tables below are read-only. It never issues DDL against
-any Spring table.
+INSERTs a row into **that section's table** (``reports``, ``scans_imaging``, ``insurance``,
+``prescriptions`` or ``vaccinations``), writes the row's ``content``, and DELETEs the
+source ``unclassified_files`` row. The THP tables below are read-only. It never issues DDL
+against any Spring table.
 """
 
 from sqlalchemy import (
@@ -82,6 +82,23 @@ insurance = Table(
     Column("user_id", UUID(as_uuid=True), nullable=False),
     Column("created_by", UUID(as_uuid=True), nullable=True),
     Column("filepath", String(500), nullable=True),
+    Column("content", JSONB, nullable=True),
+    Column("private", Boolean, nullable=True),
+)
+
+#: The prescriptions section. INSERTed into when a prescription is filed; read otherwise.
+#:
+#: NOTE: its FK column is `hospital` (-> a hospital master), and we leave it null for the
+#: same reason as `insurance.provider` — resolving a hospital name to an id is a lookup
+#: this service does not do. The prescriber's name is not lost by that: it is transcribed
+#: into `content.ai.section_extraction.fields.prescriber` as printed.
+prescriptions = Table(
+    "prescriptions",
+    spring_metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", UUID(as_uuid=True), nullable=False),
+    Column("created_by", UUID(as_uuid=True), nullable=True),
+    Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
 )

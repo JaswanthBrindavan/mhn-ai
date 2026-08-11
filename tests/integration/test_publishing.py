@@ -182,8 +182,16 @@ def test_rejected_report_can_be_resubmitted_after_the_file_is_fixed(
 # --- failure handling -------------------------------------------------------
 
 
-def test_publish_failure_leaves_the_item_pending(api, make_document, aws, db_session):
-    """A durable item with no message is recoverable; a phantom message is not."""
+def test_publish_failure_fails_the_item_rather_than_leaving_it_pending(
+    api, make_document, aws, db_session
+):
+    """An item with no message has no consumer, so it must not look accepted.
+
+    It used to stay ``pending`` on the reasoning that a stale-item sweep would retry it.
+    No sweep was ever built, so the document stopped for ever: no message, no error, and
+    a 202 saying it had been taken. ``failed`` is visible on the run, on the status
+    endpoint, and — unlike ``pending`` — is retryable through the retry endpoint.
+    """
     _, sqs, queue_url, _ = aws
     document_id = make_document()
     sqs.delete_queue(QueueUrl=queue_url)  # publishing will now fail
@@ -193,5 +201,12 @@ def test_publish_failure_leaves_the_item_pending(api, make_document, aws, db_ses
     ).json()
 
     item = body["items"][0]
-    # Still recorded, still 202 -- the stale-item sweep will retry it.
-    assert item["status"] == RunItemStatus.PENDING.value
+    # Still recorded and still 202: the run exists and the caller is told, per document,
+    # exactly what happened to each one.
+    assert item["status"] == RunItemStatus.FAILED.value
+    assert item["error_code"] == "publish_failed"
+
+    # And the state is durable, not just a field in the response.
+    status = api.get(f"/v1/documents/{document_id}/status").json()
+    assert status["status"] == RunItemStatus.FAILED.value
+    assert status["last_error_code"] == "publish_failed"

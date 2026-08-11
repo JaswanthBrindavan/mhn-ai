@@ -85,9 +85,17 @@ services:
       - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - mhn-ai-pgdata:/var/lib/postgresql/data
-      # Spring base schema, imported once on first boot of an empty volume.
+      # Spring's Flyway migrations, applied once on first boot of an empty volume.
+      # Postgres runs /docker-entrypoint-initdb.d/*.sql in alphabetical order, which for
+      # V1__/V2__/V3__/V4__ is migration order — so this brings up the base schema AND the
+      # ai_* tables, and a fresh local database matches what Spring builds.
+      #
+      # This was `../mhn-spring/migrations/index.sql` until 2026-08-10, and had been broken
+      # for a while: Spring moved to Flyway and DELETED that file, so `docker compose
+      # --profile localdev up` failed on the mount. It also pointed at `mhn-spring`, the
+      # stale fourth clone CLAUDE.md says not to use, rather than at `mhn-spring-v2`.
       # Source of truth stays in the Spring repo; mounted read-only, never copied.
-      - ${SPRING_SCHEMA_PATH:-../mhn-spring/migrations/index.sql}:/docker-entrypoint-initdb.d/01-spring-schema.sql:ro
+      - ${SPRING_SCHEMA_PATH:-../mhn-spring-v2/src/main/resources/db/migration}:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s

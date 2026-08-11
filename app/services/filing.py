@@ -37,6 +37,7 @@ from app.models.ai_results import AiSectionExtraction
 from app.models.processing import AiProcessingRunItem
 from app.models.spring import (
     insurance,
+    prescriptions,
     reports,
     scans_imaging,
     unclassified_files,
@@ -58,6 +59,7 @@ SECTION_TABLES: dict[DocumentSection, Table] = {
     DocumentSection.REPORTS: reports,
     DocumentSection.SCANS_IMAGING: scans_imaging,
     DocumentSection.INSURANCE: insurance,
+    DocumentSection.PRESCRIPTIONS: prescriptions,
     DocumentSection.VACCINATIONS: vaccinations,
 }
 
@@ -337,6 +339,17 @@ def extra_columns(session: Session, item_id: UUID, section: DocumentSection) -> 
     raw = ((data or {}).get("fields") or {}).get("next_due_date")
     if not raw:
         return {}
+
+    # A pair we have already recorded as inconsistent does not get to set a reminder.
+    # `dates_out_of_order` means the next dose reads as earlier than the dose given, which
+    # is a misread — and `_date_flags` exists precisely to keep such values "visible for a
+    # human without asserting they are correct". This is the one consumer that ACTS on the
+    # value, so it is the one place that assertion would have been made. The content still
+    # shows both dates; only the reminder is withheld.
+    flags = (data or {}).get("flags") or []
+    if any(f.get("code") == "dates_out_of_order" for f in flags):
+        logger.warning("next_due_date_not_written", extra={"item_id": str(item_id)})
+        return {}
     try:
         # Already normalised to ISO by app.services.dates; parse rather than trust a shape.
         parsed = datetime.fromisoformat(str(raw))
@@ -352,3 +365,103 @@ def _delete_quietly(s3: "S3Client", bucket: str, key: str) -> None:
         delete_object(s3, bucket, key)
     except SourceObjectUnavailableError as exc:
         logger.warning("filing_cleanup_failed", extra={"reason": str(exc)})
+
+
+def refile_to_detected(
+    session: Session,
+    s3: "S3Client",
+    *,
+    item_id: UUID,
+    section_row_id: int,
+    from_section: DocumentSection,
+    to_section: DocumentSection,
+    bucket: str,
+) -> int:
+    """Move an already-filed document from one section table to another.
+
+    **This is the reverse mover ``docs/auto-filing-design.md`` said would never be built,
+    and it is deliberately narrow.** The caller (``results.refile_document``) allows it only
+    for a document flagged ``section_mismatch`` — filed where the user put it, never
+    processed — and only towards the section this service itself detected. A document that
+    was actually read is not movable by any route, because its results describe the section
+    it is in.
+
+    The ordering is ``file_document``'s, for the same reason: S3 has no transactions.
+
+    1. copy the object and its preview to the destination key
+    2. ONE transaction: INSERT the destination row carrying the current ``content``,
+       DELETE the source row, repoint the run item
+    3. after the commit, delete the originals
+
+    A crash after (1) leaves an orphan copy a repeat overwrites; after (2) an orphan
+    original. What no crash can produce is a live row whose ``filepath`` points at a deleted
+    object.
+
+    Repointing the run item is what makes the follow-up run work: ``_adopt_prior_filing``
+    reads the most recent prior filing and compares its ``filed_section`` to the freshly
+    detected one, so after this they match and the stages update the moved row in place
+    rather than filing a second copy.
+    """
+    source = SECTION_TABLES[from_section]
+    destination = SECTION_TABLES[to_section]
+
+    row = session.execute(
+        select(
+            source.c.user_id,
+            source.c.filepath,
+            source.c.private,
+            source.c.created_by,
+            source.c.content,
+        ).where(source.c.id == section_row_id)
+    ).one_or_none()
+    if row is None:
+        raise RejectStageError("source_document_missing", "Filed document no longer exists")
+
+    to_key = key_for_section(row.filepath, to_section.value)
+    from_preview = preview_key_for(row.filepath)
+    try:
+        copy_object(s3, bucket, row.filepath, to_key)
+        had_preview = object_exists(s3, bucket, from_preview)
+        if had_preview:
+            copy_object(s3, bucket, from_preview, preview_key_for(to_key))
+    except SourceObjectMissingError as exc:
+        session.rollback()
+        raise RejectStageError("source_object_missing", "Source file was not found") from exc
+    except SourceObjectUnavailableError as exc:
+        session.rollback()
+        raise TransientStageError(f"source storage unavailable: {exc}") from exc
+
+    new_row_id = session.execute(
+        insert(destination)
+        .values(
+            user_id=row.user_id,
+            filepath=to_key,
+            private=row.private,
+            created_by=row.created_by,
+            content=row.content,
+        )
+        .returning(destination.c.id)
+    ).scalar_one()
+
+    session.execute(delete(source).where(source.c.id == section_row_id))
+    session.execute(
+        update(AiProcessingRunItem)
+        .where(AiProcessingRunItem.id == item_id)
+        .values(section_row_id=new_row_id, filed_section=to_section.value, source_key=to_key)
+    )
+    session.commit()
+
+    _delete_quietly(s3, bucket, row.filepath)
+    if had_preview:
+        _delete_quietly(s3, bucket, from_preview)
+
+    logger.info(
+        "document_refiled",
+        extra={
+            "item_id": str(item_id),
+            "from_section": from_section.value,
+            "to_section": to_section.value,
+            "section_row_id": new_row_id,
+        },
+    )
+    return int(new_row_id)

@@ -26,6 +26,7 @@ from app.models.ai_results import (
     AiReportInsight,
     AiSectionExtraction,
 )
+from app.models.processing import AiProcessingRunItem
 
 
 class ContentState(StrEnum):
@@ -45,10 +46,19 @@ class ContentState(StrEnum):
 
 
 #: Version of the content["ai"] shape, so consumers can migrate on change.
-#: 2.1 — each insight is now four explanatory parts (what_it_is / why_it_varies /
-#: risk_context / suggestions) rather than a single `body`.
+#:
+#: 2.1 — insights became multi-part rather than a single `body`. Later gained `document_id`,
+#:       the intake id, so the app can act on a filed document (`/refile`) after the intake
+#:       row it came from has been deleted. The shape moved again
+#:       afterwards, to the app's six fields (heading + risk_patterns render Risk Patterns,
+#:       suggestion_heading + suggestions render Suggestions, what_it_is / why_it_varies the
+#:       explanatory body) WITHOUT another bump, because no consumer keys off this value.
 #: 2.0 — the payload is now written at filing time, before extraction has run, and gained
-#: `state` and `section_extraction`. 1.1 was report-only and written once, at the move.
+#:       `state` and `section_extraction`. 1.1 was report-only and written once, at the move.
+#:
+#: Nothing branches on it today: mhn-react types it as an opaque string and Spring never
+#: reads it. That is why the drift above was harmless — and why it is worth knowing before
+#: anyone starts treating it as a contract.
 CONTENT_SCHEMA_VERSION = "2.1"
 
 
@@ -93,6 +103,15 @@ def build_content(session: Session, item_id: UUID, *, state: ContentState) -> di
         select(AiReportInsight.data).where(AiReportInsight.run_item_id == item_id)
     ).scalar_one_or_none()
 
+    # The intake id, carried on the payload because filing DELETES the intake row: from
+    # then on nothing Spring holds addresses this document in our contract. `/refile` and
+    # `/status` are both keyed on it, and the app reaches a filed document only through
+    # its section row. Read it here rather than making the caller pass it — every caller
+    # would have to thread the same value that is already one column away.
+    document_id = session.execute(
+        select(AiProcessingRunItem.document_id).where(AiProcessingRunItem.id == item_id)
+    ).scalar_one_or_none()
+
     classification = (
         {"section": clf.section, "title": clf.title, "confidence": float(clf.confidence)}
         if clf is not None
@@ -103,6 +122,7 @@ def build_content(session: Session, item_id: UUID, *, state: ContentState) -> di
         "ai": {
             "schema_version": CONTENT_SCHEMA_VERSION,
             "state": state.value,
+            "document_id": document_id,
             "classification": classification,
             "extraction": extraction,
             "section_extraction": section_extraction,

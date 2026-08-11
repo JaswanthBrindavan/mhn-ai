@@ -62,6 +62,35 @@ def get_document_status(
     return results_service.get_document_status(session, document_id)
 
 
+@router.post(
+    "/documents/{document_id}/refile",
+    response_model=RetryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Move a mismatched document to the section it was classified as, and process it",
+    responses={
+        **_NOT_FOUND,
+        409: {"description": "Not filed, not classified, already there, or not filable"},
+    },
+)
+def refile_document(
+    document_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    s3: Annotated["S3Client", Depends(s3_client)],
+    sqs: Annotated["SQSClient", Depends(sqs_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_request_id: Annotated[str | None, Header(alias="X-Request-Id")] = None,
+) -> RetryResponse:
+    """The one action offered on a document flagged ``section_mismatch``.
+
+    Untyped for the same reason ``/status`` is, and more so: the caller is acting *on* a
+    disagreement about the type, so it cannot be made to name one first. It returns nothing
+    extracted — an item id and a status — so leaving it untyped discloses nothing.
+    """
+    return results_service.refile_document(
+        session, document_id, x_request_id, s3=s3, sqs=sqs, settings=settings
+    )
+
+
 @router.get(
     "/documents/{document_type}/{document_id}/ai-result",
     response_model=DocumentAiResult,

@@ -86,7 +86,7 @@ def classified_item(db_session, aws, make_document):
 
 @pytest.fixture
 def seed_section_extraction(db_session):
-    def _seed(item_id, document_id, section: str, fields: dict) -> None:
+    def _seed(item_id, document_id, section: str, fields: dict, flags: list | None = None) -> None:
         db_session.execute(
             text(
                 "INSERT INTO ai_section_extractions "
@@ -97,7 +97,7 @@ def seed_section_extraction(db_session):
                 "i": item_id,
                 "d": document_id,
                 "s": section,
-                "data": json.dumps({"section": section, "fields": fields, "flags": []}),
+                "data": json.dumps({"section": section, "fields": fields, "flags": flags or []}),
             },
         )
         db_session.commit()
@@ -438,6 +438,29 @@ def test_vaccination_next_due_on_comes_from_the_extraction(
     ).scalar_one()
     assert due is not None
     assert (due.year, due.month, due.day) == (2027, 3, 14)
+
+
+def test_a_reminder_is_not_set_from_dates_we_flagged_as_inconsistent(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """`dates_out_of_order` means the next dose reads as EARLIER than the dose given.
+
+    That is a misread, and `_date_flags` exists to keep such values "visible for a human
+    without asserting they are correct". This is the one consumer that ACTS on the value
+    — `vaccinations.next_due_on` drives Spring's reminder index — so it is the one place
+    that assertion would have been made. The content still carries both dates; only the
+    reminder is withheld.
+    """
+    seed = classified_item(DocumentSection.VACCINATIONS)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "vaccinations",
+        {"date_given": "2027-03-14", "next_due_date": "2026-01-01"},
+        flags=[{"code": "dates_out_of_order", "field": "next_due_date", "detail": "..."}],
+    )
+
+    assert filing.extra_columns(db_session, seed.item_id, DocumentSection.VACCINATIONS) == {}
 
 
 def test_extra_columns_is_empty_for_a_non_vaccination_section(db_session, classified_item) -> None:

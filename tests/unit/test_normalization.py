@@ -8,6 +8,7 @@ import pytest
 
 from app.services.normalization import (
     abnormal_flag,
+    category_split_flag,
     convert_unit,
     enrich_result,
     parse_number,
@@ -299,3 +300,100 @@ def test_sex_split_flags_the_real_copper_and_iron_results() -> None:
         gender="F",
     )
     assert iron["abnormal_flag"] == "low"
+
+
+# --- interpretation scales and category splits ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reference_range", "expected"),
+    [
+        # eGFR, the shape that prompted this: normal band printed first.
+        (">= 90 : Normal 60 - 89 : Mild Decrease 45 - 59 : Moderate Decrease", (90.0, None)),
+        # The dangerous shape: normal is NOT first, so taking the first bound was wrong.
+        ("Low: <70 Normal: 70-99 High: >=100", (70.0, 99.0)),
+        ("Deficiency: <20 Insufficiency: 20-29 Sufficiency: 30-100", (30.0, 100.0)),
+        ("Normal: <5.7 Prediabetes: 5.7-6.4 Diabetes: >=6.5", (None, 5.7)),
+        # No grade means "in range", so there is nothing to select.
+        ("Grade I: <10 Grade II: 10-20 Grade III: >20", None),
+        # A single labelled range is not a scale and keeps its existing reading.
+        ("Desirable : 2.5-3.0", (2.5, 3.0)),
+        (">= 90 : Normal", (90.0, None)),
+    ],
+)
+def test_multi_band_scales_are_read_by_their_normal_band(reference_range, expected):
+    assert parse_reference_range(reference_range) == expected
+
+
+def test_a_scale_with_normal_in_the_middle_no_longer_flags_healthy_values():
+    """The bug this fixes produced a WRONG flag, not a missing one.
+
+    Reading the first bound of "Low: <70 Normal: 70-99 High: >=100" gave bounds of
+    (None, 70), so a value of 85 — squarely normal — came back "high". The same shape
+    reported a healthy vitamin D of 45 as high against the deficiency band.
+    """
+    scale = "Low: <70 Normal: 70-99 High: >=100"
+    assert _flag("85", scale) == "normal"
+    assert _flag("50", scale) == "low"
+    assert _flag("120", scale) == "high"
+
+    vitamin_d = "Deficiency: <20 Insufficiency: 20-29 Sufficiency: 30-100"
+    assert _flag("45", vitamin_d) == "normal"
+    assert _flag("12", vitamin_d) == "low"
+
+
+#: CEA prints one threshold per smoking status, and the report never says which applies.
+_CEA = "Non Smokers (Past / Never Smoked) - <5 Smokers (current) - <10"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0.93, "normal"),  # under both thresholds, so normal either way
+        (4.9, "normal"),
+        (12.0, "high"),  # over both
+        (7.0, None),  # between them: depends on a category we were not told
+        (5.0, None),
+    ],
+)
+def test_a_category_split_decides_only_when_every_threshold_agrees(value, expected):
+    assert category_split_flag(value, _CEA) == expected
+
+
+def test_a_single_threshold_is_not_a_category_split():
+    """One comparator is an ordinary one-sided range, read properly elsewhere."""
+    assert category_split_flag(3.0, "< 5") is None
+
+
+def test_thresholds_pointing_opposite_ways_are_refused():
+    """Those describe bands, not one boundary drawn twice, so nothing can be concluded
+    from 'all agree'."""
+    assert category_split_flag(85.0, "Low: <70 High: >=100") is None
+
+
+def test_the_category_split_reaches_a_real_result():
+    """Wired into enrich_result, which is what actually stores the flag."""
+    enriched = enrich_result(
+        {"test_name": "CEA", "value": "0.93", "unit": "ng/mL", "reference_range": _CEA}
+    )
+    assert enriched["abnormal_flag"] == "normal"
+
+
+def test_not_done_is_never_read_as_not_detected() -> None:
+    """ "ND" means both, and they are opposites here.
+
+    Read as absent, it becomes 0.0 against the range and comes back `normal` — a clean
+    result published for an assay nobody ran, on a report a person will act on. Every
+    other decision in this module refuses when the readings disagree; a two-letter
+    abbreviation is not the place to start making exceptions.
+
+    The cost is a genuine "Not Detected" going unflagged, which is recoverable.
+    """
+    row = {"test_name": "Urine Glucose", "value": "ND", "unit": None, "reference_range": "0 - 2"}
+
+    assert enrich_result(row)["abnormal_flag"] is None
+
+    # The unambiguous spellings still work, so nothing real was lost.
+    for spelling in ("Nil", "Absent", "Not Detected", "Negative"):
+        checked = enrich_result({**row, "value": spelling})
+        assert checked["abnormal_flag"] == "normal", spelling

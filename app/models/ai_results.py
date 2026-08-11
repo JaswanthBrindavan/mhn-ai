@@ -99,11 +99,19 @@ class AiReportExtraction(Base):
     document_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
     #: {"results": [ {test_name, value, unit, reference_range, observed_date,
-    #: source_context, value_numeric, abnormal_flag, range_source, matched_parameter,
-    #: matched_group, normalized_value, normalized_unit, normalized}, ... ],
-    #: "report_date": ..., "patient_age": ..., "patient_gender": ...}
+    #: source_context, value_numeric, abnormal_flag, range_source, flagged_against,
+    #: matched_parameter, matched_group, normalized_value, normalized_unit, normalized},
+    #: ... ], "report_date": ..., "patient_age": ..., "patient_gender": ...}
+    #:
     #: range_source is "ideal_range" when an approved-THP age-group range drove the flag,
-    #: else "report_range" (the report's own printed range).
+    #: "report_range" when the report's own printed range did, and "none" when the report
+    #: printed no range at all. "report_range" with a null flag means a range was present
+    #: and could not be decided — a different gap from having nothing to check against.
+    #:
+    #: flagged_against is that range rendered as it was actually compared ("3.5 - 6",
+    #: "<= 200"). **Anything quoting a limit to a reader must use this, not
+    #: reference_range**: with an ideal-range override the two are different numbers, and
+    #: the printed one is a limit the value never crossed.
     data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)

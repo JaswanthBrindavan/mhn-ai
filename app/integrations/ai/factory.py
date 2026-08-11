@@ -16,6 +16,7 @@ An empty override means "same provider as everything else", which is the default
 single-provider deploys unchanged.
 """
 
+import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -26,10 +27,18 @@ from app.integrations.ai.base import AIProvider
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from google import genai
 
+logger = logging.getLogger(__name__)
+
 #: Stage name (as used in ``ai_process_logs.stage``) -> the settings fields that override it.
 _STAGE_OVERRIDES = {
     "classifying": ("classification_provider", "ai_model_classification"),
     "extracting": ("extraction_provider", "ai_model_extraction"),
+    # Prescriptions get their own pair rather than sharing the extraction override. The
+    # two stages read different things — a lab panel is a printed table, a prescription
+    # is often a photograph of handwriting — so a model good enough for one is not
+    # automatically right for the other, and pinning them together would mean a change
+    # measured on reports silently moves prescriptions too.
+    "extracting_prescription": ("prescription_provider", "ai_model_prescription"),
 }
 
 
@@ -40,8 +49,19 @@ def get_ai_provider() -> AIProvider:
     # anthropic package at import time in environments that never call the model.
     import anthropic
 
+    model = settings.ai_model
+    if not model:
+        # Say so. Which model runs is a cost decision, and an unset variable silently
+        # choosing one is how a deploy ends up paying a different bill than the one the
+        # measurements in docs/ai-provider-comparison.md were taken against.
+        logger.warning(
+            "ai_model_not_set_using_default",
+            extra={"model": DEFAULT_MODEL},
+        )
+        model = DEFAULT_MODEL
+
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key or None)
-    return AnthropicProvider(client, settings.ai_model or DEFAULT_MODEL)
+    return AnthropicProvider(client, model)
 
 
 @lru_cache
@@ -80,8 +100,17 @@ def get_stage_provider(settings: Settings, default: AIProvider, *, stage: str) -
     provider_field, model_field = _STAGE_OVERRIDES.get(stage, ("", ""))
     if not provider_field:
         return default
-    if getattr(settings, provider_field).strip().lower() == "gemini":
+    configured = getattr(settings, provider_field).strip().lower()
+    if configured == "gemini":
         return get_gemini_provider(
             settings.google_api_key.strip(), getattr(settings, model_field).strip()
+        )
+    if configured:
+        # Falling back is the safe direction — an unrecognised vendor must not receive a
+        # document — but silently is not: a typo in the variable reads as "the override is
+        # live" while every call goes to the default provider.
+        logger.warning(
+            "unrecognised_stage_provider_ignored",
+            extra={"stage": stage, "setting": provider_field, "value": configured},
         )
     return default

@@ -17,7 +17,8 @@ ambiguous pair like ``03/07/2014`` deterministically 3 July, never 7 March.
 """
 
 import re
-from datetime import date, datetime
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 
 #: Four-digit years first, so a full year is never captured by a two-digit pattern.
 #: Applied after _normalise(), so these carry no ordinals, commas, or trailing time.
@@ -123,3 +124,79 @@ def in_order(earlier: object, later: object) -> bool:
     if start is None or end is None:
         return True
     return end >= start
+
+
+# --- stated intervals -------------------------------------------------------
+#
+# A vaccination card often states WHEN the next dose is due as an interval rather than a
+# date: "next dose due after 4 weeks". Asked to return the start of that window, a model
+# computes date_given + 28 days and hands back a date that appears nowhere in the
+# document — and for vaccinations that value is written to `vaccinations.next_due_on`,
+# which drives Spring's reminder index. So a model's date arithmetic would decide when a
+# parent is reminded to bring a child back.
+#
+# Measured: a card reading "Date given: 04/03/2026 / Next dose due after 4 weeks" came
+# back with next_due_date 01/04/2026, computed. Correct that time, unverifiable in
+# general, and stored indistinguishably from a printed date.
+#
+# So the model transcribes the phrase and this computes the date, for the same reason
+# abnormal flags, dose schedules and money are computed here.
+
+_WORD_NUMBERS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "twelve": 12,
+}  # fmt: skip
+
+#: "4 weeks", "one month", "6-8 weeks".
+_INTERVAL_RE = re.compile(
+    r"(?P<count>\d+|" + "|".join(_WORD_NUMBERS) + r")\s*(?P<unit>day|week|month|year)s?\b",
+    re.IGNORECASE,
+)
+#: A range collapses to its first number BEFORE matching: "6-8 weeks" is one interval, and
+#: the regex would otherwise skip the 6 (no unit follows it) and read "8 weeks" — the last
+#: day of the window rather than the first. The day a dose first becomes due is the one
+#: this field means, the same rule a printed window follows.
+_INTERVAL_RANGE_RE = re.compile(r"(\d+)\s*(?:-|–|—|to)\s*\d+", re.IGNORECASE)  # noqa: RUF001
+
+
+def _add_months(start: date, months: int) -> date:
+    """Calendar months, clamped to the end of the target month.
+
+    31 January + 1 month is 28 February, not 3 March. Written out rather than pulled from
+    dateutil: four lines against a dependency, and the clamping rule is the whole content.
+    """
+    total = start.month - 1 + months
+    year = start.year + total // 12
+    month = total % 12 + 1
+    last_day = monthrange(year, month)[1]
+    return date(year, month, min(start.day, last_day))
+
+
+def add_interval(start: object, phrase: object) -> str | None:
+    """``start`` plus a stated interval, as an ISO date. None when either is unreadable.
+
+    Refuses rather than guesses, like every other decision here: no start date, no
+    recognisable interval, or an unknown unit all give None. A range takes its first
+    number, so "6-8 weeks" is the day the dose first becomes due.
+    """
+    begin = parse_date(start)
+    if begin is None or not isinstance(phrase, str):
+        return None
+    match = _INTERVAL_RE.search(_INTERVAL_RANGE_RE.sub(r"\1", phrase))
+    if match is None:
+        return None
+
+    raw_count = match.group("count").lower()
+    # The regex admits digits or a known word and nothing else, so both branches are safe.
+    count = int(raw_count) if raw_count.isdigit() else _WORD_NUMBERS[raw_count]
+    if count <= 0:
+        return None
+
+    unit = match.group("unit").lower()
+    if unit == "day":
+        return (begin + timedelta(days=count)).isoformat()
+    if unit == "week":
+        return (begin + timedelta(weeks=count)).isoformat()
+    if unit == "month":
+        return _add_months(begin, count).isoformat()
+    return _add_months(begin, count * 12).isoformat()

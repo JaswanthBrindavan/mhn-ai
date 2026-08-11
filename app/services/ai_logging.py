@@ -7,6 +7,7 @@ in one place on purpose.
 """
 
 import time
+from collections.abc import Callable
 from decimal import Decimal
 
 from pydantic import ValidationError
@@ -15,9 +16,17 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.integrations.ai.base import StructuredResponse
 from app.integrations.ai.pricing import estimate_cost_usd
 from app.models.ai_results import AiProcessLog
-from app.workers.stagetypes import StageContext
+from app.workers.stagetypes import (
+    PermanentStageError,
+    StageContext,
+    TransientStageError,
+)
 
-PROVIDER_NAME = "anthropic"
+#: What the provider and model columns say when a stage completed without calling a model
+#: at all. ``generate_insights`` skips the paid call when every result is in range, and
+#: naming a model there claimed a call that never happened — in the one table that exists
+#: to say what was spent. Both columns are NOT NULL, so this is the sentinel.
+NO_CALL = "skipped"
 
 
 def log_process(
@@ -33,7 +42,11 @@ def log_process(
     detail: str | None = None,
 ) -> None:
     usage = response.usage if response is not None else None
-    model = response.model if response is not None else (ctx.settings.ai_model or "unknown")
+    # Both come from the response or neither does. Falling back to configuration was how
+    # a skipped stage came to log Haiku for a call it never made, and a hardcoded provider
+    # named Anthropic for every document Gemini actually received.
+    model = response.model if response is not None else NO_CALL
+    provider = response.provider if response is not None else NO_CALL
     cost = estimate_cost_usd(model, usage) if usage is not None else Decimal("0")
 
     values = {
@@ -41,7 +54,7 @@ def log_process(
         "document_id": ctx.document_id,
         "stage": stage,
         "attempt": ctx.attempt,
-        "provider": PROVIDER_NAME,
+        "provider": provider,
         "model": model,
         "prompt_version": prompt_version,
         "schema_version": schema_version,
@@ -65,6 +78,49 @@ def log_process(
     )
     ctx.session.execute(stmt)
     ctx.session.commit()
+
+
+def check_response(
+    response: StructuredResponse,
+    *,
+    log: Callable[..., None],
+    duration_ms: int,
+    what: str,
+) -> None:
+    """Reject a response no stage should try to parse, logging it first.
+
+    Shared because both conditions are properties of the response rather than of any one
+    stage, and four copies drift. ``log`` is the stage's own logging helper with its
+    context already bound, so the row still carries that stage's prompt and schema
+    versions.
+
+    A refusal is transient: the safety classifier is not deterministic and a retry can
+    legitimately succeed. **Truncation is not.** A response cut at the token ceiling fails
+    Pydantic, and at ``temperature=0`` it fails identically on every retry — so it was
+    costing the full attempt cap at full price to arrive where it started. It ends the
+    item as ``failed`` with its own code, which is what tells you to raise the ceiling
+    rather than to look for a flaky model.
+    """
+    if response.refused:
+        log(
+            outcome="refused",
+            error_code="model_refusal",
+            response=response,
+            duration_ms=duration_ms,
+        )
+        raise TransientStageError(f"{what} refused by safety classifier")
+
+    if response.truncated:
+        log(
+            outcome="truncated",
+            error_code="response_truncated",
+            response=response,
+            duration_ms=duration_ms,
+        )
+        raise PermanentStageError(
+            "response_truncated",
+            f"{what} hit the output token ceiling; the response is incomplete",
+        )
 
 
 def sanitize_validation_error(exc: ValidationError) -> str:
