@@ -339,6 +339,17 @@ def extra_columns(session: Session, item_id: UUID, section: DocumentSection) -> 
     raw = ((data or {}).get("fields") or {}).get("next_due_date")
     if not raw:
         return {}
+
+    # A pair we have already recorded as inconsistent does not get to set a reminder.
+    # `dates_out_of_order` means the next dose reads as earlier than the dose given, which
+    # is a misread — and `_date_flags` exists precisely to keep such values "visible for a
+    # human without asserting they are correct". This is the one consumer that ACTS on the
+    # value, so it is the one place that assertion would have been made. The content still
+    # shows both dates; only the reminder is withheld.
+    flags = (data or {}).get("flags") or []
+    if any(f.get("code") == "dates_out_of_order" for f in flags):
+        logger.warning("next_due_date_not_written", extra={"item_id": str(item_id)})
+        return {}
     try:
         # Already normalised to ISO by app.services.dates; parse rather than trust a shape.
         parsed = datetime.fromisoformat(str(raw))

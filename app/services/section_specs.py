@@ -289,6 +289,19 @@ class VaccinationFields(BaseModel):
     dose_info: str | None = Field(default=None, max_length=128)
     date_given: str | None = Field(default=None, max_length=64)
     next_due_date: str | None = Field(default=None, max_length=64)
+    #: The interval a record states INSTEAD of a next date — "after 4 weeks". Transcribed
+    #: as printed; ``dates.add_interval`` turns it into ``next_due_date``.
+    #:
+    #: It exists because the model was doing that arithmetic. Asked to return "the start
+    #: of the window" for "due after 4 weeks", it returned a date appearing nowhere in the
+    #: document — and for vaccinations that value is written to
+    #: ``vaccinations.next_due_on``, which drives Spring's reminder index. A model's date
+    #: maths decided when a parent is reminded to bring a child back.
+    #:
+    #: Keeping the phrase also gives the stored date its provenance for free: a
+    #: ``next_due_date`` beside a non-null interval was derived, one beside a null
+    #: interval was printed on the document.
+    next_due_interval: str | None = Field(default=None, max_length=64)
     facility: str | None = Field(default=None, max_length=256)
 
 
@@ -300,6 +313,7 @@ _VACCINATION_SCHEMA: dict[str, Any] = {
         "dose_info": _NULLABLE_STR,
         "date_given": _NULLABLE_STR,
         "next_due_date": _NULLABLE_STR,
+        "next_due_interval": _NULLABLE_STR,
         "facility": _NULLABLE_STR,
     },
     "required": [
@@ -308,6 +322,7 @@ _VACCINATION_SCHEMA: dict[str, Any] = {
         "dose_info",
         "date_given",
         "next_due_date",
+        "next_due_interval",
         "facility",
     ],
     "additionalProperties": False,
@@ -323,12 +338,20 @@ _VACCINATION_PROMPT = (
     "- vaccine_name: the vaccine itself, e.g. 'Covishield', 'Tetanus Toxoid'.\n"
     "- dose_info: e.g. 'Dose 2 of 2', 'Booster', '1st dose'.\n"
     "- date_given: the date this dose was administered.\n"
-    "- next_due_date: the NEXT scheduled dose only. Null if the record shows none or "
-    "the series is complete.\n"
-    "  If the record gives a WINDOW rather than a single day — 'Between 31 Jan 2022 and "
-    "14 Feb 2022', 'due after 4 weeks', '31/01/2022 - 14/02/2022' — return the START of "
-    "that window, the day the dose first becomes due. Do not return null just because the "
-    "record states a range: a stated next dose is the whole point of this field.\n"
+    "- next_due_date: the next dose's date, ONLY where the record prints an actual date. "
+    "Null if it shows none, says the series is complete, or gives an interval instead of "
+    "a date.\n"
+    "  Where it prints a WINDOW of dates — 'Between 31 Jan 2022 and 14 Feb 2022', "
+    "'31/01/2022 - 14/02/2022' — return the START of that window, the day the dose first "
+    "becomes due. Do not return null just because the record states a range.\n"
+    "- next_due_interval: where the record states HOW LONG until the next dose instead of "
+    "a date — 'due after 4 weeks', 'next dose in 6 months', 'after 6-8 weeks' — copy that "
+    "phrase as printed. Null when the record prints an actual date, or says nothing.\n"
+    "  **Never calculate a date from an interval.** Do not add four weeks to the date "
+    "given and return the result: that date is printed nowhere on the document, it "
+    "decides when a person is reminded to come back for a dose, and the arithmetic "
+    "belongs in code where it can be checked. Put the phrase here and leave next_due_date "
+    "null.\n"
     "- facility: the vaccination centre or hospital NAME only, not its address.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
 )
@@ -371,6 +394,11 @@ class SectionSpec:
     #: What the summary must be written from. Non-empty in any of these means there is a
     #: read to put into plain words.
     summary_sources: tuple[str, ...] = ()
+    #: (target, start, interval) — fill ``target`` by adding the interval a document
+    #: STATED to ``start``, when the document printed no date of its own. The model
+    #: transcribes the phrase and Python does the arithmetic, for the same reason abnormal
+    #: flags and money are computed here. A printed date always wins over a derived one.
+    derived_from_interval: tuple[tuple[str, str, str], ...] = ()
 
 
 INSTRUCTION_PREFIX = (
@@ -414,6 +442,8 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         max_tokens=2048,
         date_fields=("date_given", "next_due_date"),
         date_order=(("date_given", "next_due_date"),),
+        # The model transcribes the phrase; this derives the date. See VaccinationFields.
+        derived_from_interval=(("next_due_date", "date_given", "next_due_interval"),),
     ),
 }
 
