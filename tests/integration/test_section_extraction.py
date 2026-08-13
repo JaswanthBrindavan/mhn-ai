@@ -211,6 +211,52 @@ def test_rerunning_the_stage_upserts_rather_than_duplicating(
     assert len(_logs(db_session, item_id)) == 1
 
 
+def test_a_document_with_no_text_completes_without_paying_the_model(
+    db_session, aws, test_settings, make_document
+):
+    """A photographed X-ray: 4 characters of text, and nothing worth asking a model.
+
+    The real case from production. It must NOT reject — filing has already happened, so a
+    reject stamps the filed row failed and the user is shown a broken document for a file
+    we handled correctly. It completes, stores empty fields, and says why.
+    """
+    document_id = make_document(body=_pdf("20cm"))
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(db_session, item_id, document_id, "scans_imaging")
+    ai = FakeAIProvider(response=structured_response(SCAN_PAYLOAD))
+
+    extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
+
+    # The whole point: no model call was made, so none was paid for.
+    assert ai.calls == []
+
+    row = _extraction_row(db_session, item_id)
+    assert row is not None
+    assert row["section"] == "scans_imaging"
+    # Empty, not the fake's payload — nothing was read, and nothing was invented.
+    assert all(not value for value in row["data"]["fields"].values())
+    codes = {flag["code"] for flag in row["data"]["flags"]}
+    assert "nothing_extracted" in codes
+    assert "no_radiologist_read" in codes
+    # A stage that made no call must not claim one, per the ai_process_logs rule.
+    log = _logs(db_session, item_id)[0]
+    assert log["outcome"] == "succeeded"
+    assert log["provider"] == log["model"] == "skipped"
+
+
+def test_a_thin_but_real_document_is_still_read(db_session, aws, test_settings, make_document):
+    """The guard bites only on noise. Bias low: a short real document still reaches the model."""
+    document_id = make_document(body=_pdf("Covishield Dose 2 on 23/12/2021"))
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(db_session, item_id, document_id, "vaccinations")
+    ai = FakeAIProvider(response=structured_response(VACCINATION_PAYLOAD))
+
+    extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
+
+    assert len(ai.calls) == 1
+    assert _extraction_row(db_session, item_id)["data"]["fields"]["vaccine_name"] == "Covishield"
+
+
 def test_unhandled_section_is_rejected_not_retried(db_session, aws, test_settings, make_document):
     """Bills classify correctly but have no extractor — terminal, not a retry loop."""
     document_id = make_document(body=_pdf())

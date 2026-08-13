@@ -13,7 +13,8 @@ remain rejected are those that are manual-upload-only by product decision (``bil
 Flow: read this item's classification to learn the section, reload the source object,
 extract its TEXT (embedded layer first, Tesseract OCR for image-only pages), ask the
 model for that section's fields under a fixed schema, validate with Pydantic (never
-repaired), normalise dates in Python (never the model), then persist and log.
+repaired), normalise dates in Python (never the model), then persist and log. A document
+with almost no text skips the model entirely and still completes — see ``MIN_TEXT_CHARS``.
 
 The model is given the extracted text, not the file — the opposite of what the report
 pipeline does. ``app.services.ocr`` carries that argument and what it costs; the part
@@ -40,7 +41,7 @@ nothing else.
 import logging
 import time
 from functools import partial
-from typing import Any
+from typing import Any, get_origin
 
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
@@ -70,6 +71,14 @@ PROMPT_VERSION = "sec-2026-08-11"
 SCHEMA_VERSION = "sec-3"
 STAGE_NAME = "extracting_section"
 
+#: Below this many characters there is nothing a section's worth of fields could be read
+#: out of, so the model is not asked. A real chest X-ray reached production yielding **4**
+#: characters — a scale marking down the edge of the image — and we paid to be told seven
+#: nulls. The bias is deliberately low: too low costs a fraction of a cent, too high stops
+#: reading a thin but genuine document, and the sparsest real one this stage sees (a
+#: vaccination card naming a vaccine and a date) still runs to dozens of characters.
+MIN_TEXT_CHARS = 16
+
 
 def extract_section(ctx: StageContext) -> None:
     """Stage entrypoint: transcribe a non-report document's fields for its section."""
@@ -91,10 +100,11 @@ def extract_section(ctx: StageContext) -> None:
         )
         raise RejectStageError("text_extraction_failed", str(exc)) from exc
 
-    if not extracted.text.strip():
-        # A blank read is not a model failure; say so rather than paying to be told.
-        _log(ctx, outcome="rejected", error_code="no_text_extracted", duration_ms=0)
-        raise RejectStageError("no_text_extracted", "No readable text in the document")
+    if len(extracted.text.strip()) < MIN_TEXT_CHARS:
+        # Nothing a section's worth of fields could be read out of. Say so rather than
+        # paying to be told — and complete rather than reject, see _record_unread.
+        _record_unread(ctx, spec, extracted)
+        return
 
     started = time.perf_counter()
     try:
@@ -190,6 +200,62 @@ def record_section_mismatch(
             "detected_section": detected_section.value,
         },
     )
+
+
+def _record_unread(ctx: StageContext, spec: SectionSpec, extracted: ExtractedText) -> None:
+    """Record a document nothing could be read out of — completed, not rejected.
+
+    This used to raise ``RejectStageError("no_text_extracted")``, and rejecting is the
+    wrong verdict. Filing has already happened by the time this stage runs, so a reject
+    stamps ``content.ai.state = "failed"`` on a document that is perfectly fine — it is a
+    photograph of an X-ray, and there is no text on an X-ray. The user was then shown a
+    failed document, or nothing at all, for a file we had handled correctly.
+
+    Completing with empty fields and the flags that explain them is the honest record, and
+    it is the shape ``record_section_mismatch`` already uses: no model call, so the process
+    log records ``"skipped"`` for provider and model rather than claiming one that never
+    happened. ``build_payload`` supplies the rest — ``no_radiologist_read`` for a scan with
+    no report behind it, the OCR provenance, and the confidence flag.
+
+    The flag below is added for every section because the scans one is not universal: an
+    insurance policy that yields no text would otherwise complete with an empty card and
+    nothing saying why, which is the failure this whole change exists to remove.
+    """
+    payload = build_payload(spec, _empty_result(spec), extracted)
+    payload["flags"].append(
+        {
+            "code": "nothing_extracted",
+            "field": "",
+            "detail": (
+                "No readable text was found in this document, so nothing could be taken "
+                "out of it. It is saved and you can open it any time."
+            ),
+        }
+    )
+    _persist(ctx, spec.section, payload)
+    _log(ctx, outcome="succeeded", duration_ms=0)
+    logger.info(
+        "section_extraction_skipped_no_text",
+        extra={
+            "item_id": str(ctx.item_id),
+            "section": spec.section.value,
+            "chars": len(extracted.text.strip()),
+        },
+    )
+
+
+def _empty_result(spec: SectionSpec) -> BaseModel:
+    """The spec's own model with nothing in it, to feed ``build_payload``.
+
+    ``model_construct`` rather than the constructor: there is no model output to validate
+    here, and the list fields (``findings``, ``exclusions``, …) are the only required ones,
+    so validating would mean inventing values to satisfy a schema nothing filled.
+    """
+    empty: dict[str, Any] = {
+        name: [] if get_origin(field.annotation) is list else None
+        for name, field in spec.model.model_fields.items()
+    }
+    return spec.model.model_construct(**empty)
 
 
 #: Section names as a person would say them, for the sentence above.
