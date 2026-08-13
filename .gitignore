@@ -12,6 +12,9 @@ db/
 # Local test documents — never commit patient data.
 Sample reports/
 
+# The drug catalogue source for the medicine_master import — 121 MB, local only.
+Drug_Database
+
 # Python
 .venv/
 __pycache__/
