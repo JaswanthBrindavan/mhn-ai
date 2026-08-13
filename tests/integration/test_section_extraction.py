@@ -236,12 +236,34 @@ def test_a_document_with_no_text_completes_without_paying_the_model(
     # Empty, not the fake's payload — nothing was read, and nothing was invented.
     assert all(not value for value in row["data"]["fields"].values())
     codes = {flag["code"] for flag in row["data"]["flags"]}
-    assert "nothing_extracted" in codes
+    # One explanation, not two. Scans say it in their own words; the generic
+    # nothing_extracted would only repeat it, and the app gives each flag its own line.
     assert "no_radiologist_read" in codes
+    assert "nothing_extracted" not in codes
     # A stage that made no call must not claim one, per the ai_process_logs rule.
     log = _logs(db_session, item_id)[0]
     assert log["outcome"] == "succeeded"
     assert log["provider"] == log["model"] == "skipped"
+
+
+def test_a_section_with_no_explanation_of_its_own_gets_the_generic_one(
+    db_session, aws, test_settings, make_document
+):
+    """Insurance has no `no_radiologist_read` equivalent, so it must still say something.
+
+    Without this the policy completes with an empty card and nothing explaining it, which
+    is the failure the whole change exists to remove — just moved to another section.
+    """
+    document_id = make_document(body=_pdf("20cm"))
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(db_session, item_id, document_id, "insurance")
+    ai = FakeAIProvider(response=structured_response(INSURANCE_PAYLOAD))
+
+    extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
+
+    assert ai.calls == []
+    codes = {flag["code"] for flag in _extraction_row(db_session, item_id)["data"]["flags"]}
+    assert "nothing_extracted" in codes
 
 
 def test_a_thin_but_real_document_is_still_read(db_session, aws, test_settings, make_document):

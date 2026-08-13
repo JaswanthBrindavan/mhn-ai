@@ -217,21 +217,25 @@ def _record_unread(ctx: StageContext, spec: SectionSpec, extracted: ExtractedTex
     happened. ``build_payload`` supplies the rest — ``no_radiologist_read`` for a scan with
     no report behind it, the OCR provenance, and the confidence flag.
 
-    The flag below is added for every section because the scans one is not universal: an
-    insurance policy that yields no text would otherwise complete with an empty card and
-    nothing saying why, which is the failure this whole change exists to remove.
+    The flag below is added because the scans one is not universal: an insurance policy
+    that yields no text would otherwise complete with an empty card and nothing saying why,
+    which is the failure this whole change exists to remove. It is *skipped* when the
+    section already produced its own explanation — the app renders each of these as its own
+    line, so a second sentence saying the same thing makes the card worse rather than more
+    informative.
     """
     payload = build_payload(spec, _empty_result(spec), extracted)
-    payload["flags"].append(
-        {
-            "code": "nothing_extracted",
-            "field": "",
-            "detail": (
-                "No readable text was found in this document, so nothing could be taken "
-                "out of it. It is saved and you can open it any time."
-            ),
-        }
-    )
+    if not any(flag["code"] == "no_radiologist_read" for flag in payload["flags"]):
+        payload["flags"].append(
+            {
+                "code": "nothing_extracted",
+                "field": "",
+                "detail": (
+                    "No readable text was found in this document, so nothing could be "
+                    "taken out of it. It is saved and you can open it any time."
+                ),
+            }
+        )
     _persist(ctx, spec.section, payload)
     _log(ctx, outcome="succeeded", duration_ms=0)
     logger.info(
