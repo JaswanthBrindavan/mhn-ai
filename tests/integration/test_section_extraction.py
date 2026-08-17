@@ -280,16 +280,17 @@ def test_a_thin_but_real_document_is_still_read(db_session, aws, test_settings, 
 
 
 def test_unhandled_section_is_rejected_not_retried(db_session, aws, test_settings, make_document):
-    """Bills classify correctly but have no extractor — terminal, not a retry loop."""
+    """A medical condition classifies correctly but has no extractor — terminal, not a
+    retry loop."""
     document_id = make_document(body=_pdf())
     item_id = _seed_item(db_session, document_id)
-    _seed_classification(db_session, item_id, document_id, "bills")
+    _seed_classification(db_session, item_id, document_id, "medical_condition")
     ai = FakeAIProvider(response=structured_response(INSURANCE_PAYLOAD))
 
     with pytest.raises(RejectStageError) as exc:
         extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
-    assert exc.value.code == "bills"
+    assert exc.value.code == "medical_condition"
     assert _extraction_row(db_session, item_id) is None
 
 

@@ -84,7 +84,7 @@ class RunItemResponse(BaseModel):
     filed_section: str | None = None
     #: Which `/v1/documents/{document_type}/...` route reads this document's result.
     #: Null until it is classified, and for a section with no addressable type
-    #: (`bills`, `medical_condition`, `unknown` — none of which produce an AI result).
+    #: (`medical_condition`, `unknown` — neither of which produces an AI result).
     document_type: DocumentType | None = None
     status: str
     attempt_count: int

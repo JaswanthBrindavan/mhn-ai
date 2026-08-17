@@ -534,10 +534,12 @@ def test_a_section_mismatch_files_where_the_user_put_it_and_reads_nothing(
 def test_a_mismatch_into_a_section_we_cannot_file_stays_in_intake(
     db_session, make_document, session_factory, test_settings, aws
 ):
-    """`bills` and `medical_condition` have no table binding here, so there is nowhere to
-    put it. Unchanged behaviour: rejected, still in intake, Spring keeps its own mover."""
+    """`medical_condition` has no table binding here, so there is nowhere to put it.
+    Unchanged behaviour: rejected, still in intake, Spring keeps its own mover."""
     _, sqs, queue_url, _ = aws
-    item_id, run_id, document_id = _seed_item(db_session, make_document, intended_section="bills")
+    item_id, run_id, document_id = _seed_item(
+        db_session, make_document, intended_section="medical_condition"
+    )
     publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
 
     outcome = _process(
@@ -551,13 +553,13 @@ def test_a_mismatch_into_a_section_we_cannot_file_stays_in_intake(
     assert _source_exists(db_session, document_id)
 
 
-@pytest.mark.parametrize("section", ["bills", "medical_condition", "prescriptions", "unknown"])
+@pytest.mark.parametrize("section", ["medical_condition", "prescriptions", "unknown"])
 def test_a_section_with_no_pipeline_is_rejected_by_the_router(
     db_session, make_document, session_factory, test_settings, aws, section
 ):
     """Routing, not failure: no extractor exists, so the document stays where it is.
 
-    ``prescriptions`` is here for a different reason from the other three: it *has* an
+    ``prescriptions`` is here for a different reason from the other two: it *has* an
     extractor, and is held behind ``PRESCRIPTIONS_ENABLED`` until Spring can list a filed
     prescription. Off, it must be indistinguishable from a section with no pipeline at
     all — which is what this asserts. The mirror, with the flag on, is the next test.

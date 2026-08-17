@@ -6,6 +6,7 @@ Any other order can leave a live row pointing at a deleted object.
 
 import json
 import uuid
+from decimal import Decimal
 from typing import NamedTuple
 
 import pytest
@@ -16,7 +17,7 @@ from app.integrations.s3 import (
     SourceObjectUnavailableError,
     object_exists,
 )
-from app.models.spring import reports, unclassified_files, vaccinations
+from app.models.spring import bills, reports, unclassified_files, vaccinations
 from app.services import filing
 from app.services.assembly import ContentState, build_content
 from app.services.classification import DocumentSection
@@ -463,9 +464,82 @@ def test_a_reminder_is_not_set_from_dates_we_flagged_as_inconsistent(
     assert filing.extra_columns(db_session, seed.item_id, DocumentSection.VACCINATIONS) == {}
 
 
-def test_extra_columns_is_empty_for_a_non_vaccination_section(db_session, classified_item) -> None:
+def test_extra_columns_is_empty_for_a_section_with_none(db_session, classified_item) -> None:
     seed = classified_item(DocumentSection.REPORTS)
     assert filing.extra_columns(db_session, seed.item_id, DocumentSection.REPORTS) == {}
+
+
+def test_bill_amounts_reach_the_columns_the_app_reads(
+    db_session, s3_client, bucket, classified_item, seed_section_extraction
+) -> None:
+    """`bills` has columns for the very fields we extract, so the extraction fills them.
+
+    Leaving them null would mean the bills list renders no amount while the value sits in
+    `content` — which is the whole point of extracting it.
+    """
+    seed = classified_item(DocumentSection.BILLS)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "bills",
+        # As `build_payload` stores them: bare decimal strings and an ISO currency code.
+        {"total_amount": "1450.00", "amount_due": "450.50", "currency": "INR"},
+    )
+    row_id = filing.file_document(
+        db_session,
+        s3_client,
+        item_id=seed.item_id,
+        document_id=seed.document_id,
+        section=DocumentSection.BILLS,
+        content=build_content(db_session, seed.item_id, state=ContentState.CLASSIFIED),
+        bucket=bucket,
+        expected={"classifying"},
+    )
+
+    filing.write_content(
+        db_session,
+        seed.item_id,
+        build_content(db_session, seed.item_id, state=ContentState.COMPLETE),
+        extra=filing.extra_columns(db_session, seed.item_id, DocumentSection.BILLS),
+    )
+
+    row = (
+        db_session.execute(
+            select(bills.c.amount, bills.c.amount_due, bills.c.amount_currency).where(
+                bills.c.id == row_id
+            )
+        )
+        .mappings()
+        .one()
+    )
+    assert str(row["amount"]) == "1450.00"
+    assert str(row["amount_due"]) == "450.50"
+    assert row["amount_currency"] == "INR"
+
+
+def test_a_bill_amount_the_column_cannot_hold_is_skipped_not_coerced(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """`amount` is numeric(10, 2) and `amount_currency` is a four-value enum.
+
+    A misread that ran two columns together, or a currency outside the enum, would fail the
+    UPDATE — losing the `content` write for a document that was otherwise processed fine.
+    Each value is checked against its column's shape on its own, so the readable ones still
+    land and the unreadable ones stay in `content` for a human.
+    """
+    seed = classified_item(DocumentSection.BILLS)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "bills",
+        # `normalise_currency` passes any three letters through, so a legal ISO code with no
+        # place in the enum is the realistic case — not a garbled one.
+        {"total_amount": "300000500000", "amount_due": "450.50", "currency": "AED"},
+    )
+
+    assert filing.extra_columns(db_session, seed.item_id, DocumentSection.BILLS) == {
+        "amount_due": Decimal("450.50")
+    }
 
 
 # --- concurrency: one document, one section row -----------------------------

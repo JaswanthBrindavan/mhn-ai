@@ -1,14 +1,13 @@
 """Section extraction — the stage that handles non-report documents.
 
 The report pipeline is classify -> extract -> insights. This is the whole post-filing
-pipeline for the three sections that are transcribed rather than interpreted — insurance,
-scans/imaging and vaccinations — writing their fields to ``ai_section_extractions`` and
-stopping. There is no insights stage for them: there is nothing clinical to interpret.
+pipeline for the four sections that are transcribed rather than interpreted — insurance,
+scans/imaging, vaccinations and bills — writing their fields to ``ai_section_extractions``
+and stopping. There is no insights stage for them: there is nothing clinical to interpret.
 ``prescriptions`` has its own stage rather than a spec here — ``app.services.prescriptions``
 sends the document itself rather than its OCR text, because the dosing sits in a column
-beside the medicine and flattening that puts a dose on the wrong row. The sections that
-remain rejected are those that are manual-upload-only by product decision (``bills``,
-``medical_condition``).
+beside the medicine and flattening that puts a dose on the wrong row. The one section that
+remains rejected is ``medical_condition``, which is manual-entry-only by product decision.
 
 Flow: read this item's classification to learn the section, reload the source object,
 extract its TEXT (embedded layer first, Tesseract OCR for image-only pages), ask the

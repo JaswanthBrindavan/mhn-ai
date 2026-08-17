@@ -438,10 +438,10 @@ def test_run_item_reports_the_intended_section(api, make_document):
     assert run["items"][0]["intended_section"] == "reports"
 
 
-@pytest.mark.parametrize("section", ["bills", "medical_condition", "unknown"])
+@pytest.mark.parametrize("section", ["medical_condition", "unknown"])
 def test_sections_with_no_addressable_type_report_none(api, make_document, db_session, section):
-    """bills is stored not interpreted, medical_condition is entered by hand, unknown is by
-    definition unclassified — none produces a result to read, so none has a URL."""
+    """medical_condition is entered by hand and unknown is by definition unclassified —
+    neither produces a result to read, so neither has a URL."""
     document_id = make_document()
     run_id = api.post(
         "/v1/document-processing-runs", json={"documents": [{"document_id": document_id}]}

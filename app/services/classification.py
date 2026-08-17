@@ -82,15 +82,17 @@ class DocumentSection(StrEnum):
 #: Lives here, beside ``DocumentSection``, because both ``results`` and ``runs`` need it and
 #: ``results`` already imports ``runs`` — putting it in either would make that a cycle.
 #:
-#: The sections with no addressable type are deliberate, not an oversight: ``bills`` is
-#: stored rather than interpreted, ``medical_condition`` is entered by hand, and ``unknown``
-#: is by definition unclassified. None of them produces an AI result to read.
+#: The sections with no addressable type are deliberate, not an oversight:
+#: ``medical_condition`` is entered by hand and ``unknown`` is by definition unclassified,
+#: so neither produces an AI result to read. ``bills`` was in that list until it gained a
+#: section spec — it is now extracted like any other section and addressable like one.
 SECTION_BY_DOCUMENT_TYPE: dict[DocumentType, DocumentSection] = {
     DocumentType.REPORTS: DocumentSection.REPORTS,
     DocumentType.SCANS: DocumentSection.SCANS_IMAGING,
     DocumentType.INSURANCE: DocumentSection.INSURANCE,
     DocumentType.VACCINATIONS: DocumentSection.VACCINATIONS,
     DocumentType.PRESCRIPTIONS: DocumentSection.PRESCRIPTIONS,
+    DocumentType.BILLS: DocumentSection.BILLS,
 }
 
 #: The same mapping keyed by the section string as stored, for going from a classification
