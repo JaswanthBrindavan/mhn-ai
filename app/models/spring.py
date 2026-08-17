@@ -11,8 +11,8 @@ declaration cannot drift into being mistaken for the authoritative schema.
 **Row access, not schema.** ``unclassified_files`` is read-only except for the documented
 filing move: once a document is classified into a section this service processes, it
 INSERTs a row into **that section's table** (``reports``, ``scans_imaging``, ``insurance``,
-``prescriptions`` or ``vaccinations``), writes the row's ``content``, and DELETEs the
-source ``unclassified_files`` row. The THP tables below are read-only. It never issues DDL
+``prescriptions``, ``vaccinations`` or ``bills``), writes the row's ``content``, and DELETEs
+the source ``unclassified_files`` row. The THP tables below are read-only. It never issues DDL
 against any Spring table.
 """
 
@@ -23,10 +23,11 @@ from sqlalchemy import (
     Float,
     Integer,
     MetaData,
+    Numeric,
     String,
     Table,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, ENUM, JSONB, UUID
 
 spring_metadata = MetaData()
 
@@ -101,6 +102,33 @@ prescriptions = Table(
     Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+)
+
+#: The bills section. Unlike the sections above, this one has columns for the very things
+#: we extract — `amount`, `amount_due` and `amount_currency` — so `filing.extra_columns`
+#: fills them, the way it fills `vaccinations.next_due_on`. `hospital` stays null for the
+#: same reason as `insurance.provider`: it is an FK needing a name-to-id lookup.
+#:
+#: `amount_currency` is Postgres's `currency_enum`, declared as an ENUM rather than a
+#: String because psycopg sends a String parameter as text and Postgres will not implicitly
+#: cast text into an enum on INSERT. `create_type=False` keeps this a binding, never DDL —
+#: the type belongs to Spring's baseline migration.
+bills = Table(
+    "bills",
+    spring_metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", UUID(as_uuid=True), nullable=False),
+    Column("created_by", UUID(as_uuid=True), nullable=True),
+    Column("filepath", String(500), nullable=False),
+    Column("content", JSONB, nullable=True),
+    Column("private", Boolean, nullable=True),
+    Column("amount", Numeric(10, 2), nullable=True),
+    Column("amount_due", Numeric(10, 2), nullable=True),
+    Column(
+        "amount_currency",
+        ENUM("INR", "USD", "EUR", "GBP", name="currency_enum", create_type=False),
+        nullable=True,
+    ),
 )
 
 #: The vaccinations section. `next_due_on` drives Spring's "vaccination due" index and is

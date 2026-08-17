@@ -251,8 +251,8 @@ def _file_against_classification(
     belongs.
     """
     if intended not in filing.SECTION_TABLES:
-        # `bills` / `medical_condition`: no table binding here, so we cannot file it and
-        # Spring keeps its own mover for those. Unchanged behaviour — stays in intake.
+        # `medical_condition`: no table binding here, so we cannot file it and Spring keeps
+        # its own mover for it. Unchanged behaviour — stays in intake.
         raise RejectStageError(
             "section_mismatch",
             f"Filed under {intended.value} but classified as {detected.value}",

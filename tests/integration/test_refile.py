@@ -178,11 +178,11 @@ def test_a_document_already_in_its_detected_section_is_refused(
 
 
 def test_a_detected_section_we_never_file_is_refused(db_session, make_document, aws, test_settings):
-    """Classified `bills` or `unknown`: there is nowhere to move it TO, because this
-    service files neither. The app does not offer the action for them either."""
+    """Classified `medical_condition` or `unknown`: there is nowhere to move it TO, because
+    this service files neither. The app does not offer the action for them either."""
     s3, sqs, _, _ = aws
     document_id = _filed_mismatch(
-        db_session, make_document, s3, test_settings.s3_bucket, detected="bills"
+        db_session, make_document, s3, test_settings.s3_bucket, detected="medical_condition"
     )[1]
 
     with pytest.raises(ApiError) as exc:

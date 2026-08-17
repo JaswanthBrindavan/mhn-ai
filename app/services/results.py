@@ -305,8 +305,8 @@ def refile_document(
 
     detected = DocumentSection(clf.section)
     if detected not in filing.SECTION_TABLES:
-        # `bills`, `medical_condition`, `unknown`: we never file these, so there is nowhere
-        # to move it TO. The app does not offer the action for them either.
+        # `medical_condition`, `unknown`: we never file these, so there is nowhere to move
+        # it TO. The app does not offer the action for them either.
         raise ApiError(
             409,
             "section_not_filable",

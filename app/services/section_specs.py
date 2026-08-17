@@ -358,6 +358,87 @@ _VACCINATION_PROMPT = (
 
 
 # --------------------------------------------------------------------------- #
+# bills                                                                        #
+# --------------------------------------------------------------------------- #
+class BillFields(BaseModel):
+    """Validated hospital/clinic bill fields.
+
+    The smallest section here on purpose: a bill is a number and a date, and the product
+    ask is to show those. There is nothing to summarise and nothing clinical to interpret.
+
+    ``currency`` is separate from the amounts for the reason ``InsuranceFields`` gives —
+    the symbol is printed once in a column header and often does not survive text
+    extraction. Unlike insurance, these three go on to fill the ``bills`` table's own
+    ``amount`` / ``amount_due`` / ``amount_currency`` columns, so a value that cannot be
+    read is left null rather than approximated: see ``filing.extra_columns``.
+    """
+
+    facility: str | None = Field(default=None, max_length=256)
+    bill_number: str | None = Field(default=None, max_length=128)
+    bill_date: str | None = Field(default=None, max_length=64)
+    currency: str | None = Field(default=None, max_length=32)
+    total_amount: str | None = Field(default=None, max_length=64)
+    amount_due: str | None = Field(default=None, max_length=64)
+
+
+_BILL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "facility": _NULLABLE_STR,
+        "bill_number": _NULLABLE_STR,
+        "bill_date": _NULLABLE_STR,
+        "currency": _NULLABLE_STR,
+        "total_amount": _NULLABLE_STR,
+        "amount_due": _NULLABLE_STR,
+    },
+    "required": [
+        "facility",
+        "bill_number",
+        "bill_date",
+        "currency",
+        "total_amount",
+        "amount_due",
+    ],
+    "additionalProperties": False,
+}
+
+_BILL_PROMPT = (
+    "You transcribe structured fields from a medical bill, invoice or payment receipt. You "
+    "do not judge whether a charge is fair, itemise the treatment, or interpret what was "
+    "done — you only record what the document states.\n\n"
+    "Return:\n"
+    "- facility: the hospital, clinic, laboratory or diagnostic centre NAME only. Null if "
+    "only an address appears.\n"
+    "- bill_number: the invoice, bill or receipt number as printed.\n"
+    "- bill_date: the date of the bill or the date payment was taken.\n"
+    "- currency: the ISO-4217 code of the money on this document — 'INR' for Indian "
+    "rupees, three letters, nothing else. The symbol is often printed ONCE in a column "
+    "header ('Amount (₹)') rather than beside each figure, and may reach you as a stray "
+    "character such as ` or ? because the text layer could not resolve it. Words count as "
+    "evidence too: 'Rs', 'Rs.', or an amount spelled out ('RUPEES ONE THOUSAND ONLY'). "
+    "Null only if the document shows no currency anywhere.\n"
+    "- total_amount: the FINAL total payable for this bill, after every discount and "
+    "including tax — the single figure at the bottom of the bill, the one labelled 'Grand "
+    "Total', 'Net Amount', 'Net Payable' or 'Total'. DIGITS AS PRINTED and nothing else — "
+    "'1,450.00', never 'Rs 1,450', never words. NEVER a line item, never a subtotal before "
+    "tax or discount, never the sum of the lines worked out by you.\n"
+    "- amount_due: the amount still OUTSTANDING after what has been paid — 'Balance Due', "
+    "'Amount Payable', 'Due'. Digits as printed. Null when the bill prints no balance, and "
+    "null when it is settled and prints no due figure of its own. Do NOT subtract a paid "
+    "amount from the total to derive it: a bill marked 'PAID' with no balance line has no "
+    "amount_due, and arithmetic is not transcription.\n\n"
+    "Rules:\n"
+    + _NO_INVENTION_RULE
+    + _DATE_RULE
+    + "- A bill flattened to text puts adjacent columns on one line, so a rate, a quantity "
+    "and a line total can run together. Return a figure only when you can see which label "
+    "it belongs to; null is correct when you cannot.\n"
+    "- These figures are shown to the person as what they were charged. A wrong total is "
+    "worse than a missing one — when the document is unclear, return null.\n"
+)
+
+
+# --------------------------------------------------------------------------- #
 # registry                                                                     #
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -444,6 +525,18 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         date_order=(("date_given", "next_due_date"),),
         # The model transcribes the phrase; this derives the date. See VaccinationFields.
         derived_from_interval=(("next_due_date", "date_given", "next_due_interval"),),
+    ),
+    DocumentSection.BILLS: SectionSpec(
+        section=DocumentSection.BILLS,
+        model=BillFields,
+        json_schema=_BILL_SCHEMA,
+        system_prompt=_BILL_PROMPT,
+        # Six short fields, no lists: a bill's length is in its line items, and we
+        # deliberately transcribe none of them.
+        max_tokens=2048,
+        date_fields=("bill_date",),
+        amount_fields=("total_amount", "amount_due"),
+        currency_fields=("currency",),
     ),
 }
 

@@ -5,7 +5,7 @@ else is decided, because the section is what decides the rest. After it, the pip
 *shape* depends on the answer:
 
 * ``reports``            -> extract lab results, generate insights
-* ``insurance`` / ``scans_imaging`` / ``vaccinations``
+* ``insurance`` / ``scans_imaging`` / ``vaccinations`` / ``bills``
                          -> transcribe the section's fields, and stop
 * anything else          -> rejected; the document stays in ``unclassified_files``
 

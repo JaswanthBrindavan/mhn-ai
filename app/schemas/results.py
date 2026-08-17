@@ -31,6 +31,7 @@ class DocumentType(StrEnum):
     INSURANCE = "insurance"
     VACCINATIONS = "vaccinations"
     PRESCRIPTIONS = "prescriptions"
+    BILLS = "bills"
 
 
 class ClassificationResult(BaseModel):
@@ -83,7 +84,7 @@ class DocumentStatusResponse(BaseModel):
     #: Current lifecycle state of the latest processing item for this document.
     status: str
     #: The type to put in a result/retry URL. Null until the document is classified, and
-    #: for a section with no addressable type (`bills`, `medical_condition`, `unknown`).
+    #: for a section with no addressable type (`medical_condition`, `unknown`).
     document_type: DocumentType | None = None
     last_error_code: str | None = None
     #: Set once the document was filed into its section table.

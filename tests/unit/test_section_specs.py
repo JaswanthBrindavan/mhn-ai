@@ -11,6 +11,7 @@ from app.services.section_extraction import build_payload
 from app.services.section_specs import (
     SECTION_SPECS,
     SUPPORTED_SECTIONS,
+    BillFields,
     InsuranceFields,
     ScanFields,
     VaccinationFields,
@@ -41,6 +42,7 @@ def test_supported_sections_are_the_non_report_ones():
         DocumentSection.INSURANCE,
         DocumentSection.SCANS_IMAGING,
         DocumentSection.VACCINATIONS,
+        DocumentSection.BILLS,
     }
     assert expected == SUPPORTED_SECTIONS
     # Reports keep their own deeper pipeline; this package must not claim them.
@@ -49,7 +51,7 @@ def test_supported_sections_are_the_non_report_ones():
 
 def test_spec_for_an_unhandled_section_names_the_supported_ones():
     with pytest.raises(KeyError, match="insurance"):
-        spec_for(DocumentSection.BILLS)
+        spec_for(DocumentSection.MEDICAL_CONDITION)
 
 
 def test_insurance_payload_normalises_dates_to_iso():
@@ -170,3 +172,30 @@ def test_vaccination_payload_allows_a_missing_next_dose():
     assert payload["fields"]["date_given"] == "2021-12-23"
     assert payload["fields"]["next_due_date"] is None
     assert payload["flags"] == []
+
+
+def test_bill_payload_normalises_the_money_and_the_date():
+    spec = spec_for(DocumentSection.BILLS)
+    fields = BillFields(
+        facility="Apollo Hospitals",
+        bill_number="INV/2026/4471",
+        bill_date="14th March 2026",
+        currency="`",  # a rupee sign the text layer could not resolve
+        total_amount="` 1,450.00",
+        amount_due="3,00,000",  # Indian grouping
+    )
+    payload = build_payload(spec, fields)
+
+    assert payload["section"] == "bills"
+    assert payload["fields"]["bill_date"] == "2026-03-14"
+    assert payload["fields"]["currency"] == "INR"
+    assert payload["fields"]["total_amount"] == "1450.00"
+    assert payload["fields"]["amount_due"] == "300000"
+    assert payload["flags"] == []
+
+
+def test_bill_payload_refuses_a_percentage_in_an_amount_field():
+    """A share, not a sum. Keeping the number would show a discount as the bill total."""
+    spec = spec_for(DocumentSection.BILLS)
+    payload = build_payload(spec, BillFields(total_amount="20%"))
+    assert payload["fields"]["total_amount"] is None

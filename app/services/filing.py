@@ -20,6 +20,7 @@ so that AI-filed and hand-filed documents are indistinguishable.
 
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
@@ -36,6 +37,7 @@ from app.integrations.s3 import (
 from app.models.ai_results import AiSectionExtraction
 from app.models.processing import AiProcessingRunItem
 from app.models.spring import (
+    bills,
     insurance,
     prescriptions,
     reports,
@@ -61,6 +63,7 @@ SECTION_TABLES: dict[DocumentSection, Table] = {
     DocumentSection.INSURANCE: insurance,
     DocumentSection.PRESCRIPTIONS: prescriptions,
     DocumentSection.VACCINATIONS: vaccinations,
+    DocumentSection.BILLS: bills,
 }
 
 
@@ -324,19 +327,39 @@ def mark_content_failed(session: Session, item_id: UUID) -> None:
 def extra_columns(session: Session, item_id: UUID, section: DocumentSection) -> dict[str, Any]:
     """Section-table columns we can fill from the extraction, beyond ``content``.
 
-    Only vaccinations has one today: ``next_due_on`` drives Spring's reminder index and we
-    already extract the date. The rest (``hospital``, ``insurance.provider``) are foreign
-    keys into master tables and need a name-to-id lookup, which is separate work.
+    Two sections have them. ``vaccinations.next_due_on`` drives Spring's reminder index,
+    and ``bills`` carries ``amount`` / ``amount_due`` / ``amount_currency`` — the very
+    fields that section extracts, so leaving them null would mean the bills list renders
+    nothing while the value sits in ``content``. The rest (``hospital``,
+    ``insurance.provider``) are foreign keys into master tables and need a name-to-id
+    lookup, which is separate work.
+
+    Every value written here is one a column has a *shape* for, so each is checked against
+    that shape before it is written. A value that fails is skipped, never coerced: it is
+    still in ``content.ai`` for the reader, and a bad one would fail the UPDATE of a
+    Spring-owned row.
     """
-    if section is not DocumentSection.VACCINATIONS:
+    if section not in (DocumentSection.VACCINATIONS, DocumentSection.BILLS):
         return {}
 
-    data = session.execute(
-        select(AiSectionExtraction.data).where(AiSectionExtraction.run_item_id == item_id)
-    ).scalar_one_or_none()
+    data = (
+        session.execute(
+            select(AiSectionExtraction.data).where(AiSectionExtraction.run_item_id == item_id)
+        ).scalar_one_or_none()
+        or {}
+    )
     # `or {}` rather than a get-default: a present-but-null "fields" would otherwise chain
     # off None and raise AttributeError, which is neither a reject nor a transient error.
-    raw = ((data or {}).get("fields") or {}).get("next_due_date")
+    fields = data.get("fields") or {}
+    if section is DocumentSection.VACCINATIONS:
+        return _vaccination_columns(item_id, data, fields)
+    return _bill_columns(item_id, fields)
+
+
+def _vaccination_columns(
+    item_id: UUID, data: dict[str, Any], fields: dict[str, Any]
+) -> dict[str, Any]:
+    raw = fields.get("next_due_date")
     if not raw:
         return {}
 
@@ -346,7 +369,7 @@ def extra_columns(session: Session, item_id: UUID, section: DocumentSection) -> 
     # human without asserting they are correct". This is the one consumer that ACTS on the
     # value, so it is the one place that assertion would have been made. The content still
     # shows both dates; only the reminder is withheld.
-    flags = (data or {}).get("flags") or []
+    flags = data.get("flags") or []
     if any(f.get("code") == "dates_out_of_order" for f in flags):
         logger.warning("next_due_date_not_written", extra={"item_id": str(item_id)})
         return {}
@@ -357,6 +380,57 @@ def extra_columns(session: Session, item_id: UUID, section: DocumentSection) -> 
         logger.warning("next_due_date_unparseable", extra={"item_id": str(item_id)})
         return {}
     return {"next_due_on": parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)}
+
+
+#: What ``bills.amount`` and ``bills.amount_due`` can hold: ``numeric(10, 2)``.
+_AMOUNT_CEILING = Decimal("99999999.99")
+
+#: What ``bills.amount_currency`` can hold: Postgres's ``currency_enum``. A code outside
+#: this set is a legal ISO code that this column has no value for — ``normalise_currency``
+#: passes any three letters through — so it stays in ``content`` and the column stays null.
+_STORABLE_CURRENCIES = frozenset({"INR", "USD", "EUR", "GBP"})
+
+#: Extracted field -> the ``bills`` column it fills.
+_BILL_AMOUNTS = (("total_amount", "amount"), ("amount_due", "amount_due"))
+
+
+def _bill_columns(item_id: UUID, fields: dict[str, Any]) -> dict[str, Any]:
+    columns: dict[str, Any] = {}
+    for field, column in _BILL_AMOUNTS:
+        amount = _bill_amount(item_id, field, fields.get(field))
+        if amount is not None:
+            columns[column] = amount
+
+    currency = fields.get("currency")
+    if currency in _STORABLE_CURRENCIES:
+        columns["amount_currency"] = currency
+    elif currency:
+        logger.warning(
+            "bill_currency_not_storable",
+            extra={"item_id": str(item_id), "currency": currency},
+        )
+    return columns
+
+
+def _bill_amount(item_id: UUID, field: str, raw: object) -> Decimal | None:
+    """A bare decimal string from the extraction as a value ``numeric(10, 2)`` accepts.
+
+    ``money.normalise_amount`` has already reduced this to digits, so the parse is a
+    formality; the ceiling is not. A bill printed in paise, or a misread that ran two
+    columns together, overflows the column and fails the whole UPDATE — losing the
+    ``content`` write for a document that was otherwise processed correctly.
+    """
+    if not raw:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except InvalidOperation:
+        logger.warning("bill_amount_unparseable", extra={"item_id": str(item_id), "field": field})
+        return None
+    if value.copy_abs() > _AMOUNT_CEILING:
+        logger.warning("bill_amount_out_of_range", extra={"item_id": str(item_id), "field": field})
+        return None
+    return value
 
 
 def _delete_quietly(s3: "S3Client", bucket: str, key: str) -> None:

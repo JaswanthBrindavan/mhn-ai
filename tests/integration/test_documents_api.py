@@ -325,8 +325,9 @@ def test_typed_route_still_404s_for_a_never_processed_document(api, make_documen
 
 
 def test_an_unknown_document_type_is_rejected_before_any_lookup(api):
-    # 'bills' is a real section but has no addressable type; FastAPI rejects the path.
-    response = api.get("/v1/documents/bills/1/ai-result")
+    # 'medical_condition' is a real section but has no addressable type (it is entered by
+    # hand, so there is no AI result to read); FastAPI rejects the path.
+    response = api.get("/v1/documents/medical_condition/1/ai-result")
 
     assert response.status_code == 422
 
@@ -475,7 +476,7 @@ def test_status_reports_a_rejection_reason(api, db_session, make_document):
 def test_status_has_no_type_for_a_section_with_no_result_url(api, db_session, make_document):
     document_id = make_document()
     item_id = _seed_item(db_session, document_id, "rejected")
-    _seed_classified(db_session, item_id, document_id, "bills")
+    _seed_classified(db_session, item_id, document_id, "medical_condition")
 
     body = api.get(f"/v1/documents/{document_id}/status").json()
 
