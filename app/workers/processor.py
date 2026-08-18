@@ -327,10 +327,15 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
         # pharmacy bill instead, which is printed and lists the same drugs.
         pipeline = HANDWRITTEN_PRESCRIPTION_PIPELINE
     if section is DocumentSection.PRESCRIPTIONS and not ctx.settings.prescriptions_enabled:
-        # Filing is never undone, and Spring's listMyFiles still 501s for prescriptions, so
-        # a filed one renders nowhere and cannot be moved back. Reject until Spring can
-        # display it — routing, and the same answer as before the extractor existed.
-        # Remove this branch (and the setting) once that is true.
+        # An emergency stop, no longer a graceful one — the flag defaults ON since
+        # 2026-08-18 and Spring lists prescriptions, so the 501 this guarded is gone.
+        #
+        # What "off" costs now: Spring routes prescriptions through intake, so rejecting
+        # here leaves the document in Unclassified rather than in the section the user
+        # filed it into. Misfiled, not merely unread. To stop prescriptions gracefully,
+        # drop them from Spring's `AiClient.PROCESSABLE` instead — the document then goes
+        # straight to its own table, unread, exactly as before this service existed.
+        # See the note on `prescriptions_enabled` in config.py.
         pipeline = None
     if pipeline is None:
         # Correctly classified, just not a section this service processes. Routing, not

@@ -113,12 +113,29 @@ class Settings(BaseSettings):
 
     # --- Prescriptions ------------------------------------------------------
     # When on, a document classified as a prescription is filed into Spring's
-    # `prescriptions` table and extracted. OFF by default because filing is never undone
-    # and Spring's `listMyFiles` still returns 501 for this section: a filed prescription
-    # would render nowhere, and could not be moved back. Rejected while off, exactly as
-    # before the extractor existed — the document stays visible in Unclassified.
-    # Flip on once Spring lists and serves prescriptions.
-    prescriptions_enabled: bool = False
+    # `prescriptions` table and extracted.
+    #
+    # ON by default since 2026-08-18. It shipped off because Spring's `listMyFiles` still
+    # returned 501 for this section, so a filed prescription would have rendered nowhere and
+    # filing is never undone. Spring lists and serves prescriptions now, and production has
+    # run with this on since 2026-08-07 — a default of False meant the code contradicted
+    # every deployment, and any environment brought up without the variable (a new service, a
+    # replica, a local worker) rejected every prescription. That rejection is *routing*, so
+    # nothing logs an error and nothing surfaces a failure: it fails exactly as silently as
+    # the shared-SQS-queue bug did.
+    #
+    # **Turning this off is no longer a graceful kill switch, and it was one when it was
+    # written.** Spring did not route typed uploads through intake then, so "off" left a
+    # prescription sitting in the prescriptions table, merely unread. Spring added
+    # `prescriptions` to `AiClient.PROCESSABLE`, so every prescription now lands in
+    # `unclassified_files` first — and off means we reject it there, leaving it in
+    # Unclassified rather than where the user filed it. Misfiled, not degraded.
+    #
+    # To stop prescriptions being processed, prefer Spring's side: drop `prescriptions` from
+    # `PROCESSABLE` (or `app.ai.enabled=false` for everything). The document then goes
+    # straight into its own table unread, which is the pre-AI behaviour and the graceful one.
+    # This flag remains for a fast local or emergency stop, knowing what it costs.
+    prescriptions_enabled: bool = True
 
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""
