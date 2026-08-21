@@ -15,7 +15,7 @@ asking about those trains people to dismiss the dialog that matters.
 """
 
 import re
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 
 
 class NameVerdict(StrEnum):
@@ -75,15 +75,29 @@ def _within_one_edit(a: str, b: str) -> bool:
     return True
 
 
-def _tokens_agree(a: str, b: str) -> bool:
+class _Agreement(IntEnum):
+    """How two tokens agreed, strongest first — the order `min` sorts by when pairing.
+
+    The kind matters, not just the fact: an initial corroborates almost nothing, a fuzzy
+    match corroborates less than the letters suggest, and only an exact match is evidence
+    on its own. `compare` counts the kinds rather than making extra passes.
+    """
+
+    EXACT = 0
+    FUZZY = 1
+    INITIAL = 2
+    NONE = 3
+
+
+def _tokens_agree(a: str, b: str) -> _Agreement:
     if a == b:
-        return True
+        return _Agreement.EXACT
     # An initial stands for a full token: "R" matches "RAJESH".
     if len(a) == 1 or len(b) == 1:
-        return a[0] == b[0]
-    if len(a) >= _MIN_FUZZY_LENGTH and len(b) >= _MIN_FUZZY_LENGTH:
-        return _within_one_edit(a, b)
-    return False
+        return _Agreement.INITIAL if a[0] == b[0] else _Agreement.NONE
+    if len(a) >= _MIN_FUZZY_LENGTH and len(b) >= _MIN_FUZZY_LENGTH and _within_one_edit(a, b):
+        return _Agreement.FUZZY
+    return _Agreement.NONE
 
 
 def compare(document_name: str | None, account_name: str | None) -> NameVerdict:
@@ -104,17 +118,31 @@ def compare(document_name: str | None, account_name: str | None) -> NameVerdict:
 
     shorter, longer = (doc, account) if len(doc) <= len(account) else (account, doc)
     remaining = list(longer)
+    exact = fuzzy = 0
     for token in shorter:
-        partner = next((o for o in remaining if _tokens_agree(token, o)), None)
-        if partner is None:
+        # Take the STRONGEST partner available, not merely the first: with a fuzzy budget
+        # to spend, pairing SHARMA with a SHARDA sitting earlier in the list would burn it
+        # for nothing.
+        best = min(((_tokens_agree(token, o), o) for o in remaining), default=None)
+        if best is None or best[0] is _Agreement.NONE:
             return NameVerdict.MISMATCH
+        kind, partner = best
+        exact += kind is _Agreement.EXACT
+        fuzzy += kind is _Agreement.FUZZY
         remaining.remove(partner)
 
-    # One shared initial is not evidence of identity: "R MENON" against "Rajesh Sharma"
-    # pairs R->Rajesh and then fails on MENON, but a single-token name of one letter
-    # would otherwise pass on nothing at all.
-    if len(shorter) == 1 and len(shorter[0]) == 1:
+    # Shared initials are not evidence of identity. "R S" pairs against Rajesh Sharma,
+    # Ramesh Singh, Rohit Shukla and Rani Sengupta alike, and initials-only name fields
+    # are common on Indian forms — so a match needs at least one token that agreed on
+    # more than a first letter, and specifically one that agreed EXACTLY. Fuzzy agreement
+    # alone is not corroboration either: "R SHARDA" against "Rajesh Sharma" is a
+    # different family, not a misread. One damaged token is what OCR does; two is drift.
+    if exact == 0 or fuzzy > 1:
         return NameVerdict.MISMATCH
+    # Known and accepted residual: "RAJESH SHARDA" still matches "Rajesh Sharma" — RAJESH
+    # is the exact match, SHARDA the one permitted fuzzy token. It is structurally
+    # identical to the OCR case "RAJESH KUMAF SHARMA", so no cheap rule separates them,
+    # and dropping edit distance altogether would fail every genuine misread instead.
     return NameVerdict.MATCH
 
 

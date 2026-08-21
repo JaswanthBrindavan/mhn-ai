@@ -6,7 +6,7 @@ mismatch costs the user one tap.
 
 import pytest
 
-from app.services.names import NameVerdict, compare, matches_any, normalise
+from app.services.names import NameVerdict, _within_one_edit, compare, matches_any, normalise
 
 MATCHES = [
     ("MR. RAJESH KUMAR SHARMA", "Rajesh Sharma", "honorific + extra middle token"),
@@ -18,6 +18,7 @@ MATCHES = [
     ("SMT. SUNITA DEVI", "Sunita Devi", "Indian honorific"),
     ("rajesh  kumar   sharma", "Rajesh Kumar Sharma", "whitespace and case"),
     ("SUNITA DEVI", "Sunita Devi", "exact"),
+    ("RAJESH SHARDA", "Rajesh Sharma", "accepted residual: one exact + the one fuzzy token"),
 ]
 
 MISMATCHES = [
@@ -25,6 +26,14 @@ MISMATCHES = [
     ("RAJ SHARMA", "Rajesh Sharma", "RAJ/RAJESH is distance 3 — not a nickname matcher"),
     ("SUNITA DEVI", "Sunita Sharma", "one token agrees, one does not"),
     ("ANIL KUMAR", "Sunita Devi", "nothing in common"),
+    ("R S", "Rajesh Sharma", "initials only — no full token corroborates"),
+    ("R S", "Ramesh Singh", "the same initials fit an unrelated person"),
+    ("R S", "Rohit Shukla", "and another"),
+    ("R S", "Rani Sengupta", "and another"),
+    ("R", "Rajesh", "a lone initial matches almost anyone"),
+    ("R SHARDA", "Rajesh Sharma", "an initial plus a fuzzy token is no exact agreement"),
+    ("SHARDA", "Sharma", "fuzzy alone is not corroboration"),
+    ("RAJESH KUMAF SHARNA", "Rajesh Kumar Sharma", "two fuzzy tokens is drift, not a misread"),
 ]
 
 UNKNOWNS = [
@@ -67,6 +76,32 @@ def test_single_token_names_compare_whole() -> None:
 def test_initial_only_overlap_is_not_a_match() -> None:
     """One shared initial is not evidence. R. MENON is not Rajesh Sharma."""
     assert compare("R MENON", "Rajesh Sharma") is NameVerdict.MISMATCH
+
+
+def test_a_match_needs_one_full_token_that_agrees_exactly() -> None:
+    """Initials and near-misses corroborate; only an exact token is evidence."""
+    assert compare("R K SHARMA", "Rajesh Kumar Sharma") is NameVerdict.MATCH
+    assert compare("RAJESH KUMAF SHARMA", "Rajesh Kumar Sharma") is NameVerdict.MATCH
+    assert compare("R K SHARDA", "Rajesh Kumar Sharma") is NameVerdict.MISMATCH
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "expected", "why"),
+    [
+        ("KUMAR", "KUMARS", True, "insertion at the end"),
+        ("UMAR", "KUMAR", True, "insertion at the front"),
+        ("KUAR", "KUMAR", True, "insertion in the middle"),
+        ("KUMARS", "KUMAR", True, "deletion (the same pair, other way round)"),
+        ("KUMAR", "KUMARSX", False, "two insertions"),
+        ("KUAR", "KUMARS", False, "an insertion and a deletion"),
+        ("KUMAR", "KAMAT", False, "equal length, two substitutions"),
+        ("KUMAR", "KUMAT", True, "equal length, one substitution"),
+        ("KUMAR", "KUMAR", True, "identical"),
+    ],
+)
+def test_within_one_edit(a: str, b: str, expected: bool, why: str) -> None:
+    """The unequal-length walk is the insertion/deletion path the table above never hits."""
+    assert _within_one_edit(a, b) is expected, why
 
 
 def test_normalise_strips_and_tokenises() -> None:
