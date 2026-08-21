@@ -45,6 +45,18 @@ unclassified_files = Table(
     Column("name", String(255), nullable=True),
 )
 
+#: The account holder. READ-ONLY, and only the name: this service resolves whose document
+#: it is holding so it can check the name printed on it against the account's. It makes no
+#: access decision from this table — family access is Spring's, and stays Spring's (see
+#: app/api/deps.py). Bound under its real name, ``user``, which is a reserved word in
+#: Postgres; SQLAlchemy quotes it. The Python name is plural so it cannot shadow anything.
+users = Table(
+    "user",
+    spring_metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("name", String(255), nullable=False),
+)
+
 #: The reports section. We INSERT a row here when moving a classified report, and write
 #: its ``content``. Read otherwise.
 reports = Table(
