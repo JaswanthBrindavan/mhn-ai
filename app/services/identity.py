@@ -16,6 +16,7 @@ another.
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -45,11 +46,16 @@ def owner_name(session: Session, document_id: int) -> str | None:
     return str(name) if name is not None else None
 
 
-def settled_verdict(session: Session, document_id: int) -> NameVerdict | None:
-    """The verdict already reached for this document, across every run item.
+class SettledName(NamedTuple):
+    """What was actually stored about a document's name, verdict and confirmation alike."""
 
-    Keyed on document_id, not run item: a retry mints a new item, and a decision the user
-    made must outlive it. A confirmed identity outranks whatever was computed.
+    name_match: str | None
+    patient_name: str | None
+    identity_confirmed_at: datetime | None
+
+
+def settled_row(session: Session, document_id: int) -> SettledName | None:
+    """The classification row a settled verdict comes from, unmassaged.
 
     **A confirmation is checked across ALL rows, not just the newest one.** A retry inserts
     a fresh classification with a null verdict, so reading only the latest row would report
@@ -58,18 +64,41 @@ def settled_verdict(session: Session, document_id: int) -> NameVerdict | None:
     reflex-dismissal failure this whole feature exists to avoid. The computed verdict below
     it stays latest-wins: that one is a reading of the document and the newest reading is
     the current one.
+
+    Separate from ``settled_verdict`` because that function answers a routing question and
+    coerces a confirmed mismatch to MATCH to answer it. The stored truth — "mismatch, and
+    the user said it is theirs" — is what the payload has to carry, and it is not
+    recoverable from the coerced answer.
     """
     rows = session.execute(
-        select(AiReportClassification.name_match, AiReportClassification.identity_confirmed_at)
+        select(
+            AiReportClassification.name_match,
+            AiReportClassification.patient_name,
+            AiReportClassification.identity_confirmed_at,
+        )
         .where(AiReportClassification.document_id == document_id)
         .order_by(AiReportClassification.created_at.desc())
     ).all()
     if not rows:
         return None
-    if any(confirmed_at is not None for _, confirmed_at in rows):
+    confirmed = next((r for r in rows if r.identity_confirmed_at is not None), rows[0])
+    return SettledName(*confirmed)
+
+
+def _verdict_of(row: SettledName) -> NameVerdict | None:
+    if row.identity_confirmed_at is not None:
         return NameVerdict.MATCH
-    name_match = rows[0][0]
-    return NameVerdict(name_match) if name_match is not None else None
+    return NameVerdict(row.name_match) if row.name_match is not None else None
+
+
+def settled_verdict(session: Session, document_id: int) -> NameVerdict | None:
+    """The verdict already reached for this document, across every run item.
+
+    Keyed on document_id, not run item: a retry mints a new item, and a decision the user
+    made must outlive it. A confirmed identity outranks whatever was computed.
+    """
+    row = settled_row(session, document_id)
+    return _verdict_of(row) if row is not None else None
 
 
 def record_verdict(session: Session, item_id: uuid.UUID, verdict: NameVerdict) -> None:
@@ -78,6 +107,32 @@ def record_verdict(session: Session, item_id: uuid.UUID, verdict: NameVerdict) -
         update(AiReportClassification)
         .where(AiReportClassification.run_item_id == item_id)
         .values(name_match=verdict.value)
+    )
+    session.commit()
+
+
+def _carry_settled(session: Session, item_id: uuid.UUID, settled: SettledName) -> None:
+    """Copy an already-settled name state onto THIS item's classification row.
+
+    Confirming an identity re-submits the document as a NEW run item with a new, blank
+    classification. The gate then short-circuits on the settled verdict without ever
+    reaching ``record_verdict`` — so the row the payload is built from keeps a null
+    verdict, and both ``content.ai.name_check`` and ``/status.name_check`` come back null
+    for every document the user has claimed as their own. The standing warning the app
+    shows on such a document ("the name doesn't match your profile") then never renders.
+
+    What is written is the STORED state, not the gate's routing answer: ``mismatch`` with
+    its confirmation stamp. Writing ``match`` here would satisfy the same null check and
+    leave the warning just as unrenderable.
+    """
+    session.execute(
+        update(AiReportClassification)
+        .where(AiReportClassification.run_item_id == item_id)
+        .values(
+            name_match=settled.name_match,
+            patient_name=settled.patient_name,
+            identity_confirmed_at=settled.identity_confirmed_at,
+        )
     )
     session.commit()
 
@@ -119,7 +174,8 @@ def gate(ctx: StageContext, section: DocumentSection) -> None:
     * the section is one this service never files, so the document is being rejected for
       that reason anyway and asking the user about identity would be noise;
     * a verdict was already settled (matched before, or the user confirmed it). A retry
-      must not re-interrogate someone;
+      must not re-interrogate someone — but it does carry that settled state onto its own
+      classification row, or the document's payload would describe no verdict at all;
     * the intake row is gone. That is a retry of an already-filed document, and filing
       owns the missing-source case — raising here would relabel it as an identity problem.
     """
@@ -128,8 +184,9 @@ def gate(ctx: StageContext, section: DocumentSection) -> None:
     if section not in filing.SECTION_TABLES:
         return
 
-    settled = settled_verdict(ctx.session, ctx.document_id)
-    if settled in (NameVerdict.MATCH, NameVerdict.UNKNOWN):
+    settled = settled_row(ctx.session, ctx.document_id)
+    if settled is not None and _verdict_of(settled) in (NameVerdict.MATCH, NameVerdict.UNKNOWN):
+        _carry_settled(ctx.session, ctx.item_id, settled)
         return
 
     account = owner_name(ctx.session, ctx.document_id)

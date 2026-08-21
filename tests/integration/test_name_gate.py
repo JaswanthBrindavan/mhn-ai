@@ -5,6 +5,7 @@ and one key — there is no Spring section row to unpick, and filing is never un
 """
 
 import uuid
+from dataclasses import replace
 
 import pytest
 from sqlalchemy import text
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.integrations.sqs import publish_processing_item, receive_messages
 from app.models.enums import RunItemStatus
+from app.services.assembly import ContentState, build_content
 from app.services.classification import DocumentSection
 from app.services.identity import confirm_identity, gate, settled_verdict
 from app.services.names import NameVerdict
@@ -117,6 +119,36 @@ def test_a_confirmed_document_is_not_asked_again(gate_ctx, db_session) -> None:
     gate(ctx, DocumentSection.REPORTS)  # passes second time
 
 
+def _retry_item(db_session, document_id) -> uuid.UUID:
+    """A second run item for the same document, carrying the fresh, verdict-less
+    classification a retry inserts."""
+    retry_run = db_session.execute(
+        text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
+    ).scalar_one()
+    retry_item = db_session.execute(
+        text(
+            # Terminal, not active: a partial unique index allows one live item per
+            # document, and the first one is still `classifying`.
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status) "
+            "VALUES (:r, :d, 'completed') RETURNING id"
+        ),
+        {"r": retry_run, "d": document_id},
+    ).scalar_one()
+    db_session.execute(
+        # `now()` is the transaction's timestamp, so the newer row needs an explicit one.
+        text(
+            "INSERT INTO ai_report_classifications "
+            "(run_item_id, document_id, section, title, confidence, patient_name, "
+            " prompt_version, schema_version, created_at) "
+            "VALUES (:i, :d, 'reports', 'A Report', 0.9, 'PRIYA MENON', 'clf-1', 'clf-1', "
+            " now() + interval '1 hour')"
+        ),
+        {"i": retry_item, "d": document_id},
+    )
+    db_session.commit()
+    return uuid.UUID(str(retry_item))
+
+
 def test_a_confirmation_survives_a_retrys_fresh_classification(gate_ctx, db_session) -> None:
     """A retry inserts a NEW classification with a null verdict.
 
@@ -128,31 +160,43 @@ def test_a_confirmation_survives_a_retrys_fresh_classification(gate_ctx, db_sess
         gate(ctx, DocumentSection.REPORTS)
     confirm_identity(db_session, ctx.document_id)
 
-    retry_run = db_session.execute(
-        text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
-    ).scalar_one()
-    retry_item = db_session.execute(
-        text(
-            "INSERT INTO ai_processing_run_items (run_id, document_id, status) "
-            "VALUES (:r, :d, 'completed') RETURNING id"
-        ),
-        {"r": retry_run, "d": ctx.document_id},
-    ).scalar_one()
-    db_session.execute(
-        # `now()` is the transaction's timestamp, so the newer row needs an explicit one.
-        text(
-            "INSERT INTO ai_report_classifications "
-            "(run_item_id, document_id, section, title, confidence, patient_name, "
-            " prompt_version, schema_version, created_at) "
-            "VALUES (:i, :d, 'reports', 'A Report', 0.9, 'PRIYA MENON', 'clf-1', 'clf-1', "
-            " now() + interval '1 hour')"
-        ),
-        {"i": retry_item, "d": ctx.document_id},
-    )
-    db_session.commit()
+    _retry_item(db_session, ctx.document_id)
 
     assert settled_verdict(db_session, ctx.document_id) is NameVerdict.MATCH
     gate(ctx, DocumentSection.REPORTS)  # still not asked again
+
+
+def test_a_confirmed_retry_carries_the_verdict_onto_its_own_row(gate_ctx, db_session) -> None:
+    """The short-circuit never reaches `record_verdict`, so the retry's OWN classification
+    row would keep a null verdict — and `content.ai.name_check` is built from that row.
+
+    What lands there is the stored truth, `mismatch` plus its confirmation stamp, not the
+    MATCH `settled_verdict` hands the gate so the document may pass. Writing `match` here
+    satisfies the same null check and leaves the standing warning just as unrenderable.
+    """
+    ctx = gate_ctx(document_name="PRIYA MENON", account_name="Rajesh Sharma")
+    with pytest.raises(RejectStageError):
+        gate(ctx, DocumentSection.REPORTS)
+    confirm_identity(db_session, ctx.document_id)
+    retry = replace(ctx, item_id=_retry_item(db_session, ctx.document_id))
+
+    gate(retry, DocumentSection.REPORTS)  # passes, and asks nothing
+
+    assert build_content(db_session, retry.item_id, state=ContentState.COMPLETE)["ai"][
+        "name_check"
+    ] == {"verdict": "mismatch", "document_name": "PRIYA MENON", "confirmed": True}
+
+
+def test_an_unprinted_name_reaches_the_payload_as_unknown(gate_ctx, db_session) -> None:
+    """The quiet counterpart, on the first pass: this one goes through `record_verdict`
+    normally, and the card's "no name was printed" note reads the same key."""
+    ctx = gate_ctx(document_name=None, account_name="Rajesh Sharma")
+
+    gate(ctx, DocumentSection.REPORTS)
+
+    assert build_content(db_session, ctx.item_id, state=ContentState.CLASSIFIED)["ai"][
+        "name_check"
+    ] == {"verdict": "unknown", "document_name": None, "confirmed": False}
 
 
 def test_unfiled_section_skips_the_gate(gate_ctx) -> None:
