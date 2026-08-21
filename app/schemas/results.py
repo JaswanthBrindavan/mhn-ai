@@ -9,7 +9,7 @@ import uuid
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentType(StrEnum):
@@ -54,6 +54,25 @@ class NameCheck(BaseModel):
     document_name: str | None = None
     #: True once the user claimed a mismatched document as theirs.
     confirmed: bool = False
+
+
+class NameCandidate(BaseModel):
+    """One person the document's name might belong to, as Spring supplies them."""
+
+    #: Opaque to this service — echoed back in `matches`, never looked up.
+    user_id: str
+    name: str
+
+
+class NameCandidatesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[NameCandidate] = Field(max_length=100)
+
+
+class NameCandidatesResponse(BaseModel):
+    #: Ids from the request whose name matches the document's. Order follows the request.
+    matches: list[str]
 
 
 class DocumentAiResult(BaseModel):

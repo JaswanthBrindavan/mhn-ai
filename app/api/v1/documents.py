@@ -29,6 +29,8 @@ from app.schemas.results import (
     DocumentAiResult,
     DocumentStatusResponse,
     DocumentType,
+    NameCandidatesRequest,
+    NameCandidatesResponse,
     RetryResponse,
 )
 from app.services import results as results_service
@@ -89,6 +91,54 @@ def refile_document(
     return results_service.refile_document(
         session, document_id, x_request_id, s3=s3, sqs=sqs, settings=settings
     )
+
+
+@router.post(
+    "/documents/{document_id}/confirm-identity",
+    response_model=RetryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Accept a name-mismatched document as the account holder's own, and process it",
+    responses={
+        **_NOT_FOUND,
+        409: {"description": "Not waiting on an identity decision, or not classified yet"},
+    },
+)
+def confirm_identity(
+    document_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    s3: Annotated["S3Client", Depends(s3_client)],
+    sqs: Annotated["SQSClient", Depends(sqs_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_request_id: Annotated[str | None, Header(alias="X-Request-Id")] = None,
+) -> RetryResponse:
+    """The "yes, this document is mine" answer to a name mismatch.
+
+    Untyped for the same reason ``/refile`` is: the caller is acting *on* a question about
+    the document, so it cannot be made to name a type first, and nothing extracted is
+    returned — an item id and a status.
+    """
+    return results_service.confirm_identity(
+        session, document_id, x_request_id, s3=s3, sqs=sqs, settings=settings
+    )
+
+
+@router.post(
+    "/documents/{document_id}/name-candidates",
+    response_model=NameCandidatesResponse,
+    summary="Which of the supplied people the name on this document matches",
+    responses=_NOT_FOUND,
+)
+def name_candidates(
+    document_id: int,
+    payload: NameCandidatesRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> NameCandidatesResponse:
+    """The "which of my family is this?" answer, by comparing strings and nothing more.
+
+    The candidate list comes from Spring, already filtered to people the caller may write
+    to; this service reads no family table and makes no access decision. Reads only.
+    """
+    return results_service.name_candidates(session, document_id, payload)
 
 
 @router.get(
