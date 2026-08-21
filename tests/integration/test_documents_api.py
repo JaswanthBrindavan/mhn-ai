@@ -246,14 +246,16 @@ def test_retry_of_a_document_that_never_existed_is_still_404(api):
 # result: a caller reading an insurance policy can never be handed a lab report's values.
 
 
-def _seed_classified(db_session, item_id, document_id, section) -> None:
+def _seed_classified(
+    db_session, item_id, document_id, section, patient_name=None, name_match=None
+) -> None:
     db_session.execute(
         text(
             "INSERT INTO ai_report_classifications (run_item_id, document_id, section, title, "
-            "confidence, prompt_version, schema_version) "
-            "VALUES (:i, :d, :s, 'Doc', 0.9, 'clf-2', 'clf-2')"
+            "confidence, prompt_version, schema_version, patient_name, name_match) "
+            "VALUES (:i, :d, :s, 'Doc', 0.9, 'clf-2', 'clf-2', :pn, :nm)"
         ),
-        {"i": item_id, "d": document_id, "s": section},
+        {"i": item_id, "d": document_id, "s": section, "pn": patient_name, "nm": name_match},
     )
     db_session.flush()
 
@@ -494,6 +496,39 @@ def test_status_carries_nothing_extracted(api, db_session, make_document):
 
     for leaked in ("extraction", "insights", "section_extraction", "classification"):
         assert leaked not in body
+
+
+def test_status_carries_the_name_check_for_a_mismatch(api, db_session, make_document):
+    """A mismatched document is never filed, so there is no content row to read.
+
+    The dialog gets the printed name here instead — the one thing read from the document
+    that this route discloses.
+    """
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "completed", section_row_id=9)
+    _seed_classified(
+        db_session,
+        item_id,
+        document_id,
+        "reports",
+        patient_name="PRIYA MENON",
+        name_match="mismatch",
+    )
+
+    response = api.get(f"/v1/documents/{document_id}/status")
+
+    assert response.status_code == 200
+    check = response.json()["name_check"]
+    assert check == {"verdict": "mismatch", "document_name": "PRIYA MENON", "confirmed": False}
+
+
+def test_status_name_check_is_null_when_no_verdict_exists(api, db_session, make_document):
+    """Null, not a verdict of `unknown`: `unknown` means we looked and found no name."""
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, "completed")
+    _seed_classified(db_session, item_id, document_id, "reports")
+
+    assert api.get(f"/v1/documents/{document_id}/status").json()["name_check"] is None
 
 
 def test_status_404s_for_a_document_with_no_item(api, make_document):

@@ -137,6 +137,24 @@ class Settings(BaseSettings):
     # This flag remains for a fast local or emergency stop, knowing what it costs.
     prescriptions_enabled: bool = True
 
+    # --- Name matching ------------------------------------------------------
+    # When on, a document whose printed patient name disagrees with the account holder's
+    # is rejected with `name_mismatch` before filing, and the app offers the user three
+    # ways out (keep / move to a family member / delete).
+    #
+    # ON by default. All three repos ship from one branch and deploy together, so the
+    # partial-deploy hazard PRESCRIPTIONS_ENABLED was invented for does not arise here:
+    # there is no window in which this service produces `name_mismatch` and the app has
+    # no dialog to render it. CLAUDE.md records what the alternative costs — a flag
+    # defaulting false while every deployment runs true means any environment brought up
+    # without the variable silently stops checking, and that failure is invisible because
+    # a passed gate logs nothing.
+    #
+    # Kept rather than deleted, as an emergency stop, exactly as prescriptions_enabled is.
+    # Off means no name is ever checked and every document files as it did before this
+    # existed — a safe degradation, unlike that flag's, because nothing is misfiled.
+    name_matching_enabled: bool = True
+
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""
     log_level: str = "INFO"

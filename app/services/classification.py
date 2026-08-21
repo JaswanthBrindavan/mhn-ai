@@ -52,8 +52,8 @@ logger = logging.getLogger(__name__)
 #: prescriptions were filed as lab reports, ran the report pipeline, found no results, and
 #: showed the patient an empty analysis while four prescribed medicines went unread.
 #: The rule is now precedence-based: medicines listed anywhere make it a prescription.
-PROMPT_VERSION = "clf-2026-08-07"
-SCHEMA_VERSION = "clf-2"
+PROMPT_VERSION = "clf-2026-08-21"
+SCHEMA_VERSION = "clf-3"
 STAGE_NAME = "classifying"
 #: Classification output is small (a section, a title, a short reason). Kept tight to
 #: bound cost; the JSON structured-output format keeps responses compact.
@@ -118,6 +118,20 @@ class DocumentClassification(BaseModel):
     handwriting: str = Field(default="none", max_length=32)
     confidence: float
     reasoning: str = Field(default="", max_length=2000)
+    #: The patient's name exactly as printed, or None when the document prints none.
+    #: Read here rather than in extraction because this stage runs for EVERY document
+    #: and runs before filing — the gate has to answer "is this yours?" before the
+    #: document enters a wallet, not after.
+    patient_name: str | None = Field(default=None, max_length=255)
+
+    @field_validator("patient_name", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value: object) -> object:
+        # A model asked for a name it cannot find sometimes returns "" or "   ".
+        # Absent and blank mean the same thing and must not be two states downstream.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("handwriting", mode="before")
     @classmethod
@@ -156,8 +170,9 @@ CLASSIFICATION_JSON_SCHEMA: dict[str, Any] = {
         "handwriting": {"type": ["string", "null"]},
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
+        "patient_name": {"type": ["string", "null"]},
     },
-    "required": ["section", "title", "handwriting", "confidence", "reasoning"],
+    "required": ["section", "title", "handwriting", "confidence", "reasoning", "patient_name"],
     "additionalProperties": False,
 }
 
@@ -199,7 +214,12 @@ SYSTEM_PROMPT = (
     "handwritten signature or stamp is 'none'.\n"
     "- confidence: your calibrated confidence between 0 and 1.\n"
     "- reasoning: one concise sentence citing what drove the decision. Do not restate "
-    "patient data or clinical values.\n\n"
+    "patient data or clinical values.\n"
+    "- patient_name: the name of the PERSON THE DOCUMENT IS ABOUT, exactly as printed. "
+    "Copy it verbatim including any title. If the document names a doctor, a hospital, a "
+    "policyholder and a patient, return the PATIENT. Return null if no patient name is "
+    "printed — many scans, bills and vaccination cards carry none. Never infer a name "
+    "from context, a file name, or an email address, and never guess.\n\n"
     "Be conservative: if the document is unreadable or genuinely ambiguous, choose "
     "'unknown' rather than guessing a section."
 )
@@ -286,6 +306,7 @@ def _persist_classification(ctx: StageContext, result: DocumentClassification) -
             title=result.title,
             confidence=result.confidence,
             reasoning=result.reasoning or None,
+            patient_name=result.patient_name,
             prompt_version=PROMPT_VERSION,
             schema_version=SCHEMA_VERSION,
         )
@@ -297,6 +318,7 @@ def _persist_classification(ctx: StageContext, result: DocumentClassification) -
                 "title": result.title,
                 "confidence": result.confidence,
                 "reasoning": result.reasoning or None,
+                "patient_name": result.patient_name,
                 "prompt_version": PROMPT_VERSION,
                 "schema_version": SCHEMA_VERSION,
             },

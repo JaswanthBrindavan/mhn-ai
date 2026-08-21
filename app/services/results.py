@@ -26,10 +26,13 @@ from app.schemas.results import (
     DocumentAiResult,
     DocumentStatusResponse,
     DocumentType,
+    NameCandidatesRequest,
+    NameCandidatesResponse,
+    NameCheck,
     RetryResponse,
 )
 from app.schemas.runs import CreateRunRequest, SubmittedDocument
-from app.services import filing
+from app.services import filing, identity, names
 from app.services import runs as runs_service
 from app.services.classification import (
     DOCUMENT_TYPE_BY_SECTION,
@@ -110,7 +113,8 @@ def get_document_status(session: Session, document_id: int) -> DocumentStatusRes
     Untyped on purpose, and the one route that is: a caller cannot know the type before
     classification decides it, so requiring it here would make the endpoint unusable for
     the state it exists to report. Safe to leave untyped because nothing extracted is
-    returned — see ``DocumentStatusResponse``.
+    returned bar the name verdict, which a mismatched document has nowhere else to be read
+    from — see ``DocumentStatusResponse``.
     """
     item = _latest_item(session, document_id)
     if item is None:
@@ -128,6 +132,18 @@ def get_document_status(session: Session, document_id: int) -> DocumentStatusRes
         last_error_code=item.last_error_code,
         section_row_id=item.section_row_id,
         filed_section=item.filed_section,
+        # Null while no verdict exists — distinct from a verdict of `unknown`. A mismatched
+        # document is never filed, so its `content` row does not exist and this is the only
+        # place the app can read the printed name from.
+        name_check=(
+            NameCheck(
+                verdict=clf.name_match,
+                document_name=clf.patient_name,
+                confirmed=clf.identity_confirmed_at is not None,
+            )
+            if clf is not None and clf.name_match is not None
+            else None
+        ),
     )
 
 
@@ -338,4 +354,97 @@ def refile_document(
         item_id=submitted.item_id,
         run_id=result.run_id,
         status=submitted.status,
+    )
+
+
+def confirm_identity(
+    session: Session,
+    document_id: int,
+    request_id: str | None,
+    *,
+    s3: "S3Client",
+    sqs: "SQSClient",
+    settings: "Settings",
+) -> RetryResponse:
+    """Accept a document the user says is theirs despite the name printed on it.
+
+    Mirrors ``refile_document``: record the decision, then re-submit through the ordinary
+    path. ``identity.settled_verdict`` sees the confirmation on the next pass and the gate
+    lets the document through, so nothing here needs to know how the gate works.
+
+    Offered only on a document actually waiting on that question — the gate leaves
+    ``name_mismatch`` as the item's error code, and that flag is the permission, exactly as
+    ``section_mismatch`` is for refiling.
+    """
+    item = _latest_item(session, document_id)
+    if item is None:
+        raise ApiError(404, "no_ai_result", "No AI result exists for this document")
+
+    if item.last_error_code != "name_mismatch":
+        raise ApiError(
+            409,
+            "not_awaiting_identity",
+            "This document is not waiting on an identity decision",
+            {"status": item.status, "last_error_code": item.last_error_code},
+        )
+
+    if not identity.confirm_identity(session, document_id):
+        raise ApiError(409, "not_classified_yet", "This document has not been classified yet")
+
+    result = runs_service.create_run(
+        session,
+        CreateRunRequest(
+            documents=[
+                SubmittedDocument(
+                    document_id=document_id,
+                    # Carried over for the same reason retry does: the user answered a
+                    # question about WHOSE the document is, not about where it belongs.
+                    # Dropping it would silently re-process a sectioned upload as a global
+                    # one.
+                    intended_section=(
+                        DocumentSection(item.intended_section) if item.intended_section else None
+                    ),
+                )
+            ]
+        ),
+        request_id,
+        s3=s3,
+        sqs=sqs,
+        settings=settings,
+    )
+    submitted = result.items[0]
+    return RetryResponse(
+        document_id=document_id,
+        item_id=submitted.item_id,
+        run_id=result.run_id,
+        status=submitted.status,
+    )
+
+
+def name_candidates(
+    session: Session, document_id: int, payload: NameCandidatesRequest
+) -> NameCandidatesResponse:
+    """Which of these people the name on the document matches.
+
+    **A pure string comparison over a list the caller supplies.** This service does not
+    read ``family_connect`` or any other family table, and makes no access decision. Spring
+    has already filtered the list to people the caller may write to, and re-checks that on
+    the move itself — which is why this endpoint takes a list of candidates rather than a
+    user id. Do not "helpfully" add a family query here: a second implementation of the
+    access rules would drift from Spring's, and a drift bug leaks one family member's
+    records to another.
+
+    Reads only. An unreadable or absent document name matches nobody, rather than fanning
+    an unknown name out across a family.
+    """
+    item = _latest_item(session, document_id)
+    if item is None:
+        raise ApiError(404, "no_ai_result", "No AI result exists for this document")
+
+    clf = _classification(session, item.id)
+    return NameCandidatesResponse(
+        matches=names.matches_any(
+            clf.patient_name if clf is not None else None,
+            {candidate.user_id: candidate.name for candidate in payload.candidates},
+        )
     )

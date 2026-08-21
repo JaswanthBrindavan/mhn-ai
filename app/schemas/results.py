@@ -9,7 +9,7 @@ import uuid
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentType(StrEnum):
@@ -39,6 +39,40 @@ class ClassificationResult(BaseModel):
     title: str
     confidence: float
     reasoning: str | None = None
+
+
+class NameCheck(BaseModel):
+    """What we concluded about the name printed on a document.
+
+    The account holder's own name is deliberately absent: the client already knows who is
+    logged in, and this payload travels further than the dialog does.
+    """
+
+    #: match | mismatch | unknown
+    verdict: str
+    #: The name as printed. Null when the document carried none.
+    document_name: str | None = None
+    #: True once the user claimed a mismatched document as theirs.
+    confirmed: bool = False
+
+
+class NameCandidate(BaseModel):
+    """One person the document's name might belong to, as Spring supplies them."""
+
+    #: Opaque to this service — echoed back in `matches`, never looked up.
+    user_id: str
+    name: str
+
+
+class NameCandidatesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[NameCandidate] = Field(max_length=100)
+
+
+class NameCandidatesResponse(BaseModel):
+    #: Ids from the request whose name matches the document's. Order follows the request.
+    matches: list[str]
 
 
 class DocumentAiResult(BaseModel):
@@ -91,6 +125,15 @@ class DocumentStatusResponse(BaseModel):
     section_row_id: int | None = None
     #: Which section table ``section_row_id`` points at.
     filed_section: str | None = None
+    #: The name verdict, or null when no verdict exists yet ("we have not looked" is not
+    #: the same as a verdict of ``unknown``).
+    #:
+    #: A deliberate widening of the "carries no extracted content" rule above, and the only
+    #: one: a *mismatched* document is never filed, so there is no ``content`` row to read
+    #: the printed name from, and this is the only place the dialog can get it. It stays
+    #: safe to leave the route untyped because a name is not a lab value — but it is no
+    #: longer true that nothing read from the document is returned here.
+    name_check: NameCheck | None = None
 
 
 class RetryResponse(BaseModel):

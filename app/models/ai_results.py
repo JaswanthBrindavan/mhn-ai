@@ -60,6 +60,16 @@ class AiReportClassification(Base):
     #: Short model justification, kept for audit. Not user-facing and not a diagnosis.
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    #: The patient name printed on the document, as transcribed. Null when none was.
+    patient_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: match | mismatch | unknown — computed by app/services/names.py, never the model.
+    name_match: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: Set when the user answered "yes, this is mine" to a mismatch. Its presence is the
+    #: acceptance; it outlives the run item, which a retry replaces.
+    identity_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
 
