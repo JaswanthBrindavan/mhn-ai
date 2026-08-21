@@ -20,7 +20,7 @@ from app.integrations.sqs import ReceivedMessage, delete_message
 from app.models.ai_results import AiReportClassification
 from app.models.enums import RunItemStatus
 from app.models.processing import AiProcessingRunItem
-from app.services import assembly, filing, processing, section_extraction
+from app.services import assembly, filing, identity, processing, section_extraction
 from app.services.classification import DocumentSection
 from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
@@ -314,6 +314,12 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
         return Outcome.CANCELLED
 
     section = _classified_section(session, ctx)
+
+    # Before filing, and before the intended/detected comparison: whether the document is
+    # this person's at all is a more fundamental question than which section it belongs
+    # in. A document that is not theirs should not be filed anywhere, including into the
+    # section they chose.
+    identity.gate(ctx, section)
 
     intended = _intended_section(session, ctx.item_id)
     if intended is not None and intended is not section:

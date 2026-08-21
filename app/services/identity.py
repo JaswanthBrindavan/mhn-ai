@@ -13,6 +13,7 @@ the family rules here would drift, and a drift bug leaks one family member's rec
 another.
 """
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
@@ -21,7 +22,12 @@ from sqlalchemy.orm import Session
 
 from app.models.ai_results import AiReportClassification
 from app.models.spring import unclassified_files, users
-from app.services.names import NameVerdict
+from app.services import filing
+from app.services.classification import DocumentSection
+from app.services.names import NameVerdict, compare
+from app.workers.stagetypes import RejectStageError, StageContext
+
+logger = logging.getLogger(__name__)
 
 
 def owner_name(session: Session, document_id: int) -> str | None:
@@ -44,18 +50,25 @@ def settled_verdict(session: Session, document_id: int) -> NameVerdict | None:
 
     Keyed on document_id, not run item: a retry mints a new item, and a decision the user
     made must outlive it. A confirmed identity outranks whatever was computed.
+
+    **A confirmation is checked across ALL rows, not just the newest one.** A retry inserts
+    a fresh classification with a null verdict, so reading only the latest row would report
+    "nothing settled" for a document the user has already claimed as theirs — and the gate
+    would ask them again. Re-prompting someone about a decision they already made is the
+    reflex-dismissal failure this whole feature exists to avoid. The computed verdict below
+    it stays latest-wins: that one is a reading of the document and the newest reading is
+    the current one.
     """
-    row = session.execute(
+    rows = session.execute(
         select(AiReportClassification.name_match, AiReportClassification.identity_confirmed_at)
         .where(AiReportClassification.document_id == document_id)
         .order_by(AiReportClassification.created_at.desc())
-        .limit(1)
-    ).one_or_none()
-    if row is None:
+    ).all()
+    if not rows:
         return None
-    name_match, confirmed_at = row
-    if confirmed_at is not None:
+    if any(confirmed_at is not None for _, confirmed_at in rows):
         return NameVerdict.MATCH
+    name_match = rows[0][0]
     return NameVerdict(name_match) if name_match is not None else None
 
 
@@ -90,3 +103,53 @@ def confirm_identity(session: Session, document_id: int) -> bool:
     )
     session.commit()
     return True
+
+
+def gate(ctx: StageContext, section: DocumentSection) -> None:
+    """Refuse to file a document into a wallet whose owner's name it does not carry.
+
+    Called after the section is known and BEFORE filing, so a refusal costs nothing to
+    undo: the document keeps its intake row and its object, and the app's delete is one
+    row and one key. Filing is never reversed in this service, which is exactly why this
+    check cannot happen after it.
+
+    Passes silently — and deliberately — in four cases:
+
+    * the feature is off;
+    * the section is one this service never files, so the document is being rejected for
+      that reason anyway and asking the user about identity would be noise;
+    * a verdict was already settled (matched before, or the user confirmed it). A retry
+      must not re-interrogate someone;
+    * the intake row is gone. That is a retry of an already-filed document, and filing
+      owns the missing-source case — raising here would relabel it as an identity problem.
+    """
+    if not ctx.settings.name_matching_enabled:
+        return
+    if section not in filing.SECTION_TABLES:
+        return
+
+    settled = settled_verdict(ctx.session, ctx.document_id)
+    if settled in (NameVerdict.MATCH, NameVerdict.UNKNOWN):
+        return
+
+    account = owner_name(ctx.session, ctx.document_id)
+    if account is None:
+        return
+
+    printed = ctx.session.execute(
+        select(AiReportClassification.patient_name).where(
+            AiReportClassification.run_item_id == ctx.item_id
+        )
+    ).scalar_one_or_none()
+
+    verdict = compare(printed, account)
+    record_verdict(ctx.session, ctx.item_id, verdict)
+    if verdict is NameVerdict.MISMATCH:
+        logger.info(
+            "document_name_mismatch",
+            extra={"item_id": str(ctx.item_id), "document_id": ctx.document_id},
+        )
+        raise RejectStageError(
+            "name_mismatch",
+            "The name on this document does not match the account it was uploaded to",
+        )
