@@ -88,6 +88,9 @@ def build_content(session: Session, item_id: UUID, *, state: ContentState) -> di
             AiReportClassification.section,
             AiReportClassification.title,
             AiReportClassification.confidence,
+            AiReportClassification.patient_name,
+            AiReportClassification.name_match,
+            AiReportClassification.identity_confirmed_at,
         ).where(AiReportClassification.run_item_id == item_id)
     ).one_or_none()
 
@@ -118,12 +121,28 @@ def build_content(session: Session, item_id: UUID, *, state: ContentState) -> di
         else None
     )
 
+    # Null rather than a dict of nulls when no verdict exists: a document classified before
+    # the name check ran, and one never classified at all, both mean "we have not looked" —
+    # which the app must be able to tell apart from a verdict of `unknown`, meaning we
+    # looked and the document printed no name. The account holder's own name is left out on
+    # purpose; the client knows who is logged in and this payload travels further.
+    name_check = (
+        {
+            "verdict": clf.name_match,
+            "document_name": clf.patient_name,
+            "confirmed": clf.identity_confirmed_at is not None,
+        }
+        if clf is not None and clf.name_match is not None
+        else None
+    )
+
     return {
         "ai": {
             "schema_version": CONTENT_SCHEMA_VERSION,
             "state": state.value,
             "document_id": document_id,
             "classification": classification,
+            "name_check": name_check,
             "extraction": extraction,
             "section_extraction": section_extraction,
             "insights": insights,

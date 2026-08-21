@@ -4,6 +4,7 @@ item afterwards. The filing move itself lives in test_filing.py.
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
@@ -31,14 +32,31 @@ def _seed_item(db_session, document_id, status="generating_insights") -> uuid.UU
     return item_id
 
 
-def _seed_classification(db_session, item_id, document_id, section="reports") -> None:
+def _seed_classification(
+    db_session,
+    item_id,
+    document_id,
+    section="reports",
+    patient_name=None,
+    name_match=None,
+    confirmed_at=None,
+) -> None:
     db_session.execute(
         text(
             "INSERT INTO ai_report_classifications (run_item_id, document_id, section, title, "
-            "confidence, prompt_version, schema_version) "
-            "VALUES (:i, :d, :s, 'Complete Blood Count', 0.97, 'clf-2', 'clf-2')"
+            "confidence, prompt_version, schema_version, patient_name, name_match, "
+            "identity_confirmed_at) "
+            "VALUES (:i, :d, :s, 'Complete Blood Count', 0.97, 'clf-2', 'clf-2', "
+            ":pn, :nm, :ca)"
         ),
-        {"i": item_id, "d": document_id, "s": section},
+        {
+            "i": item_id,
+            "d": document_id,
+            "s": section,
+            "pn": patient_name,
+            "nm": name_match,
+            "ca": confirmed_at,
+        },
     )
     db_session.flush()
 
@@ -177,6 +195,66 @@ def test_completed_section_content_has_section_extraction_only(db_session, make_
     # Mutually exclusive: the two carry different shapes and must never both be populated.
     assert content["extraction"] is None
     assert content["insights"] is None
+
+
+def test_content_carries_the_name_check(db_session, make_document):
+    """The card's warning and its quiet no-name note both read from here."""
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(
+        db_session, item_id, document_id, patient_name="PRIYA MENON", name_match="mismatch"
+    )
+
+    check = build_content(db_session, item_id, state=ContentState.COMPLETE)["ai"]["name_check"]
+
+    # Exactly three keys: the account holder's own name is deliberately absent, because the
+    # client already knows who is logged in and this payload travels further than the dialog.
+    assert set(check) == {"verdict", "document_name", "confirmed"}
+    assert check["verdict"] == "mismatch"
+    assert check["document_name"] == "PRIYA MENON"
+    assert check["confirmed"] is False
+
+
+def test_content_name_check_is_confirmed_once_the_user_claimed_the_document(
+    db_session, make_document
+):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(
+        db_session,
+        item_id,
+        document_id,
+        patient_name="PRIYA MENON",
+        name_match="mismatch",
+        confirmed_at=datetime.now(UTC),
+    )
+
+    check = build_content(db_session, item_id, state=ContentState.COMPLETE)["ai"]["name_check"]
+
+    assert check["confirmed"] is True
+
+
+def test_content_name_check_is_none_when_no_verdict_exists(db_session, make_document):
+    """ "We have not looked" is not the same as a verdict of `unknown`, which means we did
+    look and the document printed no name. A dict of nulls would conflate them."""
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, status="classifying")
+    _seed_classification(db_session, item_id, document_id)
+
+    assert (
+        build_content(db_session, item_id, state=ContentState.CLASSIFIED)["ai"]["name_check"]
+        is None
+    )
+
+
+def test_content_name_check_is_none_before_classification(db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, status="classifying")
+
+    content = build_content(db_session, item_id, state=ContentState.CLASSIFIED)["ai"]
+
+    assert content["classification"] is None
+    assert content["name_check"] is None
 
 
 # --- completing the item ----------------------------------------------------

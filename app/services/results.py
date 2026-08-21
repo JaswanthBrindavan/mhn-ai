@@ -26,6 +26,7 @@ from app.schemas.results import (
     DocumentAiResult,
     DocumentStatusResponse,
     DocumentType,
+    NameCheck,
     RetryResponse,
 )
 from app.schemas.runs import CreateRunRequest, SubmittedDocument
@@ -110,7 +111,8 @@ def get_document_status(session: Session, document_id: int) -> DocumentStatusRes
     Untyped on purpose, and the one route that is: a caller cannot know the type before
     classification decides it, so requiring it here would make the endpoint unusable for
     the state it exists to report. Safe to leave untyped because nothing extracted is
-    returned — see ``DocumentStatusResponse``.
+    returned bar the name verdict, which a mismatched document has nowhere else to be read
+    from — see ``DocumentStatusResponse``.
     """
     item = _latest_item(session, document_id)
     if item is None:
@@ -128,6 +130,18 @@ def get_document_status(session: Session, document_id: int) -> DocumentStatusRes
         last_error_code=item.last_error_code,
         section_row_id=item.section_row_id,
         filed_section=item.filed_section,
+        # Null while no verdict exists — distinct from a verdict of `unknown`. A mismatched
+        # document is never filed, so its `content` row does not exist and this is the only
+        # place the app can read the printed name from.
+        name_check=(
+            NameCheck(
+                verdict=clf.name_match,
+                document_name=clf.patient_name,
+                confirmed=clf.identity_confirmed_at is not None,
+            )
+            if clf is not None and clf.name_match is not None
+            else None
+        ),
     )
 
 

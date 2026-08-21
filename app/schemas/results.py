@@ -41,6 +41,21 @@ class ClassificationResult(BaseModel):
     reasoning: str | None = None
 
 
+class NameCheck(BaseModel):
+    """What we concluded about the name printed on a document.
+
+    The account holder's own name is deliberately absent: the client already knows who is
+    logged in, and this payload travels further than the dialog does.
+    """
+
+    #: match | mismatch | unknown
+    verdict: str
+    #: The name as printed. Null when the document carried none.
+    document_name: str | None = None
+    #: True once the user claimed a mismatched document as theirs.
+    confirmed: bool = False
+
+
 class DocumentAiResult(BaseModel):
     document_id: int
     item_id: uuid.UUID
@@ -91,6 +106,15 @@ class DocumentStatusResponse(BaseModel):
     section_row_id: int | None = None
     #: Which section table ``section_row_id`` points at.
     filed_section: str | None = None
+    #: The name verdict, or null when no verdict exists yet ("we have not looked" is not
+    #: the same as a verdict of ``unknown``).
+    #:
+    #: A deliberate widening of the "carries no extracted content" rule above, and the only
+    #: one: a *mismatched* document is never filed, so there is no ``content`` row to read
+    #: the printed name from, and this is the only place the dialog can get it. It stays
+    #: safe to leave the route untyped because a name is not a lab value — but it is no
+    #: longer true that nothing read from the document is returned here.
+    name_check: NameCheck | None = None
 
 
 class RetryResponse(BaseModel):
