@@ -6,6 +6,7 @@ Any other order can leave a live row pointing at a deleted object.
 
 import json
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import NamedTuple
 
@@ -178,6 +179,105 @@ def test_filing_creates_the_section_row_and_moves_the_object(
     assert item["filed_section"] == "vaccinations"
     # Later stages must find the document at its NEW key.
     assert item["source_key"] == row.filepath
+
+
+def _set_intake_name(db_session, document_id: int, name: str) -> None:
+    db_session.execute(
+        text("UPDATE unclassified_files SET name = :n WHERE id = :d"),
+        {"n": name, "d": document_id},
+    )
+    db_session.commit()
+
+
+def _set_document_date(db_session, item_id, value: str) -> None:
+    db_session.execute(
+        text(
+            "UPDATE ai_report_classifications SET document_date = CAST(:v AS date), "
+            "document_date_label = 'Sample Collected' WHERE run_item_id = :i"
+        ),
+        {"v": value, "i": item_id},
+    )
+    db_session.commit()
+
+
+def _filed_row(db_session, table, row_id):
+    return db_session.execute(select(table.c.name, table.c.date).where(table.c.id == row_id)).one()
+
+
+def test_filing_carries_the_users_filename_and_the_documents_date(
+    db_session, s3_client, bucket, classified_item
+):
+    # Both were lost before these columns existed: the filename was dropped by every
+    # mover, and the date was never read at all, so the app fell back to created_at --
+    # the moment the AI filed the row, which for a 2019 report is today.
+    seed = classified_item(DocumentSection.REPORTS)
+    _set_intake_name(db_session, seed.document_id, "March bloods.pdf")
+    _set_document_date(db_session, seed.item_id, "2026-03-12")
+
+    row_id = _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    row = _filed_row(db_session, reports, row_id)
+    assert row.name == "March bloods.pdf"
+    assert row.date == datetime(2026, 3, 12, tzinfo=UTC)
+
+
+def test_the_date_is_midnight_utc_not_midnight_wherever_the_worker_runs(
+    db_session, s3_client, bucket, classified_item
+):
+    # The column is timestamptz and the value we have is a date. A NAIVE midnight is sent
+    # without a zone and Postgres reads it in the session's, so a worker running anywhere
+    # but UTC would store a different instant and the app would show the wrong day. The
+    # session timezone is moved here deliberately: with it left at UTC this test passes
+    # whether or not the code attaches a zone, and proves nothing.
+    seed = classified_item(DocumentSection.REPORTS)
+    _set_document_date(db_session, seed.item_id, "2026-03-12")
+    db_session.execute(text("SET LOCAL TIME ZONE 'America/New_York'"))
+
+    row_id = _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    assert _filed_row(db_session, reports, row_id).date == datetime(2026, 3, 12, tzinfo=UTC)
+
+
+def test_filing_falls_back_to_the_ai_title_when_the_upload_was_unnamed(
+    db_session, s3_client, bucket, classified_item
+):
+    # A global upload often carries no filename. Without the fallback the list reads
+    # "Lab Report on 4 Aug 2026" for every one of them.
+    seed = classified_item(DocumentSection.REPORTS)
+
+    row_id = _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    assert _filed_row(db_session, reports, row_id).name == "Seed Document"
+
+
+def test_the_users_filename_beats_the_ai_title(db_session, s3_client, bucket, classified_item):
+    seed = classified_item(DocumentSection.REPORTS)
+    _set_intake_name(db_session, seed.document_id, "March bloods.pdf")
+
+    row_id = _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    assert _filed_row(db_session, reports, row_id).name == "March bloods.pdf"
+
+
+def test_a_whitespace_filename_falls_back_rather_than_filing_a_blank_name(
+    db_session, s3_client, bucket, classified_item
+):
+    seed = classified_item(DocumentSection.REPORTS)
+    _set_intake_name(db_session, seed.document_id, "   ")
+
+    row_id = _file(db_session, s3_client, bucket, seed, DocumentSection.REPORTS)
+
+    assert _filed_row(db_session, reports, row_id).name == "Seed Document"
+
+
+def test_a_document_with_no_readable_date_files_with_a_null_one(
+    db_session, s3_client, bucket, classified_item
+):
+    seed = classified_item(DocumentSection.VACCINATIONS)
+
+    row_id = _file(db_session, s3_client, bucket, seed, DocumentSection.VACCINATIONS)
+
+    assert _filed_row(db_session, vaccinations, row_id).date is None
 
 
 def test_filing_moves_the_preview_when_there_is_one(

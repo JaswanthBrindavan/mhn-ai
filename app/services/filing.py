@@ -19,7 +19,7 @@ so that AI-filed and hand-filed documents are indistinguishable.
 """
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -34,7 +34,7 @@ from app.integrations.s3 import (
     delete_object,
     object_exists,
 )
-from app.models.ai_results import AiSectionExtraction
+from app.models.ai_results import AiReportClassification, AiSectionExtraction
 from app.models.processing import AiProcessingRunItem
 from app.models.spring import (
     bills,
@@ -117,6 +117,9 @@ def file_document(
             unclassified_files.c.filepath,
             unclassified_files.c.private,
             unclassified_files.c.created_by,
+            # The filename the user typed. Read here for the first time: filing used to
+            # drop it, because no section table had a column to put it in.
+            unclassified_files.c.name,
         ).where(unclassified_files.c.id == document_id)
     ).one_or_none()
     if src is None:
@@ -148,6 +151,7 @@ def file_document(
         raise TransientStageError(f"source storage unavailable: {exc}") from exc
 
     table = SECTION_TABLES[section]
+    row_name, row_date = _name_and_date(session, item_id, src.name)
     row_id = session.execute(
         insert(table)
         .values(
@@ -156,6 +160,8 @@ def file_document(
             private=src.private,
             created_by=src.created_by,
             content=content,
+            name=row_name,
+            date=row_date,
         )
         .returning(table.c.id)
     ).scalar_one()
@@ -198,6 +204,34 @@ def file_document(
         extra={"item_id": str(item_id), "section": section.value, "section_row_id": row_id},
     )
     return int(row_id)
+
+
+def _name_and_date(
+    session: Session, item_id: UUID, intake_name: str | None
+) -> tuple[str | None, datetime | None]:
+    """What to call this document, and when it is from — written once, at filing.
+
+    Both go onto the section row rather than only into ``content`` because the app lists,
+    sorts and displays from columns, and because the user can edit them afterwards: a
+    later pass rewrites ``content`` and must not be able to undo a correction.
+
+    The name is the user's own filename first and the AI's title only as a fallback. They
+    typed it, so it is the label they will look for; the title is what saves a global
+    upload from reading "Lab Report on 4 Aug 2026".
+    """
+    row = session.execute(
+        select(AiReportClassification.title, AiReportClassification.document_date).where(
+            AiReportClassification.run_item_id == item_id
+        )
+    ).one_or_none()
+
+    name = (intake_name or "").strip() or (row.title if row else None)
+    if row is None or row.document_date is None:
+        return name, None
+    # Midnight UTC, explicitly. The column is timestamptz because Spring's entity declares
+    # OffsetDateTime; letting the session's timezone decide would date a document one day
+    # early for every reader west of Greenwich.
+    return name, datetime.combine(row.document_date, time.min, tzinfo=UTC)
 
 
 def _adopt_prior_filing(
@@ -486,6 +520,11 @@ def refile_to_detected(
             source.c.private,
             source.c.created_by,
             source.c.content,
+            # Carried, not recreated. The destination INSERT below copies the row, and
+            # leaving these two out would silently strip a document's name and date the
+            # moment it was moved -- including a name the user had just corrected.
+            source.c.name,
+            source.c.date,
         ).where(source.c.id == section_row_id)
     ).one_or_none()
     if row is None:
@@ -513,6 +552,8 @@ def refile_to_detected(
             private=row.private,
             created_by=row.created_by,
             content=row.content,
+            name=row.name,
+            date=row.date,
         )
         .returning(destination.c.id)
     ).scalar_one()

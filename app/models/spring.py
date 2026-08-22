@@ -72,6 +72,12 @@ reports = Table(
     Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+    # The user's own filename, carried across at filing. Before this column existed
+    # every mover dropped it -- ours and Spring's alike.
+    Column("name", String(255), nullable=True),
+    # The date printed on the document, chosen by app/services/document_date.py.
+    # NOT created_at, which is the moment this service filed the row.
+    Column("date", DateTime(timezone=True), nullable=True),
 )
 
 #: The scans/imaging section. INSERTed into when a scan is filed; read otherwise.
@@ -84,6 +90,12 @@ scans_imaging = Table(
     Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+    # The user's own filename, carried across at filing. Before this column existed
+    # every mover dropped it -- ours and Spring's alike.
+    Column("name", String(255), nullable=True),
+    # The date printed on the document, chosen by app/services/document_date.py.
+    # NOT created_at, which is the moment this service filed the row.
+    Column("date", DateTime(timezone=True), nullable=True),
 )
 
 #: The insurance section. NOTE: its FK column is `provider` (-> insurance_provider), not
@@ -97,6 +109,12 @@ insurance = Table(
     Column("filepath", String(500), nullable=True),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+    # The user's own filename, carried across at filing. Before this column existed
+    # every mover dropped it -- ours and Spring's alike.
+    Column("name", String(255), nullable=True),
+    # The date printed on the document, chosen by app/services/document_date.py.
+    # NOT created_at, which is the moment this service filed the row.
+    Column("date", DateTime(timezone=True), nullable=True),
 )
 
 #: The prescriptions section. INSERTed into when a prescription is filed; read otherwise.
@@ -114,6 +132,12 @@ prescriptions = Table(
     Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+    # The user's own filename, carried across at filing. Before this column existed
+    # every mover dropped it -- ours and Spring's alike.
+    Column("name", String(255), nullable=True),
+    # The date printed on the document, chosen by app/services/document_date.py.
+    # NOT created_at, which is the moment this service filed the row.
+    Column("date", DateTime(timezone=True), nullable=True),
 )
 
 #: The bills section. Unlike the sections above, this one has columns for the very things
@@ -134,6 +158,12 @@ bills = Table(
     Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+    # The user's own filename, carried across at filing. Before this column existed
+    # every mover dropped it -- ours and Spring's alike.
+    Column("name", String(255), nullable=True),
+    # The date printed on the document, chosen by app/services/document_date.py.
+    # NOT created_at, which is the moment this service filed the row.
+    Column("date", DateTime(timezone=True), nullable=True),
     Column("amount", Numeric(10, 2), nullable=True),
     Column("amount_due", Numeric(10, 2), nullable=True),
     Column(
@@ -154,6 +184,12 @@ vaccinations = Table(
     Column("filepath", String(500), nullable=False),
     Column("content", JSONB, nullable=True),
     Column("private", Boolean, nullable=True),
+    # The user's own filename, carried across at filing. Before this column existed
+    # every mover dropped it -- ours and Spring's alike.
+    Column("name", String(255), nullable=True),
+    # The date printed on the document, chosen by app/services/document_date.py.
+    # NOT created_at, which is the moment this service filed the row.
+    Column("date", DateTime(timezone=True), nullable=True),
     Column("next_due_on", DateTime(timezone=True), nullable=True),
 )
 
