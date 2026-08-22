@@ -9,11 +9,12 @@ tokens, estimated cost, duration, outcome, and sanitized failure data — keyed 
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -69,6 +70,17 @@ class AiReportClassification(Base):
     identity_confirmed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    #: The document's own date — when the sample was collected, the scan performed, the
+    #: bill issued — chosen from everything the model transcribed by
+    #: app/services/document_date.py. Null when the document printed none we could read,
+    #: which is common: many bare X-rays, vaccination cards and bills carry no date.
+    document_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    #: The label the chosen date was printed under. The provenance that matters: a report
+    #: prints a collection date, a received date and a release date, so when the wrong one
+    #: is picked this names the rule to fix. Without it the only evidence is a plausible
+    #: date that happens to be wrong.
+    document_date_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)

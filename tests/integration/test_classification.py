@@ -5,6 +5,7 @@ the model call is exercised without a real (paid, non-deterministic) call.
 """
 
 import uuid
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -232,6 +233,85 @@ def test_rerun_same_attempt_updates_rather_than_duplicates(
         {"id": item_id},
     ).scalar_one()
     assert count == 1
+
+
+def test_the_chosen_date_and_its_label_are_persisted(db_session, make_document, aws, test_settings):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    ai = FakeAIProvider(
+        response=structured_response(
+            classification_payload(
+                dates=[
+                    {"label": "Reported On", "value": "15/03/2026"},
+                    {"label": "Sample Collected", "value": "12/03/2026"},
+                ]
+            )
+        )
+    )
+    ctx = _context(db_session, aws, test_settings, document_id, item_id, ai)
+
+    classify_report(ctx)
+
+    row = db_session.execute(
+        text(
+            "SELECT document_date, document_date_label FROM ai_report_classifications "
+            "WHERE run_item_id = :id"
+        ),
+        {"id": item_id},
+    ).one()
+    assert row.document_date == date(2026, 3, 12)
+    assert row.document_date_label == "Sample Collected"
+
+
+def test_a_document_printing_no_date_stores_null_rather_than_a_guess(
+    db_session, make_document, aws, test_settings
+):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    ai = FakeAIProvider(response=structured_response(classification_payload(dates=[])))
+    ctx = _context(db_session, aws, test_settings, document_id, item_id, ai)
+
+    classify_report(ctx)
+
+    row = db_session.execute(
+        text(
+            "SELECT document_date, document_date_label FROM ai_report_classifications "
+            "WHERE run_item_id = :id"
+        ),
+        {"id": item_id},
+    ).one()
+    assert row.document_date is None
+    assert row.document_date_label is None
+
+
+def test_a_rerun_replaces_the_stored_date_rather_than_keeping_the_first(
+    db_session, make_document, aws, test_settings
+):
+    # The upsert path, which is easy to get wrong in one direction only: leaving these
+    # columns out of on_conflict_do_update's set_ leaves the first pass's date sitting
+    # under the second pass's reading, and nothing anywhere says so.
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+
+    first = FakeAIProvider(
+        response=structured_response(
+            classification_payload(dates=[{"label": "Sample Collected", "value": "12/03/2026"}])
+        )
+    )
+    classify_report(_context(db_session, aws, test_settings, document_id, item_id, first))
+
+    second = FakeAIProvider(
+        response=structured_response(
+            classification_payload(dates=[{"label": "Sample Collected", "value": "05/01/2026"}])
+        )
+    )
+    classify_report(_context(db_session, aws, test_settings, document_id, item_id, second))
+
+    row = db_session.execute(
+        text("SELECT document_date FROM ai_report_classifications WHERE run_item_id = :id"),
+        {"id": item_id},
+    ).one()
+    assert row.document_date == date(2026, 1, 5)
 
 
 def test_a_new_attempt_adds_a_separate_log_row(db_session, make_document, aws, test_settings):
