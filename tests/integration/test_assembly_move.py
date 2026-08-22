@@ -40,14 +40,16 @@ def _seed_classification(
     patient_name=None,
     name_match=None,
     confirmed_at=None,
+    document_date=None,
+    document_date_label=None,
 ) -> None:
     db_session.execute(
         text(
             "INSERT INTO ai_report_classifications (run_item_id, document_id, section, title, "
             "confidence, prompt_version, schema_version, patient_name, name_match, "
-            "identity_confirmed_at) "
+            "identity_confirmed_at, document_date, document_date_label) "
             "VALUES (:i, :d, :s, 'Complete Blood Count', 0.97, 'clf-2', 'clf-2', "
-            ":pn, :nm, :ca)"
+            ":pn, :nm, :ca, CAST(:dd AS date), :dl)"
         ),
         {
             "i": item_id,
@@ -56,6 +58,8 @@ def _seed_classification(
             "pn": patient_name,
             "nm": name_match,
             "ca": confirmed_at,
+            "dd": document_date,
+            "dl": document_date_label,
         },
     )
     db_session.flush()
@@ -255,6 +259,50 @@ def test_content_name_check_is_none_before_classification(db_session, make_docum
 
     assert content["classification"] is None
     assert content["name_check"] is None
+
+
+def test_content_records_which_date_was_read_and_what_it_was_called(db_session, make_document):
+    """Provenance, not the value the app shows.
+
+    The section row's `date` column is the truth and the user can correct it; this says
+    what the model read and which printed label it came from. When a lab's template makes
+    the picker choose wrong, the label is the whole diagnosis — a plausible-looking date
+    on its own is no evidence at all.
+    """
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(
+        db_session,
+        item_id,
+        document_id,
+        document_date="2026-03-12",
+        document_date_label="Sample Collected",
+    )
+
+    read = build_content(db_session, item_id, state=ContentState.COMPLETE)["ai"]["document_date"]
+
+    assert read == {"value": "2026-03-12", "label": "Sample Collected"}
+
+
+def test_content_document_date_is_none_when_the_document_printed_none(db_session, make_document):
+    # Common and not an error: bare X-rays, most vaccination cards and many bills carry
+    # no date. Null is the honest answer and the app shows an empty field to fill in.
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(db_session, item_id, document_id)
+
+    content = build_content(db_session, item_id, state=ContentState.CLASSIFIED)["ai"]
+
+    assert content["document_date"] is None
+
+
+def test_content_document_date_is_none_before_classification(db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id, status="classifying")
+
+    content = build_content(db_session, item_id, state=ContentState.CLASSIFIED)["ai"]
+
+    assert content["document_date"] is None
 
 
 # --- completing the item ----------------------------------------------------

@@ -91,6 +91,8 @@ def build_content(session: Session, item_id: UUID, *, state: ContentState) -> di
             AiReportClassification.patient_name,
             AiReportClassification.name_match,
             AiReportClassification.identity_confirmed_at,
+            AiReportClassification.document_date,
+            AiReportClassification.document_date_label,
         ).where(AiReportClassification.run_item_id == item_id)
     ).one_or_none()
 
@@ -136,6 +138,16 @@ def build_content(session: Session, item_id: UUID, *, state: ContentState) -> di
         else None
     )
 
+    # Provenance, not the truth. The section row's `date` column is what the app displays
+    # and what the user can correct; this records what the model read and WHICH printed
+    # label it was read from — the one piece of evidence when a lab's template makes the
+    # picker choose wrong. Nothing should render it.
+    document_date = (
+        {"value": clf.document_date.isoformat(), "label": clf.document_date_label}
+        if clf is not None and clf.document_date is not None
+        else None
+    )
+
     return {
         "ai": {
             "schema_version": CONTENT_SCHEMA_VERSION,
@@ -143,6 +155,7 @@ def build_content(session: Session, item_id: UUID, *, state: ContentState) -> di
             "document_id": document_id,
             "classification": classification,
             "name_check": name_check,
+            "document_date": document_date,
             "extraction": extraction,
             "section_extraction": section_extraction,
             "insights": insights,
