@@ -293,6 +293,26 @@ def _file_against_classification(
     return Outcome.REJECTED
 
 
+def _already_filed(session: Session, document_id: int) -> bool:
+    """Has some earlier run item filed this document into a section table?
+
+    True means this pass is a resume or a retry, not an upload. Both differ from a first
+    pass in the same two ways: the pipeline must not stop for the user again, and the
+    classification can be adopted rather than re-read.
+    """
+    return (
+        session.execute(
+            select(AiProcessingRunItem.id)
+            .where(
+                AiProcessingRunItem.document_id == document_id,
+                AiProcessingRunItem.section_row_id.is_not(None),
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
 def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     """Classify, file, then run whatever that section needs, honouring cancellation.
 
@@ -305,6 +325,11 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     The pipeline's shape is chosen *after* classification because the section decides it:
     a report is extracted and interpreted, a section document is transcribed and stops.
     """
+    # A document a previous item already filed is being resumed or retried, not uploaded.
+    # It must not stop again — the user has already asked for this pass — and Task 10
+    # gives it its classification without paying for a second reading.
+    resumed = _already_filed(session, ctx.document_id)
+
     if not _run_stage(ctx, session, CLASSIFY_STAGE):
         return Outcome.CANCELLED
     # Re-checked here specifically: routing reads the classification row *unguarded*, and a
@@ -369,6 +394,25 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     # Filing relocated the object; the in-memory key is now stale and every stage below
     # loads the document through it.
     ctx.source_key = _source_key(session, ctx.item_id)
+
+    if ctx.settings.analysis_on_demand and not resumed:
+        # Filed, named, dated and on screen — and nothing paid for yet. `completed` is
+        # honest here: the item did what it was asked to do, and `content.ai.state` stays
+        # "classified", which already means "filed, not yet read".
+        #
+        # Not a new status, deliberately. One would have cost a CHECK-constraint migration
+        # in Spring's repo, a rewrite of the partial unique index the ON CONFLICT infers
+        # from, an exemption from the reaper (which exists to kill items that stop moving),
+        # and — fatally — `create_run` refuses to make work for a document whose item is
+        # still active, and it is the only resume path there is.
+        if processing.complete_item(session, ctx.item_id, expected=_IN_PROGRESS):
+            logger.info(
+                "item_awaiting_analysis",
+                extra={"item_id": str(ctx.item_id), "section": section.value},
+            )
+            return Outcome.COMPLETED
+        filing.mark_content_failed(session, ctx.item_id)
+        return Outcome.CANCELLED
 
     for step in pipeline:
         if not _run_stage(ctx, session, step):

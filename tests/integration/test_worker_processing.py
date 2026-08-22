@@ -142,6 +142,81 @@ def test_completed_at_and_started_at_are_set(
     assert row.attempt_count == 1
 
 
+# --- on-demand analysis -----------------------------------------------------
+
+
+def _on_demand(test_settings):
+    return test_settings.model_copy(update={"analysis_on_demand": True})
+
+
+def test_analysis_on_demand_files_the_document_and_stops(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The point of the flag: visible in seconds, nothing expensive spent."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    assert outcome is Outcome.COMPLETED
+    assert _status(db_session, item_id) == RunItemStatus.COMPLETED.value
+
+    # Filed — the document is in its section and openable.
+    section_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :i"), {"i": item_id}
+    ).scalar_one()
+    assert section_row_id is not None
+
+    # ...and marked as read no further. `classified` already means exactly this, which is
+    # why the pause needed no new state anywhere.
+    content = db_session.execute(
+        text("SELECT content FROM reports WHERE id = :r"), {"r": section_row_id}
+    ).scalar_one()
+    assert content["ai"]["state"] == "classified"
+
+    # Nothing after classification ran.
+    for table in ("ai_report_extractions", "ai_report_insights"):
+        assert (
+            db_session.execute(
+                text(f"SELECT count(*) FROM {table} WHERE run_item_id = :i"), {"i": item_id}
+            ).scalar_one()
+            == 0
+        )
+    assert _queue_depth(sqs, queue_url) == 0
+
+
+def test_with_the_flag_off_the_pipeline_is_exactly_what_it_was(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The regression guard that matters most.
+
+    This ships to production before the app has a button, so off must be indistinguishable
+    from the code that came before it.
+    """
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
+
+    assert outcome is Outcome.COMPLETED
+    section_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :i"), {"i": item_id}
+    ).scalar_one()
+    content = db_session.execute(
+        text("SELECT content FROM reports WHERE id = :r"), {"r": section_row_id}
+    ).scalar_one()
+    assert content["ai"]["state"] == "complete"
+    assert (
+        db_session.execute(
+            text("SELECT count(*) FROM ai_report_extractions WHERE run_item_id = :i"),
+            {"i": item_id},
+        ).scalar_one()
+        == 1
+    )
+
+
 # --- idempotency / at-least-once --------------------------------------------
 
 

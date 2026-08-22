@@ -155,6 +155,21 @@ class Settings(BaseSettings):
     # existed — a safe degradation, unlike that flag's, because nothing is misfiled.
     name_matching_enabled: bool = True
 
+    # --- On-demand analysis -------------------------------------------------
+    # When on, the worker files a document and stops. The user sees it in its section
+    # within seconds, correctly named and dated, and nothing expensive has run yet;
+    # POST /v1/documents/{id}/analyze runs the rest when they ask for it.
+    #
+    # OFF by default, and unlike the two flags above this one has an expiry. It exists so
+    # this service can ship before the app has a button: off, every document runs the full
+    # pipeline exactly as it did before, byte for byte. DELETE the setting and the branch
+    # in processor._run_pipeline once the button is live in production — a rollout flag
+    # that outlives its rollout is how `prescriptions_enabled` became a trap.
+    #
+    # It must be set the SAME on the api and the worker. Only the worker reads it, but a
+    # split would make the two services disagree about what a submitted document does.
+    analysis_on_demand: bool = False
+
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""
     log_level: str = "INFO"
