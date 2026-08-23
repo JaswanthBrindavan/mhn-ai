@@ -20,8 +20,15 @@ from app.integrations.sqs import ReceivedMessage, delete_message
 from app.models.ai_results import AiReportClassification
 from app.models.enums import RunItemStatus
 from app.models.processing import AiProcessingRunItem
-from app.services import assembly, filing, identity, processing, section_extraction
-from app.services.classification import DocumentSection
+from app.services import (
+    assembly,
+    classification,
+    filing,
+    identity,
+    processing,
+    section_extraction,
+)
+from app.services.classification import DocumentSection, classify_report
 from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
 from app.workers.stages import (
@@ -293,6 +300,32 @@ def _file_against_classification(
     return Outcome.REJECTED
 
 
+def _adopt_or_classify(ctx: StageContext) -> None:
+    """Take the classification a previous item already made, or read the document.
+
+    Runs under the same ``classifying`` status as the real stage, because that is what the
+    item is doing — establishing its classification — and it writes no
+    ``ai_process_logs`` row, because no model was called and the log is the record of what
+    was spent.
+
+    The fallback is defensive rather than expected: a filed document was classified before
+    it could be filed. If that row is ever missing, reading the document again is better
+    than failing the pass.
+    """
+    if classification.adopt_prior(ctx.session, item_id=ctx.item_id, document_id=ctx.document_id):
+        return
+    logger.warning(
+        "classification_adopt_missed",
+        extra={"item_id": str(ctx.item_id), "document_id": ctx.document_id},
+    )
+    classify_report(ctx)
+
+
+#: Same status as CLASSIFY_STAGE, so cancellation, the guarded advance and the rest of the
+#: pipeline see no difference between a document that was read and one that was resumed.
+_ADOPT_STAGE: StageStep = (RunItemStatus.CLASSIFYING, _adopt_or_classify)
+
+
 def _already_filed(session: Session, document_id: int) -> bool:
     """Has some earlier run item filed this document into a section table?
 
@@ -326,11 +359,11 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     a report is extracted and interpreted, a section document is transcribed and stops.
     """
     # A document a previous item already filed is being resumed or retried, not uploaded.
-    # It must not stop again — the user has already asked for this pass — and Task 10
-    # gives it its classification without paying for a second reading.
+    # Two things follow: it must not stop for the user again — they have already asked for
+    # this pass — and its classification is adopted rather than read a second time.
     resumed = _already_filed(session, ctx.document_id)
 
-    if not _run_stage(ctx, session, CLASSIFY_STAGE):
+    if not _run_stage(ctx, session, _ADOPT_STAGE if resumed else CLASSIFY_STAGE):
         return Outcome.CANCELLED
     # Re-checked here specifically: routing reads the classification row *unguarded*, and a
     # cancel landing while the stage ran would otherwise be seen as a missing row. The

@@ -26,9 +26,7 @@ _BASE = (
 
 def test_labelled_dates_are_parsed() -> None:
     result = DocumentClassification.model_validate_json(
-        "{"
-        + _BASE
-        + ',"dates":[{"label":"Sample Collected","value":"12/03/2026"},'
+        "{" + _BASE + ',"dates":[{"label":"Sample Collected","value":"12/03/2026"},'
         '{"label":"Reported On","value":"15/03/2026"}]}'
     )
     assert [(d.label, d.value) for d in result.dates] == [
@@ -62,9 +60,7 @@ def test_malformed_dates_degrade_to_empty_rather_than_failing_the_document() -> 
     # An advisory field must never cost a document its classification — the rule
     # `handwriting` and `patient_name` already follow. Failing here would lose the
     # section, the title and the patient name over a date.
-    result = DocumentClassification.model_validate_json(
-        "{" + _BASE + ',"dates":"not a list"}'
-    )
+    result = DocumentClassification.model_validate_json("{" + _BASE + ',"dates":"not a list"}')
     assert result.dates == []
 
 
@@ -80,17 +76,13 @@ def test_entries_with_no_value_are_dropped_not_defaulted() -> None:
 
 def test_a_pathological_list_is_bounded() -> None:
     entries = ",".join(f'{{"label":"D{i}","value":"01/04/2026"}}' for i in range(40))
-    result = DocumentClassification.model_validate_json(
-        "{" + _BASE + ',"dates":[' + entries + "]}"
-    )
+    result = DocumentClassification.model_validate_json("{" + _BASE + ',"dates":[' + entries + "]}")
     assert len(result.dates) == 20
 
 
 def test_chosen_date_applies_the_section_rule() -> None:
     result = DocumentClassification.model_validate_json(
-        "{"
-        + _BASE
-        + ',"dates":[{"label":"Reported On","value":"15/03/2026"},'
+        "{" + _BASE + ',"dates":[{"label":"Reported On","value":"15/03/2026"},'
         '{"label":"Sample Collected","value":"12/03/2026"}]}'
     )
     assert chosen_date(result) == (date(2026, 3, 12), "Sample Collected")

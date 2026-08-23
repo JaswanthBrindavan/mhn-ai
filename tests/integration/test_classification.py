@@ -314,6 +314,112 @@ def test_a_rerun_replaces_the_stored_date_rather_than_keeping_the_first(
     assert row.document_date == date(2026, 1, 5)
 
 
+def _finish(db_session, item_id) -> None:
+    """Close an item so a second one for the same document may exist.
+
+    The partial unique index allows one in-flight item per document, which is exactly the
+    state a resume starts from: the first pass is terminal before the second is created.
+    """
+    db_session.execute(
+        text("UPDATE ai_processing_run_items SET status = 'completed' WHERE id = :i"),
+        {"i": item_id},
+    )
+    db_session.flush()
+
+
+def test_adopt_prior_copies_the_whole_classification_onto_a_new_item(
+    db_session, make_document, aws, test_settings
+):
+    """A resumed or retried document takes the classification it already has.
+
+    Tested here rather than only through the worker, because two of these fields are also
+    restored downstream by identity._carry_settled -- so a worker-level test passes even
+    if this function drops them, and would go on passing until someone switched name
+    matching off.
+    """
+    document_id = make_document()
+    first_item = _seed_item(db_session, document_id)
+    ai = FakeAIProvider(
+        response=structured_response(
+            classification_payload(dates=[{"label": "Sample Collected", "value": "12/03/2026"}])
+        )
+    )
+    classify_report(_context(db_session, aws, test_settings, document_id, first_item, ai))
+    db_session.execute(
+        text(
+            "UPDATE ai_report_classifications SET patient_name = 'PRIYA MENON', "
+            "name_match = 'mismatch', identity_confirmed_at = now() WHERE run_item_id = :i"
+        ),
+        {"i": first_item},
+    )
+    _finish(db_session, first_item)
+
+    second_item = _seed_item(db_session, document_id)
+    assert (
+        classification.adopt_prior(db_session, item_id=second_item, document_id=document_id) is True
+    )
+
+    columns = (
+        "section, title, confidence, reasoning, patient_name, name_match, "
+        "identity_confirmed_at, document_date, document_date_label, prompt_version, "
+        "schema_version"
+    )
+    rows = [
+        db_session.execute(
+            text(f"SELECT {columns} FROM ai_report_classifications WHERE run_item_id = :i"),
+            {"i": item},
+        ).one()
+        for item in (second_item, first_item)
+    ]
+    assert rows[0] == rows[1]
+    # Spelt out so the equality above cannot pass on two rows of nulls.
+    assert rows[0].document_date == date(2026, 3, 12)
+    assert rows[0].identity_confirmed_at is not None
+
+
+def test_adopting_records_no_process_log_and_no_fresh_version(
+    db_session, make_document, aws, test_settings
+):
+    # No model was called, so there is nothing to bill and nothing to stamp. Writing the
+    # current PROMPT_VERSION here would claim a reading under a version that never ran --
+    # the same lie a skipped insights stage avoids by logging "skipped" instead of the
+    # configured model.
+    document_id = make_document()
+    first_item = _seed_item(db_session, document_id)
+    classify_report(
+        _context(db_session, aws, test_settings, document_id, first_item, FakeAIProvider())
+    )
+    db_session.execute(
+        text(
+            "UPDATE ai_report_classifications SET prompt_version = 'clf-ancient', "
+            "schema_version = 'clf-0' WHERE run_item_id = :i"
+        ),
+        {"i": first_item},
+    )
+    _finish(db_session, first_item)
+
+    second_item = _seed_item(db_session, document_id)
+    classification.adopt_prior(db_session, item_id=second_item, document_id=document_id)
+
+    versions = db_session.execute(
+        text(
+            "SELECT prompt_version, schema_version FROM ai_report_classifications "
+            "WHERE run_item_id = :i"
+        ),
+        {"i": second_item},
+    ).one()
+    assert versions.prompt_version == "clf-ancient"
+    assert versions.schema_version == "clf-0"
+    assert _logs(db_session, second_item) == []
+
+
+def test_adopt_prior_finds_nothing_for_a_document_never_classified(db_session, make_document):
+    document_id = make_document()
+    item_id = _seed_item(db_session, document_id)
+
+    assert classification.adopt_prior(db_session, item_id=item_id, document_id=document_id) is False
+
+
 def test_a_new_attempt_adds_a_separate_log_row(db_session, make_document, aws, test_settings):
     document_id = make_document()
     item_id = _seed_item(db_session, document_id)

@@ -27,9 +27,12 @@ from datetime import date
 from enum import StrEnum
 from functools import partial
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
 
 from app.integrations.ai.base import AIProviderError
 from app.integrations.ai.factory import get_stage_provider
@@ -363,6 +366,67 @@ def classify_report(ctx: StageContext) -> None:
 
 
 # --- helpers ----------------------------------------------------------------
+
+
+def adopt_prior(session: Session, *, item_id: UUID, document_id: int) -> bool:
+    """Copy the newest classification for this document onto THIS item. True if it did.
+
+    A resumed or retried document is a NEW run item, and the classification row is keyed
+    on ``run_item_id`` — so without this the pipeline would have to read the document
+    again. Paying twice is the smaller half of the problem. A second reading can land on a
+    different section, and ``filing._adopt_prior_filing`` then refuses with
+    ``section_changed_on_retry``: terminal, deliberately not re-filed, and reached by a
+    user who did nothing but press a button. Adopting makes that disagreement impossible
+    rather than unlikely.
+
+    The mirror of ``identity._carry_settled``, on the same table and for the same reason:
+    what an earlier pass established about a document has to survive the item that
+    established it.
+
+    ``prompt_version`` and ``schema_version`` are copied, not stamped fresh. No model call
+    was made under this version, and claiming one would put a lie in the audit trail — the
+    rule that makes a skipped insights stage record ``"skipped"`` rather than the
+    configured model.
+    """
+    prior = session.execute(
+        select(AiReportClassification)
+        .where(
+            AiReportClassification.document_id == document_id,
+            AiReportClassification.run_item_id != item_id,
+        )
+        .order_by(AiReportClassification.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if prior is None:
+        return False
+
+    session.execute(
+        pg_insert(AiReportClassification)
+        .values(
+            run_item_id=item_id,
+            document_id=document_id,
+            section=prior.section,
+            title=prior.title,
+            confidence=prior.confidence,
+            reasoning=prior.reasoning,
+            patient_name=prior.patient_name,
+            name_match=prior.name_match,
+            identity_confirmed_at=prior.identity_confirmed_at,
+            document_date=prior.document_date,
+            document_date_label=prior.document_date_label,
+            prompt_version=prior.prompt_version,
+            schema_version=prior.schema_version,
+        )
+        # A redelivery of the resumed message re-runs this against an item that already
+        # has its row. Nothing has changed, so there is nothing to update.
+        .on_conflict_do_nothing(index_elements=[AiReportClassification.run_item_id])
+    )
+    session.commit()
+    logger.info(
+        "classification_adopted",
+        extra={"item_id": str(item_id), "document_id": document_id, "section": prior.section},
+    )
+    return True
 
 
 def chosen_date(result: DocumentClassification) -> tuple[date | None, str | None]:
