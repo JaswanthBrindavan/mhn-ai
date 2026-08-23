@@ -34,6 +34,7 @@ from app.schemas.results import (
 from app.schemas.runs import CreateRunRequest, SubmittedDocument
 from app.services import filing, identity, names
 from app.services import runs as runs_service
+from app.services.assembly import ContentState
 from app.services.classification import (
     DOCUMENT_TYPE_BY_SECTION,
     SECTION_BY_DOCUMENT_TYPE,
@@ -253,6 +254,120 @@ def retry_document(
                     ),
                 )
             ]
+        ),
+        request_id,
+        s3=s3,
+        sqs=sqs,
+        settings=settings,
+    )
+    submitted = result.items[0]
+    return RetryResponse(
+        document_id=document_id,
+        item_id=submitted.item_id,
+        run_id=result.run_id,
+        status=submitted.status,
+    )
+
+
+def _content_state(session: Session, item: AiProcessingRunItem) -> str | None:
+    """The filed row's ``content.ai.state``, or None when there is no row or no key.
+
+    None is treated as "not waiting to be analysed" everywhere it is used. A document
+    filed before ``state`` existed is old enough to have been read already, and guessing
+    otherwise would offer to re-read documents that are finished.
+    """
+    if item.section_row_id is None or item.filed_section is None:
+        return None
+    table = filing.SECTION_TABLES.get(DocumentSection(item.filed_section))
+    if table is None:
+        return None
+    content = session.execute(
+        select(table.c.content).where(table.c.id == item.section_row_id)
+    ).scalar_one_or_none()
+    if not isinstance(content, dict):
+        return None
+    ai = content.get("ai")
+    return ai.get("state") if isinstance(ai, dict) else None
+
+
+def analyze_document(
+    session: Session,
+    document_id: int,
+    request_id: str | None,
+    *,
+    s3: "S3Client",
+    sqs: "SQSClient",
+    settings: "Settings",
+) -> RetryResponse:
+    """Run the stages we deliberately did not run when the document was filed.
+
+    With ``ANALYSIS_ON_DEMAND`` on, filing is where a document stops: it is in its section
+    within seconds, named and dated, and nothing expensive has been spent. This is the user
+    saying go ahead, and it re-submits through the ordinary path — the worker adopts the
+    stored classification and the filed row, so nothing is read or filed twice.
+
+    The permission is the state, as it is for refile and confirm-identity: filed, its
+    latest item ``completed``, and its content still ``classified``. Those two conditions
+    together are also what excludes a **section-mismatched** document, which is filed but
+    ``rejected`` and already ``complete``. That one has its own action, and reading it in
+    place would run the wrong extractor over it — which is the whole reason the mismatch
+    path stops before extraction.
+    """
+    item = _latest_item(session, document_id)
+    if item is None:
+        raise ApiError(404, "no_ai_result", "No AI result exists for this document")
+
+    if item.section_row_id is None or item.filed_section is None:
+        raise ApiError(
+            409,
+            "not_filed",
+            "This document has not been filed into a section",
+            {"status": item.status},
+        )
+
+    if item.status in ACTIVE_STATUSES:
+        raise ApiError(
+            409,
+            "already_in_progress",
+            "This document is already being processed",
+            {"status": item.status},
+        )
+
+    state = _content_state(session, item)
+    if state == ContentState.COMPLETE.value:
+        raise ApiError(409, "already_analysed", "This document has already been analysed")
+
+    if item.status != RunItemStatus.COMPLETED.value or state != ContentState.CLASSIFIED.value:
+        raise ApiError(
+            409,
+            "not_awaiting_analysis",
+            "This document is not waiting to be analysed",
+            {"status": item.status, "last_error_code": item.last_error_code},
+        )
+
+    result = runs_service.create_run(
+        session,
+        CreateRunRequest(
+            documents=[
+                SubmittedDocument(
+                    document_id=document_id,
+                    # Carried, like retry and confirm-identity do. The user asked for the
+                    # document to be read, not for its section to be reconsidered — and
+                    # dropping it would turn a sectioned upload into a global one on the
+                    # pass that finally reads it.
+                    intended_section=(
+                        DocumentSection(item.intended_section) if item.intended_section else None
+                    ),
+                )
+            ],
+            # The pause ends the item `completed`, and `create_run` will not make work for
+            # a completed document without being told to — "never overwrite a completed
+            # result". Here there is no result to overwrite: the check above has already
+            # refused anything whose content is `complete`, so the only documents that
+            # reach this line are the ones that were filed and never read. Being explicit
+            # is the honest expression of a user pressing a button, not a way around the
+            # rule.
+            force_reprocess=True,
         ),
         request_id,
         s3=s3,
