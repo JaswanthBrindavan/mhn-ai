@@ -160,15 +160,27 @@ class Settings(BaseSettings):
     # within seconds, correctly named and dated, and nothing expensive has run yet;
     # POST /v1/documents/{id}/analyze runs the rest when they ask for it.
     #
-    # OFF by default, and unlike the two flags above this one has an expiry. It exists so
-    # this service can ship before the app has a button: off, every document runs the full
-    # pipeline exactly as it did before, byte for byte. DELETE the setting and the branch
-    # in processor._run_pipeline once the button is live in production — a rollout flag
-    # that outlives its rollout is how `prescriptions_enabled` became a trap.
+    # ON by default, for the reason `name_matching_enabled` is: all three repos ship from
+    # one branch and deploy together, so the partial-deploy hazard does not arise. The
+    # alternative is worse and is a mistake this codebase has already made once — a flag
+    # defaulting false while every deployment sets it true means any environment brought
+    # up without the variable silently behaves unlike all the others, and that failure is
+    # invisible because a document that files and stops looks exactly like one that files
+    # and is still working.
+    #
+    # **The ordering constraint this replaces the old default with:** the app must be able
+    # to render the Analyse button before this service reaches an environment. Without it
+    # every document files, stops, and has no way to be resumed — filed, named and dated,
+    # but never read, with nothing on screen saying why. Deploy mhn-react before or with
+    # this, never after.
+    #
+    # Kept rather than deleted, as an emergency stop. Off degrades SAFELY, unlike
+    # `prescriptions_enabled`: every document simply runs the full pipeline on upload, as
+    # it did before this existed, and nothing is misfiled or left anywhere unexpected.
     #
     # It must be set the SAME on the api and the worker. Only the worker reads it, but a
     # split would make the two services disagree about what a submitted document does.
-    analysis_on_demand: bool = False
+    analysis_on_demand: bool = True
 
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""
