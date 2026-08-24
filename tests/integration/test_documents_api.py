@@ -87,6 +87,138 @@ def filed_failed_item(db_session, aws, seed_user, make_document) -> Filed:
     return Filed(document_id=document_id, item_id=item_id, source_key=key)
 
 
+@pytest.fixture
+def awaiting_analysis(db_session, aws, seed_user, make_document):
+    """A document filed and deliberately left unread, as ANALYSIS_ON_DEMAND leaves it.
+
+    `completed` with content still `classified`: the item did what it was asked to do, and
+    nothing after classification has run.
+    """
+
+    def _make(*, state: str = "classified", status: str = "completed", error: str | None = None):
+        key = f"reports/{uuid.uuid4().hex}.pdf"
+        aws[0].put_object(Bucket=BUCKET, Key=key, Body=b"%PDF-1.4 filed report")
+        document_id = make_document(upload=False)
+        db_session.execute(
+            text("DELETE FROM unclassified_files WHERE id = :id"), {"id": document_id}
+        )
+        section_row_id = db_session.execute(
+            text(
+                "INSERT INTO reports (user_id, created_by, filepath, content) "
+                "VALUES (:u, :u, :k, CAST(:c AS JSONB)) RETURNING id"
+            ),
+            {"u": seed_user, "k": key, "c": json.dumps({"ai": {"state": state}})},
+        ).scalar_one()
+        item_id = _seed_item(
+            db_session,
+            document_id,
+            status,
+            section_row_id=section_row_id,
+            filed_section="reports",
+            source_key=key,
+        )
+        if error is not None:
+            db_session.execute(
+                text("UPDATE ai_processing_run_items SET last_error_code = :e WHERE id = :i"),
+                {"e": error, "i": item_id},
+            )
+            db_session.flush()
+        return Filed(document_id=document_id, item_id=item_id, source_key=key)
+
+    return _make
+
+
+def test_analyze_submits_a_document_waiting_for_it(api, db_session, awaiting_analysis):
+    filed = awaiting_analysis()
+
+    response = api.post(f"/v1/documents/{filed.document_id}/analyze")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["document_id"] == filed.document_id
+    assert uuid.UUID(body["item_id"]) != filed.item_id
+
+
+def test_analyze_carries_the_intended_section_forward(api, db_session, awaiting_analysis):
+    # The user asked for the document to be read, not for its section to be reconsidered.
+    # Dropping this would turn a sectioned upload into a global one on the pass that
+    # finally reads it.
+    filed = awaiting_analysis()
+    db_session.execute(
+        text("UPDATE ai_processing_run_items SET intended_section = 'reports' WHERE id = :i"),
+        {"i": filed.item_id},
+    )
+    db_session.flush()
+
+    new_item = uuid.UUID(api.post(f"/v1/documents/{filed.document_id}/analyze").json()["item_id"])
+
+    assert (
+        db_session.execute(
+            text("SELECT intended_section FROM ai_processing_run_items WHERE id = :i"),
+            {"i": new_item},
+        ).scalar_one()
+        == "reports"
+    )
+
+
+def test_analyze_refuses_a_document_that_was_never_filed(api, db_session, make_document):
+    document_id = make_document()
+    _seed_item(db_session, document_id, "completed")
+
+    response = api.post(f"/v1/documents/{document_id}/analyze")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "not_filed"
+
+
+def test_analyze_refuses_a_document_already_read(api, awaiting_analysis):
+    filed = awaiting_analysis(state="complete")
+
+    response = api.post(f"/v1/documents/{filed.document_id}/analyze")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "already_analysed"
+
+
+def test_analyze_refuses_a_document_already_in_flight(api, awaiting_analysis):
+    filed = awaiting_analysis(status="extracting")
+
+    response = api.post(f"/v1/documents/{filed.document_id}/analyze")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "already_in_progress"
+
+
+def test_analyze_refuses_a_section_mismatch(api, awaiting_analysis):
+    """It is filed, but it has its own action and must not be read where it sits.
+
+    A mismatched document was filed where the user put it and deliberately not extracted,
+    because running an insurance policy through the report extractor produces confident
+    nonsense. "Move to <detected>" is the way out; this is not.
+    """
+    filed = awaiting_analysis(state="complete", status="rejected", error="section_mismatch")
+
+    response = api.post(f"/v1/documents/{filed.document_id}/analyze")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "already_analysed"
+
+
+def test_analyze_refuses_a_failed_document(api, awaiting_analysis):
+    # Retry is the route for that, and it exists. This one is only for a document that was
+    # never read because nobody had asked yet.
+    filed = awaiting_analysis(status="failed", error="extraction_failed")
+
+    response = api.post(f"/v1/documents/{filed.document_id}/analyze")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "not_awaiting_analysis"
+
+
+def test_analyze_a_document_that_never_existed_is_404(api):
+    assert api.post("/v1/documents/987654/analyze").status_code == 404
+
+
 def _seed_results(db_session, item_id, document_id) -> None:
     db_session.execute(
         text(

@@ -20,8 +20,15 @@ from app.integrations.sqs import ReceivedMessage, delete_message
 from app.models.ai_results import AiReportClassification
 from app.models.enums import RunItemStatus
 from app.models.processing import AiProcessingRunItem
-from app.services import assembly, filing, identity, processing, section_extraction
-from app.services.classification import DocumentSection
+from app.services import (
+    assembly,
+    classification,
+    filing,
+    identity,
+    processing,
+    section_extraction,
+)
+from app.services.classification import DocumentSection, classify_report
 from app.services.processing import ClaimOutcome
 from app.workers.heartbeat import VisibilityHeartbeat
 from app.workers.stages import (
@@ -293,6 +300,52 @@ def _file_against_classification(
     return Outcome.REJECTED
 
 
+def _adopt_or_classify(ctx: StageContext) -> None:
+    """Take the classification a previous item already made, or read the document.
+
+    Runs under the same ``classifying`` status as the real stage, because that is what the
+    item is doing — establishing its classification — and it writes no
+    ``ai_process_logs`` row, because no model was called and the log is the record of what
+    was spent.
+
+    The fallback is defensive rather than expected: a filed document was classified before
+    it could be filed. If that row is ever missing, reading the document again is better
+    than failing the pass.
+    """
+    if classification.adopt_prior(ctx.session, item_id=ctx.item_id, document_id=ctx.document_id):
+        return
+    logger.warning(
+        "classification_adopt_missed",
+        extra={"item_id": str(ctx.item_id), "document_id": ctx.document_id},
+    )
+    classify_report(ctx)
+
+
+#: Same status as CLASSIFY_STAGE, so cancellation, the guarded advance and the rest of the
+#: pipeline see no difference between a document that was read and one that was resumed.
+_ADOPT_STAGE: StageStep = (RunItemStatus.CLASSIFYING, _adopt_or_classify)
+
+
+def _already_filed(session: Session, document_id: int) -> bool:
+    """Has some earlier run item filed this document into a section table?
+
+    True means this pass is a resume or a retry, not an upload. Both differ from a first
+    pass in the same two ways: the pipeline must not stop for the user again, and the
+    classification can be adopted rather than re-read.
+    """
+    return (
+        session.execute(
+            select(AiProcessingRunItem.id)
+            .where(
+                AiProcessingRunItem.document_id == document_id,
+                AiProcessingRunItem.section_row_id.is_not(None),
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
 def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     """Classify, file, then run whatever that section needs, honouring cancellation.
 
@@ -305,7 +358,12 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     The pipeline's shape is chosen *after* classification because the section decides it:
     a report is extracted and interpreted, a section document is transcribed and stops.
     """
-    if not _run_stage(ctx, session, CLASSIFY_STAGE):
+    # A document a previous item already filed is being resumed or retried, not uploaded.
+    # Two things follow: it must not stop for the user again — they have already asked for
+    # this pass — and its classification is adopted rather than read a second time.
+    resumed = _already_filed(session, ctx.document_id)
+
+    if not _run_stage(ctx, session, _ADOPT_STAGE if resumed else CLASSIFY_STAGE):
         return Outcome.CANCELLED
     # Re-checked here specifically: routing reads the classification row *unguarded*, and a
     # cancel landing while the stage ran would otherwise be seen as a missing row. The
@@ -369,6 +427,25 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     # Filing relocated the object; the in-memory key is now stale and every stage below
     # loads the document through it.
     ctx.source_key = _source_key(session, ctx.item_id)
+
+    if ctx.settings.analysis_on_demand and not resumed:
+        # Filed, named, dated and on screen — and nothing paid for yet. `completed` is
+        # honest here: the item did what it was asked to do, and `content.ai.state` stays
+        # "classified", which already means "filed, not yet read".
+        #
+        # Not a new status, deliberately. One would have cost a CHECK-constraint migration
+        # in Spring's repo, a rewrite of the partial unique index the ON CONFLICT infers
+        # from, an exemption from the reaper (which exists to kill items that stop moving),
+        # and — fatally — `create_run` refuses to make work for a document whose item is
+        # still active, and it is the only resume path there is.
+        if processing.complete_item(session, ctx.item_id, expected=_IN_PROGRESS):
+            logger.info(
+                "item_awaiting_analysis",
+                extra={"item_id": str(ctx.item_id), "section": section.value},
+            )
+            return Outcome.COMPLETED
+        filing.mark_content_failed(session, ctx.item_id)
+        return Outcome.CANCELLED
 
     for step in pipeline:
         if not _run_stage(ctx, session, step):

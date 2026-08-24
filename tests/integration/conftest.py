@@ -123,6 +123,12 @@ def test_settings(aws) -> Settings:
         # reads it — the redrive policy itself lives on the main queue in AWS.
         sqs_dlq_url=dlq,
         max_file_bytes=1_000_000,
+        # Stated, not inherited. ANALYSIS_ON_DEMAND defaults ON, and most of this suite
+        # exercises the FULL pipeline — extraction, insights, retry in place, cancel
+        # after filing. Those tests want a document read end to end, so they say so here
+        # and the on-demand tests opt in with `model_copy` instead. Leaving it to the
+        # default would silently turn a dozen pipeline tests into filing tests.
+        analysis_on_demand=False,
     )
 
 

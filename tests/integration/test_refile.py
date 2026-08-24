@@ -9,6 +9,8 @@ The move is the reverse mover `docs/auto-filing-design.md` said would never be b
 keeps it narrow is the refusals below.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import select, text
 
@@ -43,6 +45,8 @@ def _filed_mismatch(db_session, make_document, s3, bucket, *, detected="insuranc
             filepath=reports_key,
             private=False,
             content={"ai": {"state": "complete"}},
+            name="March bloods.pdf",
+            date=datetime(2026, 3, 12, tzinfo=UTC),
         )
         .returning(reports.c.id)
     ).scalar_one()
@@ -113,6 +117,30 @@ def test_refile_moves_the_row_the_object_and_the_run_item(
     # The object moved with it, and the original is gone.
     assert object_exists(s3, bucket, item["source_key"]) is True
     assert object_exists(s3, bucket, old_key) is False
+
+
+def test_the_move_carries_the_name_and_the_date(db_session, make_document, aws, test_settings):
+    # The destination INSERT copies the row column by column, so a column left out of it
+    # is silently stripped by the move -- including a name the user had just corrected.
+    # Nothing downstream would notice: the document simply reverts to "Insurance document
+    # on 4 Aug 2026" and no error is raised anywhere.
+    s3, sqs, _, _ = aws
+    bucket = test_settings.s3_bucket
+    item_id, document_id, _, _ = _filed_mismatch(db_session, make_document, s3, bucket)
+
+    results_service.refile_document(
+        db_session, document_id, None, s3=s3, sqs=sqs, settings=test_settings
+    )
+
+    new_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :i"),
+        {"i": item_id},
+    ).scalar_one()
+    moved = db_session.execute(
+        select(insurance.c.name, insurance.c.date).where(insurance.c.id == new_row_id)
+    ).one()
+    assert moved.name == "March bloods.pdf"
+    assert moved.date == datetime(2026, 3, 12, tzinfo=UTC)
 
 
 def test_refile_submits_the_document_for_processing(db_session, make_document, aws, test_settings):

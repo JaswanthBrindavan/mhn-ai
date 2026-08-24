@@ -142,6 +142,233 @@ def test_completed_at_and_started_at_are_set(
     assert row.attempt_count == 1
 
 
+# --- on-demand analysis -----------------------------------------------------
+
+
+def _on_demand(test_settings):
+    return test_settings.model_copy(update={"analysis_on_demand": True})
+
+
+def test_analysis_on_demand_files_the_document_and_stops(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The point of the flag: visible in seconds, nothing expensive spent."""
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    assert outcome is Outcome.COMPLETED
+    assert _status(db_session, item_id) == RunItemStatus.COMPLETED.value
+
+    # Filed — the document is in its section and openable.
+    section_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :i"), {"i": item_id}
+    ).scalar_one()
+    assert section_row_id is not None
+
+    # ...and marked as read no further. `classified` already means exactly this, which is
+    # why the pause needed no new state anywhere.
+    content = db_session.execute(
+        text("SELECT content FROM reports WHERE id = :r"), {"r": section_row_id}
+    ).scalar_one()
+    assert content["ai"]["state"] == "classified"
+
+    # Nothing after classification ran.
+    for table in ("ai_report_extractions", "ai_report_insights"):
+        assert (
+            db_session.execute(
+                text(f"SELECT count(*) FROM {table} WHERE run_item_id = :i"), {"i": item_id}
+            ).scalar_one()
+            == 0
+        )
+    assert _queue_depth(sqs, queue_url) == 0
+
+
+def test_with_the_flag_off_the_pipeline_is_exactly_what_it_was(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The regression guard that matters most.
+
+    This ships to production before the app has a button, so off must be indistinguishable
+    from the code that came before it.
+    """
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, test_settings, aws)
+
+    assert outcome is Outcome.COMPLETED
+    section_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :i"), {"i": item_id}
+    ).scalar_one()
+    content = db_session.execute(
+        text("SELECT content FROM reports WHERE id = :r"), {"r": section_row_id}
+    ).scalar_one()
+    assert content["ai"]["state"] == "complete"
+    assert (
+        db_session.execute(
+            text("SELECT count(*) FROM ai_report_extractions WHERE run_item_id = :i"),
+            {"i": item_id},
+        ).scalar_one()
+        == 1
+    )
+
+
+def _resume(db_session, sqs, queue_url, document_id):
+    """A second run item for a document a previous one already filed, as create_run makes
+    it: new item, no section_row_id of its own, source_key copied from the filed one."""
+    prior = db_session.execute(
+        text(
+            "SELECT source_key, intended_section FROM ai_processing_run_items "
+            "WHERE document_id = :d ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"d": document_id},
+    ).one()
+    run_id = db_session.execute(
+        text("INSERT INTO ai_processing_runs (caller) VALUES ('test') RETURNING id")
+    ).scalar_one()
+    item_id = db_session.execute(
+        text(
+            "INSERT INTO ai_processing_run_items (run_id, document_id, status, source_key, "
+            "intended_section) VALUES (:r, :d, 'queued', :k, :i) RETURNING id"
+        ),
+        {"r": run_id, "d": document_id, "k": prior.source_key, "i": prior.intended_section},
+    ).scalar_one()
+    db_session.commit()
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+    return item_id
+
+
+def _stages(db_session, item_id):
+    return [
+        r[0]
+        for r in db_session.execute(
+            text("SELECT stage FROM ai_process_logs WHERE run_item_id = :i"), {"i": item_id}
+        ).all()
+    ]
+
+
+def test_a_resumed_document_is_not_read_a_second_time(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """Not merely a saved model call.
+
+    A second reading can land on a different section, and _adopt_prior_filing then refuses
+    with section_changed_on_retry -- terminal, deliberately not re-filed, and reached by a
+    user who did nothing but press a button.
+    """
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+    _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    # Everything the first pass established, so the comparison below is not a row of
+    # nulls agreeing with a row of nulls. The identity stamp matters most: dropping it
+    # would ask a user who already claimed this document whose it is, all over again --
+    # the exact bug identity._carry_settled exists to prevent, through another door.
+    db_session.execute(
+        text(
+            "UPDATE ai_report_classifications SET document_date = DATE '2026-03-12', "
+            "document_date_label = 'Sample Collected', patient_name = 'PRIYA MENON', "
+            "name_match = 'mismatch', identity_confirmed_at = now() WHERE run_item_id = :i"
+        ),
+        {"i": item_id},
+    )
+    db_session.commit()
+
+    resumed_id = _resume(db_session, sqs, queue_url, document_id)
+    outcome = _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    assert outcome is Outcome.COMPLETED
+    # No model was called to classify: the stage adopted, and ai_process_logs is the
+    # record of what was spent, so there is no row for it.
+    assert "classifying" not in _stages(db_session, resumed_id)
+
+    columns = (
+        "section, title, confidence, document_date, document_date_label, patient_name, "
+        "name_match, identity_confirmed_at, prompt_version, schema_version"
+    )
+    rows = {
+        which: db_session.execute(
+            text(f"SELECT {columns} FROM ai_report_classifications WHERE run_item_id = :i"),
+            {"i": which_id},
+        ).one()
+        for which, which_id in (("adopted", resumed_id), ("original", item_id))
+    }
+    assert rows["adopted"] == rows["original"]
+    # Spelt out, because the equality above passes on two rows of nulls if the seed ever
+    # stops seeding.
+    assert rows["adopted"].document_date is not None
+    assert rows["adopted"].identity_confirmed_at is not None
+
+
+def test_resuming_reads_the_document_and_updates_the_same_row(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+    _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+    filed_row_id = db_session.execute(
+        text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :i"), {"i": item_id}
+    ).scalar_one()
+    before = db_session.execute(text("SELECT count(*) FROM reports")).scalar_one()
+
+    resumed_id = _resume(db_session, sqs, queue_url, document_id)
+    _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    # The same row, read in place -- not a second copy of the document.
+    assert db_session.execute(text("SELECT count(*) FROM reports")).scalar_one() == before
+    assert (
+        db_session.execute(
+            text("SELECT section_row_id FROM ai_processing_run_items WHERE id = :i"),
+            {"i": resumed_id},
+        ).scalar_one()
+        == filed_row_id
+    )
+    content = db_session.execute(
+        text("SELECT content FROM reports WHERE id = :r"), {"r": filed_row_id}
+    ).scalar_one()
+    assert content["ai"]["state"] == "complete"
+
+
+def test_a_resumed_document_does_not_stop_again(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    # The pause is for the upload, not for every pass. Stopping again would make the
+    # button do nothing, forever, with no error anywhere.
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+    _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    resumed_id = _resume(db_session, sqs, queue_url, document_id)
+    _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    assert (
+        db_session.execute(
+            text("SELECT count(*) FROM ai_report_extractions WHERE run_item_id = :i"),
+            {"i": resumed_id},
+        ).scalar_one()
+        == 1
+    )
+
+
+def test_a_first_pass_still_reads_the_document(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    _process(sqs, queue_url, session_factory, test_settings, aws)
+
+    assert "classifying" in _stages(db_session, item_id)
+
+
 # --- idempotency / at-least-once --------------------------------------------
 
 
@@ -961,12 +1188,23 @@ def test_a_filed_but_failed_document_is_reprocessed_in_place_on_retry(
     assert content["extraction"] is not None
 
 
-def test_a_retry_that_classifies_into_another_section_is_rejected(
+def test_a_retry_of_a_filed_document_cannot_flip_its_section(
     api, db_session, make_document, session_factory, test_settings, aws, monkeypatch
 ):
-    """A loud terminal reject, not a re-file. Moving the document again would mean deleting
-    a Spring row we created and copying the object a second time — a lot of machinery for
-    something that should not happen at temperature=0, and data-mangling if it misfires."""
+    """This used to be a loud terminal reject. It is now unreachable, on purpose.
+
+    ``section_changed_on_retry`` existed because a retry re-read the document, and a second
+    reading could land somewhere else — leaving the user with a document that could not be
+    processed and could not be moved. Re-filing was never the answer: it would mean
+    deleting a Spring row we created and copying the object again.
+
+    The answer was to stop re-reading. A filed document has already been classified, and
+    the classification is adopted rather than made afresh, so there is nothing for a second
+    reading to disagree with. The fake below classifies as insurance and is never asked.
+
+    ``_adopt_prior_filing``'s guard stays as an invariant check, not because this path can
+    reach it.
+    """
     _, sqs, queue_url, _ = aws
     item_id, run_id, document_id = _seed_item(db_session, make_document)
     publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
@@ -991,11 +1229,18 @@ def test_a_retry_that_classifies_into_another_section_is_rejected(
         sqs, queue_url, session_factory, test_settings, aws, ai=_ClassifiesAs("insurance")
     )
 
-    assert outcome is Outcome.REJECTED
+    assert outcome is Outcome.COMPLETED
     retry_item = _item(db_session, retry_item_id)
-    assert retry_item["last_error_code"] == "section_changed_on_retry"
-    assert retry_item["section_row_id"] is None
-    # Neither table gained a row: the original stands, and nothing was filed into insurance.
+    assert retry_item["last_error_code"] is None
+    # The same row it was already filed into, read in place.
+    assert retry_item["section_row_id"] == filed_row_id
+    assert (
+        db_session.execute(
+            text("SELECT section FROM ai_report_classifications WHERE run_item_id = :i"),
+            {"i": retry_item_id},
+        ).scalar_one()
+        == "reports"
+    )
     key = {"k": retry_item["source_key"]}
     assert (
         db_session.execute(text("SELECT count(*) FROM reports WHERE filepath = :k"), key)

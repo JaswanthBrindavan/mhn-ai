@@ -94,6 +94,35 @@ def refile_document(
 
 
 @router.post(
+    "/documents/{document_id}/analyze",
+    response_model=RetryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Run the AI stages on a document that was filed and left unread",
+    responses={
+        **_NOT_FOUND,
+        409: {"description": "Not filed, already analysed, or not waiting to be"},
+    },
+)
+def analyze_document(
+    document_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    s3: Annotated["S3Client", Depends(s3_client)],
+    sqs: Annotated["SQSClient", Depends(sqs_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_request_id: Annotated[str | None, Header(alias="X-Request-Id")] = None,
+) -> RetryResponse:
+    """ "Read this one now" — the answer to a document filed but deliberately left unread.
+
+    Untyped for the same reason ``/refile`` and ``/confirm-identity`` are: the caller is
+    acting *on* a document rather than naming a type, and nothing extracted comes back —
+    an item id and a status.
+    """
+    return results_service.analyze_document(
+        session, document_id, x_request_id, s3=s3, sqs=sqs, settings=settings
+    )
+
+
+@router.post(
     "/documents/{document_id}/confirm-identity",
     response_model=RetryResponse,
     status_code=status.HTTP_202_ACCEPTED,

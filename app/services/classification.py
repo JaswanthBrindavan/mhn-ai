@@ -23,17 +23,22 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import logging
 import time
 from dataclasses import replace
+from datetime import date
 from enum import StrEnum
 from functools import partial
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
 
 from app.integrations.ai.base import AIProviderError
 from app.integrations.ai.factory import get_stage_provider
 from app.models.ai_results import AiReportClassification
 from app.schemas.results import DocumentType
+from app.services import document_date
 from app.services.ai_logging import (
     check_response,
     elapsed_ms,
@@ -106,6 +111,22 @@ DOCUMENT_TYPE_BY_SECTION: dict[str, DocumentType] = {
 HANDWRITING_LEVELS = ("none", "some", "mostly")
 
 
+class LabelledDate(BaseModel):
+    """One date printed on the document, with whatever label sat beside it."""
+
+    #: "Sample Collected", "Study Date", "Invoice Date" — or empty for a bare date in a
+    #: header, which is common and must not be discarded.
+    label: str = Field(default="", max_length=64)
+    value: str = Field(max_length=64)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _null_label_is_blank(cls, value: object) -> object:
+        # The schema allows null because a date is often printed bare in a header, and
+        # absent and blank must not become two states downstream.
+        return "" if value is None else value
+
+
 class DocumentClassification(BaseModel):
     """Validated model output. Written to the DB only after this parses cleanly."""
 
@@ -123,6 +144,29 @@ class DocumentClassification(BaseModel):
     #: and runs before filing — the gate has to answer "is this yours?" before the
     #: document enters a wallet, not after.
     patient_name: str | None = Field(default=None, max_length=255)
+    #: Every date printed on the document, verbatim, with its printed label. Read here for
+    #: the same reason `patient_name` is: this is the only stage every document runs, and
+    #: the only one that finishes before the user is asked to confirm what they uploaded.
+    #: WHICH of these is the document's date is decided by app/services/document_date.py —
+    #: the model transcribes, Python chooses. Defaulted rather than required so every
+    #: classification written before this field existed still parses.
+    dates: list[LabelledDate] = Field(default_factory=list, max_length=20)
+
+    @field_validator("dates", mode="before")
+    @classmethod
+    def _usable_dates(cls, value: object) -> object:
+        # Degrades to [] rather than failing, like the two validators below: an advisory
+        # field must not cost a document its section, its title and its patient name.
+        # An entry with no value is dropped rather than kept with an empty one — empty
+        # parses to None downstream and would read as a date we considered and rejected
+        # rather than one that was never there.
+        if not isinstance(value, list):
+            return []
+        return [
+            item
+            for item in value[:20]
+            if isinstance(item, dict) and str(item.get("value") or "").strip()
+        ]
 
     @field_validator("patient_name", mode="before")
     @classmethod
@@ -171,8 +215,30 @@ CLASSIFICATION_JSON_SCHEMA: dict[str, Any] = {
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
         "patient_name": {"type": ["string", "null"]},
+        #: A list rather than one date, because choosing between them is not the model's
+        #: job — see app/services/document_date.py. An empty list is a real answer.
+        "dates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": ["string", "null"]},
+                    "value": {"type": "string"},
+                },
+                "required": ["label", "value"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["section", "title", "handwriting", "confidence", "reasoning", "patient_name"],
+    "required": [
+        "section",
+        "title",
+        "handwriting",
+        "confidence",
+        "reasoning",
+        "patient_name",
+        "dates",
+    ],
     "additionalProperties": False,
 }
 
@@ -219,12 +285,18 @@ SYSTEM_PROMPT = (
     "Copy it verbatim including any title. If the document names a doctor, a hospital, a "
     "policyholder and a patient, return the PATIENT. Return null if no patient name is "
     "printed — many scans, bills and vaccination cards carry none. Never infer a name "
-    "from context, a file name, or an email address, and never guess.\n\n"
+    "from context, a file name, or an email address, and never guess.\n"
+    "- dates: every date printed on the document, each with the label printed beside it, "
+    "copied verbatim in the document's own format. Include ALL of them — a report prints a "
+    "collection date, a received date and a release date, and we choose between them "
+    "ourselves. Use the label exactly as printed ('Sample Collected', 'Study Date', "
+    "'Invoice Date'), or an empty label for a date printed with none. Return an empty list "
+    "if the document prints no date. Never infer, compute or guess a date.\n\n"
     "Be conservative: if the document is unreadable or genuinely ambiguous, choose "
     "'unknown' rather than guessing a section."
 )
 
-INSTRUCTION = "Classify the attached document into one section."
+INSTRUCTION = "Classify the attached document into one section, and transcribe the dates it prints."
 
 
 def classify_report(ctx: StageContext) -> None:
@@ -296,7 +368,79 @@ def classify_report(ctx: StageContext) -> None:
 # --- helpers ----------------------------------------------------------------
 
 
+def adopt_prior(session: Session, *, item_id: UUID, document_id: int) -> bool:
+    """Copy the newest classification for this document onto THIS item. True if it did.
+
+    A resumed or retried document is a NEW run item, and the classification row is keyed
+    on ``run_item_id`` — so without this the pipeline would have to read the document
+    again. Paying twice is the smaller half of the problem. A second reading can land on a
+    different section, and ``filing._adopt_prior_filing`` then refuses with
+    ``section_changed_on_retry``: terminal, deliberately not re-filed, and reached by a
+    user who did nothing but press a button. Adopting makes that disagreement impossible
+    rather than unlikely.
+
+    The mirror of ``identity._carry_settled``, on the same table and for the same reason:
+    what an earlier pass established about a document has to survive the item that
+    established it.
+
+    ``prompt_version`` and ``schema_version`` are copied, not stamped fresh. No model call
+    was made under this version, and claiming one would put a lie in the audit trail — the
+    rule that makes a skipped insights stage record ``"skipped"`` rather than the
+    configured model.
+    """
+    prior = session.execute(
+        select(AiReportClassification)
+        .where(
+            AiReportClassification.document_id == document_id,
+            AiReportClassification.run_item_id != item_id,
+        )
+        .order_by(AiReportClassification.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if prior is None:
+        return False
+
+    session.execute(
+        pg_insert(AiReportClassification)
+        .values(
+            run_item_id=item_id,
+            document_id=document_id,
+            section=prior.section,
+            title=prior.title,
+            confidence=prior.confidence,
+            reasoning=prior.reasoning,
+            patient_name=prior.patient_name,
+            name_match=prior.name_match,
+            identity_confirmed_at=prior.identity_confirmed_at,
+            document_date=prior.document_date,
+            document_date_label=prior.document_date_label,
+            prompt_version=prior.prompt_version,
+            schema_version=prior.schema_version,
+        )
+        # A redelivery of the resumed message re-runs this against an item that already
+        # has its row. Nothing has changed, so there is nothing to update.
+        .on_conflict_do_nothing(index_elements=[AiReportClassification.run_item_id])
+    )
+    session.commit()
+    logger.info(
+        "classification_adopted",
+        extra={"item_id": str(item_id), "document_id": document_id, "section": prior.section},
+    )
+    return True
+
+
+def chosen_date(result: DocumentClassification) -> tuple[date | None, str | None]:
+    """The one date this document is about, and the label it was printed under.
+
+    Split out from persistence so the rule can be exercised against a parsed
+    classification without a database, and so the model's raw transcription stays
+    visibly separate from the choice made over it.
+    """
+    return document_date.pick(result.section.value, [(d.label, d.value) for d in result.dates])
+
+
 def _persist_classification(ctx: StageContext, result: DocumentClassification) -> None:
+    picked, picked_label = chosen_date(result)
     stmt = (
         pg_insert(AiReportClassification)
         .values(
@@ -307,6 +451,8 @@ def _persist_classification(ctx: StageContext, result: DocumentClassification) -
             confidence=result.confidence,
             reasoning=result.reasoning or None,
             patient_name=result.patient_name,
+            document_date=picked,
+            document_date_label=picked_label,
             prompt_version=PROMPT_VERSION,
             schema_version=SCHEMA_VERSION,
         )
@@ -319,6 +465,11 @@ def _persist_classification(ctx: StageContext, result: DocumentClassification) -
                 "confidence": result.confidence,
                 "reasoning": result.reasoning or None,
                 "patient_name": result.patient_name,
+                # In the update as well as the insert: a redelivered message re-runs
+                # this stage against the same item, and omitting these here would
+                # leave the first pass's date under the second pass's reading.
+                "document_date": picked,
+                "document_date_label": picked_label,
                 "prompt_version": PROMPT_VERSION,
                 "schema_version": SCHEMA_VERSION,
             },
