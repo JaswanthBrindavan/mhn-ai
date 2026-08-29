@@ -75,6 +75,36 @@ class NameCandidatesResponse(BaseModel):
     matches: list[str]
 
 
+class NameCheckSummary(BaseModel):
+    """One document's identity verdict, and nothing else about it."""
+
+    document_id: int
+    #: match | mismatch | unknown
+    verdict: str
+    #: True once the user claimed a mismatched document as theirs, which settles it.
+    confirmed: bool = False
+
+
+class NameChecksRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_ids: list[int] = Field(max_length=500)
+
+
+class NameChecksResponse(BaseModel):
+    """Verdicts for the documents that have one. Documents with no verdict are OMITTED
+    rather than returned null: absent already means "we have not looked", so a null entry
+    would be a second way to say the same thing.
+
+    **Carries no printed name, unlike ``/status``.** This answers a list screen, which
+    needs to know that a document is waiting on its owner -- not who it names. The name is
+    the most identifying field on a document, and it belongs on the one screen where the
+    question is actually put.
+    """
+
+    checks: list[NameCheckSummary]
+
+
 class DocumentAiResult(BaseModel):
     document_id: int
     item_id: uuid.UUID

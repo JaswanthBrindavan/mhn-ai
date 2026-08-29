@@ -9,7 +9,7 @@ submission path, so there is one code path for creating and publishing work.
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.errors import ApiError
@@ -29,6 +29,9 @@ from app.schemas.results import (
     NameCandidatesRequest,
     NameCandidatesResponse,
     NameCheck,
+    NameChecksRequest,
+    NameChecksResponse,
+    NameCheckSummary,
     RetryResponse,
 )
 from app.schemas.runs import CreateRunRequest, SubmittedDocument
@@ -145,6 +148,60 @@ def get_document_status(session: Session, document_id: int) -> DocumentStatusRes
             if clf is not None and clf.name_match is not None
             else None
         ),
+    )
+
+
+def get_name_checks(session: Session, request: NameChecksRequest) -> NameChecksResponse:
+    """The identity verdict for each of these documents that has one.
+
+    Exists so a list screen can mark the documents waiting on their owner **in one call**.
+    The single-document route answers the same question, but a wallet list holds several
+    intake rows and asking per row turns the most-hit screen in the app into an N+1.
+
+    Read through the latest run item per document, exactly as ``get_document_status``
+    does, rather than straight off the newest classification row. A retry writes a new
+    item and a new classification, so the two routes have to agree about which one counts
+    -- two endpoints disagreeing about whether a document is yours would be its own bug.
+
+    Returns **no printed name**, unlike ``/status``: a list needs to know that a decision
+    is waiting, not who the document names. The name belongs on the screen where the
+    question is put.
+    """
+    if not request.document_ids:
+        return NameChecksResponse(checks=[])
+
+    latest = (
+        select(
+            AiProcessingRunItem.id.label("item_id"),
+            func.row_number()
+            .over(
+                partition_by=AiProcessingRunItem.document_id,
+                order_by=AiProcessingRunItem.created_at.desc(),
+            )
+            .label("rn"),
+        )
+        .where(AiProcessingRunItem.document_id.in_(request.document_ids))
+        .subquery()
+    )
+    rows = session.execute(
+        select(
+            AiReportClassification.document_id,
+            AiReportClassification.name_match,
+            AiReportClassification.identity_confirmed_at,
+        )
+        .join(latest, latest.c.item_id == AiReportClassification.run_item_id)
+        .where(latest.c.rn == 1, AiReportClassification.name_match.is_not(None))
+    ).all()
+
+    return NameChecksResponse(
+        checks=[
+            NameCheckSummary(
+                document_id=document_id,
+                verdict=verdict,
+                confirmed=confirmed_at is not None,
+            )
+            for document_id, verdict, confirmed_at in rows
+        ]
     )
 
 
