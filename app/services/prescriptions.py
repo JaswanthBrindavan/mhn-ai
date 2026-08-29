@@ -62,7 +62,7 @@ from app.services.ai_logging import (
     sanitize_validation_error,
 )
 from app.services.classification import DocumentSection
-from app.services.dates import iso_date
+from app.services.dates import interval_days, iso_date
 from app.services.ocr import TextExtractionError, extract_text
 from app.services.source_loading import load_source_document
 from app.workers.stagetypes import StageContext, TransientStageError
@@ -80,7 +80,11 @@ PROMPT_VERSION = "rx-2026-08-11"
 #: rx-5 added ``intake_instruction``: a document that prints food timing in its own table
 #: column was losing it entirely, because the only place the prompt asked for it was
 #: inside ``frequency_raw``.
-SCHEMA_VERSION = "rx-5"
+#: rx-6 added ``duration_days``: the prescribed duration as a day count, so the confirm
+#: screen can prefill an End date from whatever start date the user picks. Derived in
+#: Python from ``duration``, never asked of the model -- the same rule as the dosing
+#: schedule beside it. ``duration`` itself is unchanged and still carries the raw text.
+SCHEMA_VERSION = "rx-6"
 STAGE_NAME = "extracting_prescription"
 
 #: A prescription is short next to a lab panel — a dozen medicines with five fields each.
@@ -654,6 +658,11 @@ def _build_payload(
             " ".join(part for part in (row.frequency_raw, row.intake_instruction) if part) or None
         )
         data["form_normalized"] = _resolve_form(row)
+        # Derived here rather than on the screen so one rule decides it: React would
+        # need its own copy of the interval grammar, and two parsers of "6-8 weeks"
+        # drift. None whenever the duration is absent or unreadable, which leaves the
+        # End date empty for the user to set.
+        data["duration_days"] = interval_days(row.duration)
         data["key"] = _medicine_key(row, seen)
         #: Filled by the catalogue resolver when that lands; null until then, and null is
         #: the ordinary answer even after — a brand the catalogue does not carry is not an

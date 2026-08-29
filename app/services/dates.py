@@ -172,6 +172,55 @@ def _add_months(start: date, months: int) -> date:
     return date(year, month, min(start.day, last_day))
 
 
+def _parse_interval(phrase: object) -> tuple[int, str] | None:
+    """``(count, unit)`` from a stated interval, or None when there is not one.
+
+    Shared by the two readers below so one phrase cannot be understood two ways: a
+    duration that yields an end date and a duration that yields a day count have to agree
+    about what "6-8 weeks" means, and one parse is the only way to guarantee that.
+    """
+    if not isinstance(phrase, str):
+        return None
+    match = _INTERVAL_RE.search(_INTERVAL_RANGE_RE.sub(r"\1", phrase))
+    if match is None:
+        return None
+    raw_count = match.group("count").lower()
+    # The regex admits digits or a known word and nothing else, so both branches are safe.
+    count = int(raw_count) if raw_count.isdigit() else _WORD_NUMBERS[raw_count]
+    return (count, match.group("unit").lower()) if count > 0 else None
+
+
+#: Days per unit. A month is 30 and a year 365 -- APPROXIMATE, unlike everything else in
+#: this module, and deliberately so. See ``interval_days``.
+_DAYS_PER_UNIT = {"day": 1, "week": 7, "month": 30, "year": 365}
+
+#: ``prescription_item.duration_days`` is ``int2``. A count past this is not a long course,
+#: it is a misread, and letting it through would fail an INSERT rather than merely look odd.
+_MAX_DURATION_DAYS = 32767
+
+
+def interval_days(phrase: object) -> int | None:
+    """A prescribed duration as a number of days: "5 days" -> 5, "2 weeks" -> 14.
+
+    Feeds the End date the confirm screen prefills, which is the whole reason it exists: a
+    course ends at its start plus its duration, and only that screen knows the start the
+    user picked.
+
+    **Months and years are approximated (30 and 365), which breaks this module's usual
+    refuse-rather-than-guess rule on purpose.** That rule protects values nobody looks at
+    -- a document date is filed, displayed, sorted on and never questioned. This one is
+    prefilled into a field the user is reading and can change before saving, so an end date
+    two days out is visible and correctable, while a blank one fails the commonest case
+    there is: a chronic medicine written for "1 month". The raw ``duration`` text travels
+    beside it either way, so nothing is lost by the approximation.
+    """
+    parsed = _parse_interval(phrase)
+    if parsed is None:
+        return None
+    days = parsed[0] * _DAYS_PER_UNIT[parsed[1]]
+    return days if days <= _MAX_DURATION_DAYS else None
+
+
 def add_interval(start: object, phrase: object) -> str | None:
     """``start`` plus a stated interval, as an ISO date. None when either is unreadable.
 
@@ -180,19 +229,11 @@ def add_interval(start: object, phrase: object) -> str | None:
     number, so "6-8 weeks" is the day the dose first becomes due.
     """
     begin = parse_date(start)
-    if begin is None or not isinstance(phrase, str):
+    parsed = _parse_interval(phrase)
+    if begin is None or parsed is None:
         return None
-    match = _INTERVAL_RE.search(_INTERVAL_RANGE_RE.sub(r"\1", phrase))
-    if match is None:
-        return None
+    count, unit = parsed
 
-    raw_count = match.group("count").lower()
-    # The regex admits digits or a known word and nothing else, so both branches are safe.
-    count = int(raw_count) if raw_count.isdigit() else _WORD_NUMBERS[raw_count]
-    if count <= 0:
-        return None
-
-    unit = match.group("unit").lower()
     if unit == "day":
         return (begin + timedelta(days=count)).isoformat()
     if unit == "week":
