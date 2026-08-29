@@ -44,8 +44,13 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ins-2026-08-10"
-SCHEMA_VERSION = "ins-4"
+PROMPT_VERSION = "ins-2026-08-29"
+#: ins-5 shortened ``risk_patterns`` (60 -> 40 words) and ``summary`` (unbudgeted -> 60),
+#: with their caps moved down to match. The shape is unchanged — same five fields, same
+#: rules — but payloads either side of the boundary are not comparable in LENGTH, which
+#: is the whole point of the change. Same reasoning ``extraction`` records for ext-3,
+#: which was also a cap move and nothing else.
+SCHEMA_VERSION = "ins-5"
 STAGE_NAME = "generating_insights"
 #: Headroom, not a target: the fields are individually capped and a typical report now
 #: lands well under this. Truncation IS detected — ``check_response`` ends the item
@@ -81,7 +86,12 @@ class Insight(BaseModel):
     the model is not told about is not a limit, it is a paid failure: over-long output
     fails validation, which this stage treats as transient, so it retries the whole call
     at full price. A 400-char ``risk_patterns`` cap with no stated budget did exactly that
-    once, at $0.046 per attempt. Tighten a cap and the budget together, or not at all.
+    once, at $0.046 per attempt. Tighten a cap and the budget together, or not at all —
+    which is how ``risk_patterns`` and ``summary`` were shortened on 2026-08-29.
+
+    One exception, deliberately left: ``heading`` has a cap and no budget. It is a card
+    title of a few words in practice, so 200 characters is not a limit it can reach — but
+    it is the one field where the paragraph above is aspiration rather than fact.
 
     **These are clinically directive, by product decision (2026-08-03).** They name
     conditions, state the risk a pattern carries, and recommend concrete actions — diet,
@@ -102,8 +112,15 @@ class Insight(BaseModel):
     #: from two fields that were separately explaining the same thing at length.
     explanation: str = Field(min_length=1, max_length=350)
     #: The Risk Patterns card body: the value against the limit it crossed, then what
-    #: that can lead to. Two or three short lines.
-    risk_patterns: str = Field(min_length=1, max_length=500)
+    #: that can lead to. Two short lines.
+    #:
+    #: 350, down from 500, with the prompt's budget cut 60 -> 40 words in the same
+    #: change. 40 is close to the floor rather than an arbitrary trim: the field carries
+    #: three things — the value, the limit from ``flagged_against``, and the consequence
+    #: — and the prompt's own example spends 24 words on all three. Below about 25 the
+    #: limit citation is what a model drops, and that citation is what stops it quoting a
+    #: number the value never crossed.
+    risk_patterns: str = Field(min_length=1, max_length=350)
     #: The Suggestions card title — an action, e.g. "Reduce Uric Acid Through Diet".
     suggestion_heading: str = Field(min_length=1, max_length=120)
     #: The Suggestions card body: concrete steps, two or three short lines. Never
@@ -117,7 +134,12 @@ class DocumentInsights(BaseModel):
     """Validated model output. An empty list is valid (nothing noteworthy to say)."""
 
     insights: list[Insight]
-    summary: str | None = Field(default=None, max_length=2000)
+    #: 700, down from 2000, against a stated budget of 60 words. It had NO budget at all
+    #: before — the exact trap ``Insight`` describes, sitting on the longest field here.
+    #: The ratio of cap to budget is looser than ``risk_patterns``' on purpose: this is
+    #: also where unchecked tests are named in a clause, and a list of test names spends
+    #: characters without spending words.
+    summary: str | None = Field(default=None, max_length=700)
 
 
 _INSIGHT_ITEM_SCHEMA: dict[str, Any] = {
@@ -194,7 +216,7 @@ SYSTEM_PROMPT = (
     "product your kidneys clear out. It builds "
     "up when you eat a lot of red meat or shellfish, drink alcohol, or do not drink "
     "enough water.'\n"
-    "- risk_patterns: TWO OR THREE SHORT LINES, AT MOST 60 WORDS. Start with the "
+    "- risk_patterns: TWO SHORT LINES, AT MOST 40 WORDS. Start with the "
     "value and the limit it crossed. The limit MUST be taken from 'flagged_against', "
     "which is the range the result was actually checked against — never a number from "
     "anywhere else. Then say "
@@ -225,9 +247,9 @@ SYSTEM_PROMPT = (
     "NOT give it its own insight and do NOT judge whether it is in range. Name those "
     "tests in the SUMMARY instead, in one clause — 'X and Y were reported without "
     "reference ranges, so they could not be checked'.\n\n"
-    "summary: two to four sentences covering the whole panel — what was flagged, grouped "
-    "sensibly, and what came back within range. Written for someone reading it before "
-    "any of the detail below it."
+    "summary: TWO OR THREE SHORT SENTENCES, AT MOST 60 WORDS, covering the whole panel — "
+    "what was flagged, grouped sensibly, and what came back within range. Written for "
+    "someone reading it before any of the detail below it."
 )
 
 INSTRUCTION_PREFIX = (
