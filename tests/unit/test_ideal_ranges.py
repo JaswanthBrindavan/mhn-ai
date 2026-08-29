@@ -1,7 +1,9 @@
 import pytest
 
 from app.services.ideal_ranges import (
+    Bracket,
     Lookup,
+    canon_sex,
     in_report_unit,
     match_key,
     parse_age,
@@ -30,18 +32,40 @@ def test_match_key_ignores_case_and_all_whitespace():
     assert match_key(None) == ""
 
 
+# --- sex --------------------------------------------------------------------
+@pytest.mark.parametrize("raw", ["Male", "male", "M", "m", " MALE ", "boy"])
+def test_canon_sex_reads_the_spellings_a_report_prints(raw):
+    assert canon_sex(raw) == "male"
+
+
+@pytest.mark.parametrize("raw", ["Female", "F", "woman", "girl"])
+def test_canon_sex_reads_female(raw):
+    assert canon_sex(raw) == "female"
+
+
+@pytest.mark.parametrize("raw", [None, "", "Other", "Transgender", "U", "N/A", "X"])
+def test_canon_sex_refuses_anything_it_does_not_recognise(raw):
+    # Stricter than the printed-range selector on purpose: an unrecognised value must not
+    # fall through to "male", which would flag a patient against the wrong curated range.
+    assert canon_sex(raw) is None
+
+
 # --- age brackets -----------------------------------------------------------
-_ROWS = [(0, 150, 1.0, 9.0), (18, 60, 4.0, 6.0), (0, 1, 2.0, 3.0)]
+_ROWS = [
+    Bracket(0, 150, 1.0, 9.0, "any"),
+    Bracket(18, 60, 4.0, 6.0, "any"),
+    Bracket(0, 1, 2.0, 3.0, "any"),
+]
 
 
 @pytest.mark.parametrize(
     ("age", "expected"),
     [
-        (40, (18, 60, 4.0, 6.0)),  # narrowest covering bracket wins
-        (0.5, (0, 1, 2.0, 3.0)),  # a 6-month-old lands in the infant bracket
-        (18, (18, 60, 4.0, 6.0)),  # inclusive lower bound
-        (60, (18, 60, 4.0, 6.0)),  # inclusive upper bound
-        (70, (0, 150, 1.0, 9.0)),  # only the catch-all covers this age
+        (40, (18, 60, 4.0, 6.0, "any")),  # narrowest covering bracket wins
+        (0.5, (0, 1, 2.0, 3.0, "any")),  # a 6-month-old lands in the infant bracket
+        (18, (18, 60, 4.0, 6.0, "any")),  # inclusive lower bound
+        (60, (18, 60, 4.0, 6.0, "any")),  # inclusive upper bound
+        (70, (0, 150, 1.0, 9.0, "any")),  # only the catch-all covers this age
     ],
 )
 def test_pick_bracket_prefers_the_most_specific(age, expected):
@@ -52,13 +76,44 @@ def test_pick_bracket_needs_an_age_and_a_covering_row():
     # An adult range must never be applied to a patient whose age the report didn't give.
     assert pick_bracket(_ROWS, None) is None
     assert pick_bracket([], 40) is None
-    assert pick_bracket([(18, 60, 4.0, 6.0)], 5) is None
+    assert pick_bracket([Bracket(18, 60, 4.0, 6.0, "any")], 5) is None
 
 
 def test_pick_bracket_is_deterministic_on_equal_spans():
     # Overlapping brackets of the same width: the lower one wins, every time.
-    rows = [(20, 30, 5.0, 6.0), (10, 20, 3.0, 4.0)]
-    assert pick_bracket(rows, 20) == (10, 20, 3.0, 4.0)
+    rows = [Bracket(20, 30, 5.0, 6.0, "any"), Bracket(10, 20, 3.0, 4.0, "any")]
+    assert pick_bracket(rows, 20) == (10, 20, 3.0, 4.0, "any")
+
+
+# --- sex-specific brackets --------------------------------------------------
+# The shape 78 of the 277 curated ranges actually have: a male row and a female row, no
+# 'any' row at all (V18's unique key is (thp_id, sex, age_min, age_max)).
+_SEXED = [Bracket(0, 120, 13.0, 17.0, "male"), Bracket(0, 120, 12.0, 15.0, "female")]
+
+
+def test_pick_bracket_takes_the_patients_own_sex():
+    assert pick_bracket(_SEXED, 40, "Male") == (0, 120, 13.0, 17.0, "male")
+    assert pick_bracket(_SEXED, 40, "F") == (0, 120, 12.0, 15.0, "female")
+
+
+def test_pick_bracket_takes_neither_half_when_the_sex_is_unknown():
+    # The whole bug this guards: without reading `sex`, a woman was flagged against the
+    # male range 13-17 because it merely sorted first. Nothing is better than the wrong one.
+    assert pick_bracket(_SEXED, 40, None) is None
+    assert pick_bracket(_SEXED, 40, "Other") is None
+
+
+def test_pick_bracket_prefers_sex_over_a_narrower_age_span():
+    # A parameter is curated per sex precisely when sex is what moves the range, so the
+    # sex-specific row wins even against an 'any' row that covers a tighter age band.
+    rows = [*_SEXED, Bracket(18, 60, 1.0, 2.0, "any")]
+    assert pick_bracket(rows, 40, "male") == (0, 120, 13.0, 17.0, "male")
+
+
+def test_pick_bracket_falls_back_to_any_when_the_sex_has_no_row():
+    rows = [Bracket(0, 120, 5.0, 9.0, "any"), Bracket(0, 120, 13.0, 17.0, "male")]
+    assert pick_bracket(rows, 40, "female") == (0, 120, 5.0, 9.0, "any")
+    assert pick_bracket(rows, 40, None) == (0, 120, 5.0, 9.0, "any")
 
 
 # --- units ------------------------------------------------------------------
@@ -69,7 +124,10 @@ def _lookup() -> Lookup:
         canonical_name={1: "Hemoglobin", 2: "Glucose", 3: "ESR"},
         base_unit={1: "g/dl", 2: "mg/dl", 3: "mm/hr"},
         alt_units={(1, "g/l"): (0.1, 0.0), (2, "mmol/l"): (18.0, 0.0)},
-        age_ranges={1: [(18, 60, 13.0, 17.0)], 3: [(0, 150, 0.0, 20.0)]},
+        age_ranges={
+            1: [Bracket(18, 60, 13.0, 17.0, "any")],
+            3: [Bracket(0, 150, 0.0, 20.0, "any")],
+        },
     )
 
 
@@ -140,6 +198,44 @@ def test_resolve_uses_an_age_agnostic_bracket():
     # ESR is curated 0-150, so it applies at any age.
     assert resolve("ESR", "mm/hr", 40, lk).bounds == (0.0, 20.0)
     assert resolve("ESR", "mm/hr", 0.5, lk).bounds == (0.0, 20.0)
+
+
+def _sexed_lookup() -> Lookup:
+    lk = _lookup()
+    return Lookup(
+        thp_id_by_name={**lk.thp_id_by_name, "ferritin": 4},
+        approved={**lk.approved, 4: True},
+        canonical_name={**lk.canonical_name, 4: "Ferritin"},
+        base_unit={**lk.base_unit, 4: "ng/ml"},
+        alt_units=lk.alt_units,
+        age_ranges={
+            **lk.age_ranges,
+            4: [Bracket(0, 120, 30.0, 400.0, "male"), Bracket(0, 120, 15.0, 150.0, "female")],
+        },
+    )
+
+
+def test_resolve_uses_the_bracket_for_the_reports_own_sex():
+    lk = _sexed_lookup()
+    assert resolve("Ferritin", "ng/mL", 40, lk, sex="Female").bounds == (15.0, 150.0)
+    assert resolve("Ferritin", "ng/mL", 40, lk, sex="M").bounds == (30.0, 400.0)
+
+
+def test_resolve_falls_back_when_a_sex_split_parameter_has_no_sex():
+    # Same rule as a printed 'Male: … Female: …' range: unusable without knowing which.
+    res = resolve("Ferritin", "ng/mL", 40, lk := _sexed_lookup())
+    assert res.bounds is None
+    assert res.reason == "no_ideal_range"
+    assert res.matched_parameter == "Ferritin"  # matched, just not resolvable
+    assert resolve("Ferritin", "ng/mL", 40, lk, sex="Other").reason == "no_ideal_range"
+
+
+def test_resolve_names_the_sex_in_the_group_only_when_it_narrowed_the_choice():
+    # R&D reads this on the worklist: "18-60" and "0-120 female" are different curations.
+    assert (
+        resolve("Ferritin", "ng/mL", 40, _sexed_lookup(), sex="F").matched_group == "0-120 female"
+    )
+    assert resolve("Hemoglobin", "g/dL", 40, _lookup(), sex="F").matched_group == "18-60"
 
 
 def test_resolve_reports_a_unit_mismatch_with_the_bracket_it_reached():

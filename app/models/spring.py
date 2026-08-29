@@ -27,7 +27,7 @@ from sqlalchemy import (
     String,
     Table,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, ENUM, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 
 spring_metadata = MetaData()
 
@@ -199,12 +199,40 @@ vaccinations = Table(
 # The rows land in these Spring-owned tables and we read them to override a report's
 # printed reference range (see app/services/ideal_ranges).
 #
-# Shapes follow the Spring migration of 2026-07-30. Only the columns we read are declared:
-# thp_age_range also carries min/low_danger/ideal/high_danger/max, which drive the
-# dashboard's gauge but not our three-value abnormal flag.
+# Shapes follow Spring's V14 (the staff-dashboard workflow columns) and V18 (the curated
+# catalogue: 193 parameters, 1184 aliases, 277 age/sex ranges). Only the columns we read
+# are declared: thp_age_range also carries min/ideal/max, which drive the dashboard's gauge
+# but not our three-value abnormal flag.
+#
+# V14 moved three things this service depends on, and the old shapes are still present in
+# the schema, so reading the wrong one fails silently rather than erroring:
+#   * approval is ``status``, not the ``approved`` boolean -- which V1 created, V18 never
+#     sets, and nothing in Spring writes. It is left undeclared deliberately: a binding
+#     for it is a binding for a column that is false on every curated row.
+#   * aliases live in ``thp_alias``, not the inline ``aliases varchar(100)[]`` array, which
+#     V18 leaves null on all 193 rows. Also left undeclared, for the same reason.
+#   * an age bracket is per (parameter, SEX) -- see the note on thp_age_range below.
 
-#: THP master. ``approved`` is the doctor-approval gate. ``visible`` is NOT declared: the
+#: Spring's staff-dashboard workflow states (V14). Declared as the real enum rather than a
+#: string: PostgreSQL will not compare ``reference_status_enum`` with a bound varchar, so a
+#: String column turns every status filter into a runtime error.
+_REFERENCE_STATUS = ENUM(
+    "draft",
+    "pending",
+    "approved",
+    "rejected",
+    "archived",
+    "merged",
+    name="reference_status_enum",
+    create_type=False,
+)
+
+#: THP master. ``status`` is the doctor-approval gate (the reference_status_enum:
+#: draft/pending/approved/rejected/archived/merged). ``visible`` is NOT declared: the
 #: dashboard labels it "Customer visibility?", so it governs app display, not approval.
+#: ``ai_integrated`` is the dashboard's own switch for whether a parameter takes part in AI
+#: processing at all; nothing in Spring writes it yet and it defaults true, so honouring it
+#: costs nothing today and means a staff member turning it off is not silently ignored.
 traditional_health_parameters = Table(
     "traditional_health_parameters",
     spring_metadata,
@@ -212,21 +240,39 @@ traditional_health_parameters = Table(
     Column("name", String(100), nullable=False),
     #: The unit the parameter's ideal ranges are curated in.
     Column("units", String(25), nullable=False),
-    Column("approved", Boolean, nullable=True),
-    #: Other names the same parameter appears under on a report.
-    Column("aliases", ARRAY(String(100)), nullable=True),
+    Column("status", _REFERENCE_STATUS, nullable=False),
+    Column("ai_integrated", Boolean, nullable=False),
+    #: Soft delete. A deleted parameter must not go on matching test names.
+    Column("deleted_at", DateTime(timezone=True), nullable=True),
+)
+
+#: Other names the same parameter appears under on a report. Curated per row rather than as
+#: an array since V14, with its own approval state -- an alias may be a staff entry or an
+#: unreviewed OCR/AI suggestion, and only an approved one may decide a patient's flag.
+thp_alias = Table(
+    "thp_alias",
+    spring_metadata,
+    Column("thp_id", Integer, nullable=True),
+    Column("alias", String(150), nullable=False),
+    Column("status", _REFERENCE_STATUS, nullable=False),
 )
 
 #: Ideal range per age bracket, inclusive on both ends. ``low_warn``/``high_warn`` bound
 #: the dashboard's "Ideal Range"; see _IDEAL_FLOOR in app/services/ideal_ranges.py.
+#:
+#: ``sex`` is 'any' | 'male' | 'female' and is part of the row's identity (V14 re-made the
+#: unique index as (thp_id, sex, age_min, age_max)). 78 of the 277 curated ranges are
+#: sex-specific, so a bracket picked without reading this column can be the other sex's.
 thp_age_range = Table(
     "thp_age_range",
     spring_metadata,
     Column("thp_id", Integer, nullable=False),
+    Column("sex", String(8), nullable=False),
     Column("age_min", Integer, nullable=False),
     Column("age_max", Integer, nullable=False),
     Column("low_warn", Float, nullable=False),
     Column("high_warn", Float, nullable=False),
+    Column("status", _REFERENCE_STATUS, nullable=False),
 )
 
 #: Units other than the parameter's own that a report may print, with the conversion into

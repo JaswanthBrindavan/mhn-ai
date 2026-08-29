@@ -289,7 +289,15 @@ def _normalize(
             enriched.append(normalization.enrich_result(data, gender=result.patient_gender))
             continue
 
-        res = ideal_ranges.resolve(data["test_name"], data.get("unit"), age_years, lookup)
+        res = ideal_ranges.resolve(
+            data["test_name"],
+            data.get("unit"),
+            age_years,
+            lookup,
+            # The same value that selects the half of a printed 'Male: … Female: …' range
+            # selects the curated bracket: 78 of the 277 are per sex.
+            sex=result.patient_gender,
+        )
         if res.bounds is not None:
             enriched.append(
                 normalization.enrich_result(
