@@ -31,6 +31,8 @@ from app.schemas.results import (
     DocumentType,
     NameCandidatesRequest,
     NameCandidatesResponse,
+    NameChecksRequest,
+    NameChecksResponse,
     RetryResponse,
 )
 from app.services import results as results_service
@@ -62,6 +64,32 @@ def get_document_status(
     """The one untyped route. Two path segments, so it cannot shadow the three-segment
     result routes below."""
     return results_service.get_document_status(session, document_id)
+
+
+@router.post(
+    "/documents/name-checks",
+    response_model=NameChecksResponse,
+    summary="Identity verdicts for a set of documents, in one call",
+)
+def get_name_checks(
+    request: NameChecksRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> NameChecksResponse:
+    """Answers a LIST screen: which of these documents are waiting on their owner.
+
+    A plural route rather than N calls to ``/status``, because a wallet list holds several
+    intake rows and the alternative turns the most-hit screen in the app into an N+1 across
+    a service boundary.
+
+    Deliberately narrower than ``/status``: verdicts only, **no printed names**. A list
+    needs to know a decision is waiting, not who the document names -- and that name is the
+    most identifying field a document has, so it stays on the one screen that asks the
+    question. Documents with no verdict are omitted rather than returned null.
+
+    Two path segments, and every other document route has three, so "name-checks" cannot
+    be read as a document id whatever the declaration order.
+    """
+    return results_service.get_name_checks(session, request)
 
 
 @router.post(
