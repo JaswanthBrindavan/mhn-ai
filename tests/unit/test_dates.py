@@ -8,7 +8,14 @@ from datetime import date, datetime
 
 import pytest
 
-from app.services.dates import display_date, in_order, iso_date, parse_date
+from app.services.dates import (
+    add_interval,
+    display_date,
+    in_order,
+    interval_days,
+    iso_date,
+    parse_date,
+)
 
 
 @pytest.mark.parametrize(
@@ -161,3 +168,41 @@ def test_in_order_accepts_valid_or_uncomparable_pairs(earlier, later):
 
 def test_in_order_rejects_an_inverted_pair():
     assert in_order("29th July 2027", "27th July 2026") is False
+
+
+@pytest.mark.parametrize(
+    ("phrase", "days"),
+    [
+        ("5 days", 5),
+        ("for 5 days", 5),  # the word the document actually prints around it
+        ("2 weeks", 14),
+        ("one month", 30),
+        ("3 months", 90),
+        ("1 year", 365),
+        ("6-8 weeks", 42),  # a range takes its FIRST number, as add_interval does
+    ],
+)
+def test_interval_days_reads_a_prescribed_duration(phrase, days):
+    assert interval_days(phrase) == days
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "",
+        None,
+        "as directed",  # the commonest unparseable duration on a real prescription
+        "0 days",  # a course of no days is a misread, not a duration
+        "5000 years",  # past what the int2 column can hold
+        "500 mg",  # a strength that wandered into the duration field
+    ],
+)
+def test_interval_days_refuses_what_it_cannot_read(phrase):
+    """None leaves the End date empty for the user to set, which is recoverable."""
+    assert interval_days(phrase) is None
+
+
+def test_interval_days_and_add_interval_agree_on_a_range():
+    """One parser, so an end date and a day count cannot disagree about "6-8 weeks"."""
+    assert interval_days("6-8 weeks") == 42
+    assert add_interval("01/01/2026", "6-8 weeks") == "2026-02-12"  # 01 Jan + 42 days
