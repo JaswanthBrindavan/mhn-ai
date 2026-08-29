@@ -6,6 +6,7 @@ Spring-shared database.
 """
 
 import json
+import urllib.error
 import uuid
 
 import pytest
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.integrations.s3 import object_exists
 from app.integrations.sqs import publish_processing_item, receive_messages
 from app.models.enums import RunItemStatus
+from app.services import filing, notify
 from app.services.classification import DocumentSection
 from app.services.filing import SECTION_TABLES
 from app.services.section_specs import SECTION_SPECS
@@ -1300,3 +1302,186 @@ def test_a_missing_source_key_is_a_permanent_reject(db_session, make_document, t
     with pytest.raises(RejectStageError) as excinfo:
         load_source_document(ctx)
     assert excinfo.value.code == "source_document_missing"
+
+
+# --- telling Spring the document has landed ---------------------------------
+
+
+def _capture_notifications(monkeypatch) -> list[dict]:
+    """Record what the worker would POST to Spring, running the real notify path."""
+    sent: list[dict] = []
+
+    class _Response:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        sent.append(json.loads(request.data))
+        return _Response()
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+    return sent
+
+
+def _notifying(test_settings):
+    return test_settings.model_copy(
+        update={"spring_callback_url": "http://spring.internal/internal/ai/filed"}
+    )
+
+
+def test_filing_a_document_tells_spring_where_it_went(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """The announcement carries the row the app must navigate to, and nothing else."""
+    _, sqs, queue_url, _ = aws
+    sent = _capture_notifications(monkeypatch)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, _notifying(test_settings), aws)
+
+    assert outcome is Outcome.COMPLETED
+    section_row_id = _item(db_session, item_id)["section_row_id"]
+    assert sent == [
+        {
+            "document_id": document_id,
+            "section": "reports",
+            "section_row_id": section_row_id,
+            # What the row said at the moment it appeared. The stages that follow update
+            # it; the announcement is about arriving, not about finishing.
+            "state": "classified",
+        }
+    ]
+
+
+def test_a_mismatched_document_is_announced_too(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """It is filed, it is on screen, and it carries an action. Not announcing it would
+    leave the user waiting on the one document that has something to ask them."""
+    _, sqs, queue_url, _ = aws
+    sent = _capture_notifications(monkeypatch)
+    item_id, run_id, document_id = _seed_item(db_session, make_document, intended_section="reports")
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(
+        sqs,
+        queue_url,
+        session_factory,
+        _notifying(test_settings),
+        aws,
+        ai=_ClassifiesAs("insurance"),
+    )
+
+    assert outcome is Outcome.REJECTED
+    assert [n["section"] for n in sent] == ["reports"]  # where the USER put it
+    assert sent[0]["state"] == "complete"
+
+
+def test_nothing_is_announced_when_nothing_was_filed(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """The guard in `file_document` matched nothing -- cancelled, or filed underneath us.
+
+    No row appeared, so there is nothing to send anyone to. Announcing here would push the
+    user at a section holding no such document.
+    """
+    _, sqs, queue_url, _ = aws
+    sent = _capture_notifications(monkeypatch)
+    monkeypatch.setattr(filing, "file_document", lambda *a, **k: None)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, _notifying(test_settings), aws)
+
+    assert outcome is Outcome.CANCELLED
+    assert sent == []
+
+
+def test_the_announcement_happens_after_filing_returns(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """Ordering, which is the whole correctness argument for where this call sits.
+
+    `file_document` commits as its last database action, so calling after it returns is
+    calling after the commit -- and Spring can SELECT the row the moment it is told. The
+    reverse order is the same defect as publishing to SQS before committing: the fetch that
+    follows finds nothing and the screen sticks.
+
+    **What this proves and what it does not.** It pins the call site relative to filing.
+    It cannot prove the commit itself, because the whole suite runs inside one rolled-back
+    transaction on one connection, so a second session would see uncommitted rows anyway --
+    a test asserting otherwise would pass whatever the order was.
+    """
+    _, sqs, queue_url, _ = aws
+    order: list[str] = []
+    real_file = filing.file_document
+
+    def tracking_file(*args, **kwargs):
+        result = real_file(*args, **kwargs)
+        order.append("filed")
+        return result
+
+    class _Response:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        order.append("announced")
+        return _Response()
+
+    monkeypatch.setattr(filing, "file_document", tracking_file)
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    _process(sqs, queue_url, session_factory, _notifying(test_settings), aws)
+
+    assert order == ["filed", "announced"]
+
+
+def test_a_failed_announcement_changes_nothing(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """Spring being down must not cost a redelivery and a second run of every paid stage."""
+    _, sqs, queue_url, _ = aws
+
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", refuse)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    outcome = _process(sqs, queue_url, session_factory, _notifying(test_settings), aws)
+
+    assert outcome is Outcome.COMPLETED
+    assert _item(db_session, item_id)["filed_section"] == "reports"
+    assert _filed_row(db_session, item_id).content["ai"]["state"] == "complete"
+    assert _queue_depth(sqs, queue_url) == 0  # acked, not left for redelivery
+
+
+def test_no_callback_url_means_no_call(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """Every deployment that has not set the URL behaves exactly as it did before."""
+    _, sqs, queue_url, _ = aws
+
+    def explode(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("notified with no callback URL configured")
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", explode)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    assert _process(sqs, queue_url, session_factory, test_settings, aws) is Outcome.COMPLETED

@@ -184,6 +184,22 @@ class Settings(BaseSettings):
 
     # --- Service ------------------------------------------------------------
     mhn_service_token: str = ""
+
+    # Where to tell Spring that a document has just appeared in a section, so the app can
+    # take the user there instead of waiting out a poll. Empty disables the call entirely,
+    # which is the pre-2026-08-29 behaviour exactly.
+    #
+    # **Best-effort by design, and that is what makes it cheap.** The app still polls
+    # `ai-status`, so this is an accelerator and not a delivery guarantee: no retries, no
+    # backoff, no outbound DLQ. A dropped notification costs one poll interval; a
+    # notification that could fail the pipeline would cost a redelivery and re-run every
+    # paid stage on a document that is already correctly filed.
+    #
+    # Authenticated with `mhn_service_token` — the same shared secret Spring proves itself
+    # with coming the other way. One secret, one trust boundary, in both directions.
+    spring_callback_url: str = ""
+    spring_callback_timeout_seconds: float = 2.0
+
     log_level: str = "INFO"
 
     @property

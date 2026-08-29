@@ -25,6 +25,7 @@ from app.services import (
     classification,
     filing,
     identity,
+    notify,
     processing,
     section_extraction,
 )
@@ -286,6 +287,16 @@ def _file_against_classification(
         ctx.item_id,
         assembly.build_content(session, ctx.item_id, state=assembly.ContentState.COMPLETE),
     )
+    # The document IS on screen now, in the section the user chose, carrying the flag that
+    # offers "Move to <detected>". Announced like any other filing so the app can take them
+    # to it — the disagreement is a thing to show them, not a reason to leave them waiting.
+    notify.document_filed(
+        ctx.settings,
+        document_id=ctx.document_id,
+        section=intended.value,
+        section_row_id=section_row_id,
+        state=assembly.ContentState.COMPLETE.value,
+    )
     processing.reject_item(
         session,
         ctx.item_id,
@@ -427,6 +438,20 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     # Filing relocated the object; the in-memory key is now stale and every stage below
     # loads the document through it.
     ctx.source_key = _source_key(session, ctx.item_id)
+
+    # Post-commit — `file_document` has committed by the time it returns a row id, so this
+    # cannot announce a row Spring is unable to read. Best-effort and never raises; the
+    # app's existing poll is what guarantees delivery. See app/services/notify.py.
+    #
+    # Fired here rather than after the stages: this is the moment the document appears in
+    # its section, and with analysis on demand it is often the only moment there is.
+    notify.document_filed(
+        ctx.settings,
+        document_id=ctx.document_id,
+        section=section.value,
+        section_row_id=section_row_id,
+        state=assembly.ContentState.CLASSIFIED.value,
+    )
 
     if ctx.settings.analysis_on_demand and not resumed:
         # Filed, named, dated and on screen — and nothing paid for yet. `completed` is
