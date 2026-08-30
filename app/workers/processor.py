@@ -217,6 +217,24 @@ def _classified_section(session: Session, ctx: StageContext) -> DocumentSection:
     return DocumentSection(value)
 
 
+def _analyze_now(session: Session, item_id: UUID) -> bool:
+    """Did the user ask for this document to be analysed on upload?
+
+    Read from the run item rather than carried in the SQS message: the reaper rebuilds a
+    stranded message from database columns alone, so a re-queued document would silently
+    lose the choice and pause -- and a document that files and stops looks exactly like one
+    still working.
+
+    Per ATTEMPT, never inherited. A reassigned document is a NEW item for a different owner,
+    who has asked for nothing, so it defaults false without any code resetting it.
+    """
+    return bool(
+        session.execute(
+            select(AiProcessingRunItem.analyze_now).where(AiProcessingRunItem.id == item_id)
+        ).scalar_one_or_none()
+    )
+
+
 def _intended_section(session: Session, item_id: UUID) -> DocumentSection | None:
     """The section the user uploaded into, or None for a global upload.
 
@@ -453,7 +471,12 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
         state=assembly.ContentState.CLASSIFIED.value,
     )
 
-    if ctx.settings.analysis_on_demand and not resumed:
+    # The user's own choice at upload, and it only ever OPTS OUT of the pause. A per-document
+    # true cannot override ANALYSIS_ON_DEMAND being off, because off is the emergency stop and
+    # already means "everything runs fully" -- there is nothing left for the tick to buy.
+    analyze_now = _analyze_now(session, ctx.item_id)
+
+    if ctx.settings.analysis_on_demand and not analyze_now and not resumed:
         # Filed, named, dated and on screen — and nothing paid for yet. `completed` is
         # honest here: the item did what it was asked to do, and `content.ai.state` stays
         # "classified", which already means "filed, not yet read".

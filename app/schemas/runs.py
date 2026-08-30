@@ -42,6 +42,15 @@ class SubmittedDocument(BaseModel):
             "document is rejected without extraction and stays in unclassified_files."
         ),
     )
+    analyze_now: bool = Field(
+        default=False,
+        description=(
+            "The user asked for this document to be analysed on upload, so skip the "
+            "ANALYSIS_ON_DEMAND pause for it. Per SUBMISSION and never inherited: a "
+            "reassigned document belongs to someone who has not asked for anything. Has "
+            "no effect when ANALYSIS_ON_DEMAND is off, because everything runs fully then."
+        ),
+    )
 
 
 class CreateRunRequest(BaseModel):
