@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -115,6 +116,15 @@ class AiProcessingRunItem(Base):
     #: The document's current S3 key. Set at submit and updated at filing, so a stage can
     #: load the source without depending on which table currently owns the document.
     source_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    #: The user ticked "analyse now" at upload, so this document skips the
+    #: ANALYSIS_ON_DEMAND pause. Lives here rather than on ``unclassified_files`` for two
+    #: reasons that both have to hold: filing DELETEs the intake row before the pause
+    #: decision is read, and Spring's reassign re-publishes ``intended_section`` off that
+    #: same row -- so a sibling column there would be inherited by the family member
+    #: automatically, which is the one rule this feature exists to prevent. A run item is
+    #: per ATTEMPT and inherits nothing, so a reassigned document defaults to false without
+    #: anyone writing code to reset it.
+    analyze_now: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=RunItemStatus.PENDING.value

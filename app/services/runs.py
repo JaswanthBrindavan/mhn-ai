@@ -201,6 +201,7 @@ def _plan_items(
     force_reprocess: bool,
     intended: dict[int, str | None],
     source_keys: dict[int, str],
+    analyze_now: dict[int, bool],
 ) -> _Plan:
     """Pure decision step: no I/O, so the rules are easy to test and to read."""
     reused: dict[int, AiProcessingRunItem] = {}
@@ -245,9 +246,45 @@ def _plan_items(
             # Set here because the key is already loaded for validation. From now on the
             # pipeline reads the document through this, not through unclassified_files.
             "source_key": source_keys.get(document_id),
+            # Added unconditionally, like every key here: one multi-row VALUES cannot mix
+            # differing column sets. Defaults false, so a caller that never heard of this
+            # field gets exactly today's behaviour.
+            "analyze_now": analyze_now.get(document_id, False),
         }
 
     return _Plan(reused=reused, outcomes=outcomes, new_rows=new_rows)
+
+
+def _apply_analyze_now_to_reused(
+    session: Session,
+    reused: dict[int, AiProcessingRunItem],
+    analyze_now: dict[int, bool],
+) -> None:
+    """The LATEST submission's choice governs an item that was reused rather than created.
+
+    A new row picks up its choice from the insert and a reassigned document therefore
+    defaults to false, which is what keeps the uploader's tick off someone else's records.
+    A REUSED item has no insert to carry that default, and it is reachable: a mismatched
+    document is retried (copying analyze_now=true), that item is still active, and the user
+    then answers "it is my father's" in the dialog that is still open. Without this the
+    in-flight item keeps the uploader's flag and analyses a document that is about to become
+    somebody else's.
+
+    Only ever CLEARS, never sets. Turning it on here would let a second submission spend
+    money on a document whose first submission did not ask for it — and a reassign is
+    exactly that shape.
+    """
+    to_clear = [
+        item.id
+        for document_id, item in reused.items()
+        if item.analyze_now and not analyze_now.get(document_id, False)
+    ]
+    if to_clear:
+        session.execute(
+            update(AiProcessingRunItem)
+            .where(AiProcessingRunItem.id.in_(to_clear))
+            .values(analyze_now=False)
+        )
 
 
 def _insert_new_items(
@@ -339,11 +376,13 @@ def create_run(
     # Deduplicate while preserving caller order. First occurrence wins for the intended
     # section: a repeated id in one request is one document, not two.
     intended: dict[int, str | None] = {}
+    analyze_now: dict[int, bool] = {}
     for document in payload.documents:
         intended.setdefault(
             document.document_id,
             document.intended_section.value if document.intended_section else None,
         )
+        analyze_now.setdefault(document.document_id, document.analyze_now)
     unique_ids = list(intended)
 
     filepaths = _source_keys(session, unique_ids)
@@ -394,9 +433,17 @@ def create_run(
         ) from exc
 
     plan = _plan_items(
-        unique_ids, active, latest, validated, payload.force_reprocess, intended, filepaths
+        unique_ids,
+        active,
+        latest,
+        validated,
+        payload.force_reprocess,
+        intended,
+        filepaths,
+        analyze_now,
     )
     created = _insert_new_items(session, run_id, plan.new_rows)
+    _apply_analyze_now_to_reused(session, plan.reused, analyze_now)
 
     # Rows the insert did not return lost the idempotency race to a concurrent
     # submission. ON CONFLICT DO NOTHING means no exception and no lost transaction:
