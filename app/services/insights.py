@@ -50,7 +50,11 @@ PROMPT_VERSION = "ins-2026-08-29"
 #: rules — but payloads either side of the boundary are not comparable in LENGTH, which
 #: is the whole point of the change. Same reasoning ``extraction`` records for ext-3,
 #: which was also a cap move and nothing else.
-SCHEMA_VERSION = "ins-5"
+#: ins-6 raised the ``risk_patterns`` and ``explanation`` caps back to 500 after ins-5's
+#: 350 started rejecting real output. The prompt's word budgets are untouched, so payloads
+#: either side of this boundary ARE comparable — unlike ins-5's, which is why that one is
+#: called out above and this one is recorded rather than explained.
+SCHEMA_VERSION = "ins-6"
 STAGE_NAME = "generating_insights"
 #: Headroom, not a target: the fields are individually capped and a typical report now
 #: lands well under this. Truncation IS detected — ``check_response`` ends the item
@@ -110,17 +114,33 @@ class Insight(BaseModel):
     heading: str = Field(min_length=1, max_length=200)
     #: One or two lines: what this test looks at and what moves it, together. Merged
     #: from two fields that were separately explaining the same thing at length.
-    explanation: str = Field(min_length=1, max_length=350)
+    #:
+    #: 500, raised from 350 alongside ``risk_patterns`` and for the same reason — it is
+    #: the other 40-word field and carried the identical cap, so it fails the identical
+    #: way. Fixed together rather than one at a time.
+    explanation: str = Field(min_length=1, max_length=500)
     #: The Risk Patterns card body: the value against the limit it crossed, then what
     #: that can lead to. Two short lines.
     #:
-    #: 350, down from 500, with the prompt's budget cut 60 -> 40 words in the same
-    #: change. 40 is close to the floor rather than an arbitrary trim: the field carries
-    #: three things — the value, the limit from ``flagged_against``, and the consequence
-    #: — and the prompt's own example spends 24 words on all three. Below about 25 the
-    #: limit citation is what a model drops, and that citation is what stops it quoting a
-    #: number the value never crossed.
-    risk_patterns: str = Field(min_length=1, max_length=350)
+    #: The 40-word budget in the prompt is unchanged and is the product control. This cap
+    #: is a safety net, and **the net firing is worse than the thing it catches**: the
+    #: stage treats a validation failure as transient, so an over-long field costs three
+    #: paid retries and then the reader gets NO insights at all — strictly worse than one
+    #: paragraph running long.
+    #:
+    #: 500, back up from the 350 set on 2026-08-29. That change cut the budget 60 -> 40
+    #: words and moved the cap down "to match", which left only ~8.7 characters per
+    #: budgeted word — and this is the densest field there is, naming a value, a unit, a
+    #: limit and a consequence, and grouping several results when they form one pattern.
+    #: It fired in production on 2026-08-31 (`insights.0.risk_patterns: string_too_long`),
+    #: on the first reports processed after the approved-THP override went on: a tighter
+    #: range flags more results, more results group into one pattern, and the pattern is
+    #: written into this field.
+    #:
+    #: The rule the class docstring states still holds — never tighten a cap without
+    #: tightening the budget with it. What is added here is its other half: never size a
+    #: cap so close to the budget that an ordinary overshoot destroys the payload.
+    risk_patterns: str = Field(min_length=1, max_length=500)
     #: The Suggestions card title — an action, e.g. "Reduce Uric Acid Through Diet".
     suggestion_heading: str = Field(min_length=1, max_length=120)
     #: The Suggestions card body: concrete steps, two or three short lines. Never

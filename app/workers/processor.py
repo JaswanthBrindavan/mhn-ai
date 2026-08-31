@@ -542,6 +542,21 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
         filing.mark_content_failed(session, ctx.item_id)
         return Outcome.CANCELLED
 
+    # The pause was not taken, so the expensive stages are about to run — say so on the
+    # row. Until now `classified` answered two different questions with one word: "filed
+    # and waiting for YOU" and "filed and being read right now". A document uploaded with
+    # "read it straight away" ticked is the second, and looked like the first for the
+    # whole 30-80s the stages take — so the app offered an Analyse button for work already
+    # under way, and pressing it returned 409 already_in_progress.
+    #
+    # One UPDATE against a stage that costs tens of seconds. Every exit below overwrites
+    # it (`complete`, or `failed` via mark_content_failed), so it cannot be left behind.
+    filing.write_content(
+        session,
+        ctx.item_id,
+        assembly.build_content(session, ctx.item_id, state=assembly.ContentState.ANALYSING),
+    )
+
     for step in pipeline:
         if not _run_stage(ctx, session, step):
             filing.mark_content_failed(session, ctx.item_id)

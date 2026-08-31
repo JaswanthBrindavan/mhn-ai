@@ -9,6 +9,7 @@ in one place on purpose.
 import time
 from collections.abc import Callable
 from decimal import Decimal
+from typing import Any
 
 from pydantic import ValidationError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -123,10 +124,35 @@ def check_response(
         )
 
 
+def _measured(err: Any) -> str:
+    """`(len=412, max=350)` for a length failure, and nothing for anything else.
+
+    Two numbers, never the value. A cap that fires costs three paid retries and then the
+    whole payload, so the one thing worth knowing is by how much — and without it the
+    only way to size a new cap is to reason about the prompt's word budget and guess,
+    which is exactly what had to be done when ``risk_patterns`` fired on 2026-08-31.
+
+    Lengths are not report contents: a character count discloses nothing a reader could
+    act on, while the string itself would echo a patient's own results into a log this
+    module exists to keep them out of.
+    """
+    if err.get("type") not in ("string_too_long", "string_too_short"):
+        return ""
+    limit = (err.get("ctx") or {}).get("max_length") or (err.get("ctx") or {}).get("min_length")
+    value = err.get("input")
+    if limit is None or not isinstance(value, str):
+        return ""
+    return f" (len={len(value)}, limit={limit})"
+
+
 def sanitize_validation_error(exc: ValidationError) -> str:
     # Field locations and messages only — never the offending model output/value,
-    # which could echo report contents.
-    parts = [f"{'.'.join(str(p) for p in err['loc'])}: {err['type']}" for err in exc.errors()]
+    # which could echo report contents. `_measured` adds a length where there is one,
+    # which is a number rather than content.
+    parts = [
+        f"{'.'.join(str(p) for p in err['loc'])}: {err['type']}{_measured(err)}"
+        for err in exc.errors()
+    ]
     return "; ".join(parts)[:2000]
 
 

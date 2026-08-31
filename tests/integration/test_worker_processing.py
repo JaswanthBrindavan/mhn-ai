@@ -151,6 +151,72 @@ def _on_demand(test_settings):
     return test_settings.model_copy(update={"analysis_on_demand": True})
 
 
+def test_a_document_being_read_says_so_rather_than_looking_paused(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """`classified` was answering two questions with one word.
+
+    A document uploaded with "read it straight away" ticked is filed with `classified`
+    and then analysed immediately, so for the whole 30-80s the stages take it looked
+    identical to one waiting to be asked about — and the app put an "Analyse document"
+    button in front of work already under way. Pressing it returned 409
+    already_in_progress.
+
+    Asserted from INSIDE a stage, because that is the only moment the value exists: by
+    the time the pipeline returns, the row says `complete`.
+    """
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    # The tick: "read it straight away". This is the case that looked paused — a document
+    # nobody has to press anything for, which the app was asking them to press for.
+    db_session.execute(
+        text("UPDATE ai_processing_run_items SET analyze_now = true WHERE id = :i"),
+        {"i": item_id},
+    )
+    db_session.commit()
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    seen: dict[str, str] = {}
+
+    def _peek(ctx) -> None:
+        seen["state"] = ctx.session.execute(
+            text(
+                "SELECT content FROM reports WHERE id = "
+                "(SELECT section_row_id FROM ai_processing_run_items WHERE id = :i)"
+            ),
+            {"i": ctx.item_id},
+        ).scalar_one()["ai"]["state"]
+
+    monkeypatch.setattr(
+        "app.workers.processor.SECTION_PIPELINES",
+        {DocumentSection.REPORTS: [(RunItemStatus.EXTRACTING, _peek)]},
+    )
+
+    outcome = _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    assert outcome is Outcome.COMPLETED
+    assert seen["state"] == "analysing"
+    # And it does not stay that way: the pipeline finished, so the row is terminal.
+    assert _filed_row(db_session, item_id).content["ai"]["state"] == "complete"
+
+
+def test_a_paused_document_is_not_marked_as_being_read(
+    db_session, make_document, session_factory, test_settings, aws
+):
+    """The other half of the same distinction, and the one the flag exists for.
+
+    Nothing is running, so the row must keep saying `classified` — that is what puts the
+    Analyse button on screen at all.
+    """
+    _, sqs, queue_url, _ = aws
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    _process(sqs, queue_url, session_factory, _on_demand(test_settings), aws)
+
+    assert _filed_row(db_session, item_id).content["ai"]["state"] == "classified"
+
+
 def test_analysis_on_demand_files_the_document_and_stops(
     db_session, make_document, session_factory, test_settings, aws
 ):
@@ -1071,8 +1137,15 @@ def test_a_transient_failure_after_filing_leaves_the_content_classified(
     db_session, make_document, session_factory, test_settings, aws, monkeypatch
 ):
     """The mirror of the failed-stamping tests: the document is about to be RETRIED, so
-    its content must keep saying `classified`. Stamping `failed` here would flash a
-    permanent-looking failure at the user for every provider blip."""
+    its content must NOT say `failed`. Stamping that here would flash a
+    permanent-looking failure at the user for every provider blip.
+
+    It says `analysing` rather than `classified`, and that is the honest answer: the
+    stages started, one blipped, and a redelivery is coming. `classified` would claim
+    nobody is working on it and put an "Analyse document" button in front of a user for
+    a document that is mid-flight — which is the bug `ContentState.ANALYSING` exists to
+    fix. Nothing is stranded either way: the attempt cap ends the item `failed` through
+    `mark_content_failed`, and the retry endpoint is the recovery path from there."""
     _, sqs, queue_url, _ = aws
     item_id, run_id, document_id = _seed_item(db_session, make_document)
     publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
@@ -1090,7 +1163,9 @@ def test_a_transient_failure_after_filing_leaves_the_content_classified(
     assert outcome is Outcome.RETRY
     # Filed — that part is durable and must survive the retry.
     assert _item(db_session, item_id)["section_row_id"] is not None
-    assert _filed_row(db_session, item_id).content["ai"]["state"] == "classified"
+    state = _filed_row(db_session, item_id).content["ai"]["state"]
+    assert state == "analysing"
+    assert state != "failed"  # spelt out: this is what the test is really about
     # And the message is still on the queue to be retried.
     assert _queue_depth(sqs, queue_url) == 1
 
