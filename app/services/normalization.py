@@ -54,11 +54,16 @@ def parse_number(value: str | None) -> float | None:
 #: ever found, selecting "female" matched nothing, and the result went unflagged. A
 #: genuinely high serum copper (162.22 against a female ceiling of 155) came back with no
 #: flag that way on a real report.
+#: "Men"/"Women" as well as "Male"/"Female": GGT printed `Men: 8 - 61 Women : 5 - 36`
+#: and came back unflagged for want of the other two words. Note both `\b`s hold --
+#: "male" inside "Female" and "men" inside "Women" are each preceded by a word
+#: character, so neither can match there.
+_SEX_WORDS = r"females?|males?|women|men"
 _GENDER_SEGMENT_RE = re.compile(
-    r"\b(?P<gender>male|female)\s*:\s*(?P<range>.+?)"
-    r"(?=[,;]|\bmale\s*:|\bfemale\s*:|$)",
+    rf"\b(?P<gender>{_SEX_WORDS})\s*:\s*(?P<range>.+?)(?=[,;]|\b(?:{_SEX_WORDS})\s*:|$)",
     re.I,
 )
+_FEMALE_WORDS = frozenset({"female", "females", "women"})
 #: A leading qualifier ("Desirable : 2.5-3.0", "Adult : 17-43") or a trailing one
 #: (">= 90 : Normal"). The label is context for a human, noise for the bounds.
 _LEADING_LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z ]{0,24}:\s*")
@@ -133,20 +138,67 @@ def _normal_band(bands: list[tuple[str, str]]) -> str | None:
     return None
 
 
+#: The two grades that, together and alone, bound a band without naming it.
+_LOW_GRADE, _HIGH_GRADE = "low", "high"
+
+
+def _gap_between_grades(bands: list[tuple[str, str]]) -> tuple[float, float] | None:
+    """The unnamed band between a low threshold and a high one, for a scale that names
+    only its abnormal grades.
+
+    HDL prints ``Low: < 40, High: > 60`` and never names the band in between — so
+    ``_normal_band`` refuses it and a perfectly normal 50 came back "Not checked" on a
+    real report. Two thresholds pointing opposite ways with nothing between them describe
+    exactly one band, and it is the one the report is asking about.
+
+    Everything about this is deliberately narrow, because the failure mode on the other
+    side is a confident wrong flag:
+
+    * **exactly two bands**, so a scale with a middle grade the report DID name and did
+      not call normal ("Borderline") is refused rather than assumed fine;
+    * **the labels are exactly "low" and "high"**, so a risk ladder ("Low Risk: 3.3-4.4
+      … High Risk: > 11.0") is untouched — a value under "Low Risk" is better than low
+      risk, not abnormal, and the printed 2.5 must stay unflagged;
+    * **one-sided thresholds only**, pointing outwards, and the low one must not sit
+      above the high one.
+
+    # ponytail: two labels, not a vocabulary. Widen only against a report that prints
+    # the wider wording — every label added here is a chance to flag a ladder.
+    """
+    if len(bands) != 2:
+        return None
+    lows = [band for label, band in bands if label.strip().lower() == _LOW_GRADE]
+    highs = [band for label, band in bands if label.strip().lower() == _HIGH_GRADE]
+    if len(lows) != 1 or len(highs) != 1:
+        return None
+    floor = _UPPER_RE.match(_clean_range_text(lows[0]))
+    ceiling = _LOWER_RE.match(_clean_range_text(highs[0]))
+    if floor is None or ceiling is None:
+        return None
+    low, high = float(floor.group(1)), float(ceiling.group(1))
+    return (low, high) if low <= high else None
+
+
 def _select_gender_range(text: str, gender: str | None) -> str | None:
     """The segment for this patient's sex, or None when the choice can't be made.
 
-    A gender-split range is unusable without knowing the sex — returning either half
+    A gender-SPLIT range is unusable without knowing the sex — returning either half
     would flag against the wrong bounds, so an unknown sex stays unparsed.
+
+    **One labelled half is a label, not a split**, and is handed on to the
+    label-stripping below: "Males: 0.70 - 1.20" has no other half to choose wrongly, so
+    an unknown sex costs nothing there. Same rule as ``_scale_bands`` — one is not a
+    scale. It was already the behaviour, but by accident: the old pattern did not match
+    a trailing "s", so `Males:` fell through and `Male:` did not.
     """
     segments: list[tuple[str, str]] = _GENDER_SEGMENT_RE.findall(text)
-    if not segments:
+    if len(segments) < 2:
         return text
     if not gender:
         return None
-    wanted = "female" if gender.strip().lower().startswith("f") else "male"
+    wants_female = gender.strip().lower().startswith("f")
     for found, range_text in segments:
-        if found.lower() == wanted:
+        if (found.strip().lower() in _FEMALE_WORDS) == wants_female:
             return range_text.strip()
     return None
 
@@ -155,8 +207,12 @@ def _clean_range_text(text: str) -> str:
     """Strip the decoration labs print around bounds, leaving the numeric core."""
     s = text.strip()
     s = _TRAILING_LABEL_RE.sub("", s)
-    if not _GENDER_SEGMENT_RE.match(s):  # a gender label is selected, never stripped
-        s = _LEADING_LABEL_RE.sub("", s)
+    # A sex label is stripped here like any other. It used to be guarded against, on the
+    # reasoning that a gender label is *selected* rather than stripped — but by the time
+    # this runs `_select_gender_range` has already returned the chosen half, which
+    # carries no label. The guard was unreachable, and became actively wrong the moment a
+    # single "Men: 8 - 61" was allowed through as a label.
+    s = _LEADING_LABEL_RE.sub("", s)
     s = _RATIO_RE.sub(r"\1", s)
     for pattern, replacement in _WORD_COMPARATORS:
         s = re.sub(pattern, replacement, s, flags=re.I)
@@ -184,7 +240,9 @@ def parse_reference_range(
     if bands := _scale_bands(selected):
         normal = _normal_band(bands)
         if normal is None:
-            return None
+            # A scale may bound its normal band without naming it — see
+            # _gap_between_grades, which returns None for every other unnamed shape.
+            return _gap_between_grades(bands)
         selected = normal
     s = _clean_range_text(selected)
     if m := _RANGE_RE.match(s):

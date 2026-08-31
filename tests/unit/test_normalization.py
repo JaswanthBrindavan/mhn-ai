@@ -397,3 +397,101 @@ def test_not_done_is_never_read_as_not_detected() -> None:
     for spelling in ("Nil", "Absent", "Not Detected", "Negative"):
         checked = enrich_result({**row, "value": spelling})
         assert checked["abnormal_flag"] == "normal", spelling
+
+
+# --- shapes a real report printed and this parser could not read -------------
+#
+# Document 83, a 65-test panel from one lab, came back with four results carrying a
+# printed range and no flag. Two of them are readable and are fixed below; the other
+# two are genuinely ambiguous and must stay unflagged. An unflagged result is
+# recoverable, a wrong flag is not -- so the line between the pairs is the point of
+# these tests, not the four cases individually.
+
+
+def _flag_for(value, ref, gender):
+    return enrich_result({"test_name": "T", "value": value, "reference_range": ref}, gender=gender)[
+        "abnormal_flag"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("50", "normal"),  # the reported case: HDL 50 read as "Not checked"
+        ("40", "normal"),  # "Low: < 40" means 40 itself is not low
+        ("60", "normal"),  # and "High: > 60" means 60 itself is not high
+        ("39", "low"),
+        ("61", "high"),
+    ],
+)
+def test_a_scale_naming_only_its_abnormal_grades_puts_normal_in_the_gap(value, expected):
+    """HDL prints `Low: < 40, High: > 60`, and never names the band in between.
+
+    Every other scale this parser reads names its normal grade, and `_normal_band`
+    refuses one that does not -- correctly, because taking an arbitrary band's bound is
+    how a healthy value came back "high" before. But a low threshold and a high
+    threshold with nothing between them describe exactly one band, and it is the one the
+    report is asking about.
+    """
+    assert _flag(value, "Low: < 40, High: > 60") == expected
+
+
+def test_the_gap_is_only_read_when_two_grades_actually_bound_one():
+    """The refusals matter more than the reading, so they are spelt out.
+
+    Each of these would produce a plausible-looking wrong flag if the rule above were
+    any looser, and the first is from the same report as the HDL case.
+    """
+    # A RISK ladder, not a low/high pair: "Low Risk" is a grade of its own and a value
+    # under it is better than low risk, not abnormal. Chol/HDL Ratio 2.5 on document 83.
+    ladder = (
+        "Low Risk: 3.3 - 4.4 Average Risk: 4.5 - 7.1 Moderate Risk: 7.2 - 11.0 High Risk : > 11.0"
+    )
+    assert parse_reference_range(ladder) is None
+    # Grades that name neither end of anything.
+    assert parse_reference_range("Grade I: <10 Grade II: 10-20 Grade III: >20") is None
+    # Two thresholds pointing the same way bound nothing.
+    assert parse_reference_range("Low: < 40, High: < 60") is None
+    # Crossed thresholds are a contradiction, not a band.
+    assert parse_reference_range("Low: < 60, High: > 40") is None
+    # A middle grade the report did name, and did not call normal -- refused, because
+    # "Borderline" is not a claim that the band is fine.
+    assert parse_reference_range("Low: <40 Borderline: 40-60 High: >60") is None
+
+
+def test_a_sex_split_written_as_men_and_women():
+    """The same split in different words, and the words were all that stopped it.
+
+    GGT printed `Men: 8 - 61 Women : 5 - 36` on document 83 and came back unflagged.
+    CLAUDE.md already records that a range SHAPE the parser cannot read silently loses a
+    result, and that shapes are a property of each lab's template -- this is that, in the
+    vocabulary rather than the punctuation.
+    """
+    split = "Men: 8 - 61 Women : 5 - 36"
+    assert parse_reference_range(split, "M") == (8.0, 61.0)
+    assert parse_reference_range(split, "Female") == (5.0, 36.0)
+    assert parse_reference_range(split) is None
+    assert _flag_for("15.60", split, "M") == "normal"
+    # 15.6 is inside the male band and well inside the female one; 62 separates them.
+    assert _flag_for("62", split, "M") == "high"
+    assert _flag_for("62", split, "F") == "high"
+    assert _flag_for("6", split, "M") == "low"
+    assert _flag_for("6", split, "F") == "normal"
+
+
+def test_one_sex_label_is_a_label_and_not_a_split():
+    """There is no other half to choose wrongly, so an unknown sex costs nothing here.
+
+    Document 83 printed both spellings -- `Males: 0.70 - 1.20` for creatinine and
+    `Men: 8 - 61` for GGT's male half -- and only the first parsed, because the segment
+    pattern happened not to match a trailing "s". Same rule as `_scale_bands`: one is not
+    a split.
+    """
+    for single in ("Males: 0.70 - 1.20", "Male: 0.70 - 1.20"):
+        assert parse_reference_range(single) == (0.7, 1.2)
+        assert parse_reference_range(single, "M") == (0.7, 1.2)
+        assert parse_reference_range(single, "F") == (0.7, 1.2)
+    assert parse_reference_range("Men: 8 - 61") == (8.0, 61.0)
+    assert parse_reference_range("Women : 5 - 36") == (5.0, 36.0)
+    # Two halves still refuse an unknown sex -- that is the case this one is not.
+    assert parse_reference_range("Male: 65-175, Female: 50-170") is None
