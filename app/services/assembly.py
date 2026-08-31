@@ -37,8 +37,23 @@ class ContentState(StrEnum):
     null fields.
     """
 
-    #: Filed, classification recorded, nothing extracted yet.
+    #: Filed, classification recorded, nothing extracted yet — and nobody is working on
+    #: it. **Waiting for the user**, not waiting for us.
     CLASSIFIED = "classified"
+    #: Filed, and the expensive stages are running right now.
+    #:
+    #: Split out of ``classified`` on 2026-08-31, because that one value was answering two
+    #: questions. A document uploaded with "read it straight away" ticked is filed with
+    #: ``classified`` and then analysed immediately — so for the 30-80s the stages take it
+    #: looked exactly like a document waiting to be asked about, and the app offered an
+    #: "Analyse document" button for work already under way. Pressing it got a 409.
+    #:
+    #: Not a run-item status, deliberately: those cost a CHECK-constraint migration in
+    #: Spring's repo, a rewrite of the partial unique index, and an exemption from the
+    #: reaper. This is a JSONB value nothing branches on, and every path that ends a
+    #: pipeline already overwrites it — ``complete`` on success, ``failed`` through
+    #: ``mark_content_failed`` on a failure, a cancel or a give-up — so it cannot strand.
+    ANALYSING = "analysing"
     #: The pipeline finished.
     COMPLETE = "complete"
     #: Filed, but the pipeline did not finish (failed, gave up, or was cancelled).
