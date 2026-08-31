@@ -105,11 +105,42 @@ class Settings(BaseSettings):
     # --- Ideal ranges (approved-THP override) -------------------------------
     # When on, extraction overrides the report's reference range with the R&D-approved
     # ideal range for the patient's age bracket (Spring-owned THP tables:
-    # traditional_health_parameters / thp_age_range / thp_alternate_units). OFF by default:
-    # the tables ship in Spring's migration but are not in every database this service
-    # points at, and an empty master would send every test to the fallback worklist. Flip
-    # on once they exist and carry approved rows. See app/services/ideal_ranges.py.
-    ideal_ranges_enabled: bool = False
+    # traditional_health_parameters / thp_alias / thp_age_range / thp_alternate_units).
+    #
+    # ON by default since 2026-08-31. It shipped off because the master was empty, and an
+    # empty master sends every test to the fallback worklist and changes nothing else.
+    # Spring's V18 seeded it — 193 parameters, 1184 aliases, 277 age/sex ranges, 149 of
+    # them approved and AI-integrated — so that reason is gone, and a default of False
+    # meant the code that reads all of it had never once run in production. That was not
+    # a suspicion: `ai_thp_fallbacks` was EMPTY, and it cannot be empty once this runs.
+    #
+    # **Every miss falls back and is logged**, which is what makes turning it on safe
+    # rather than a leap: unmatched, unapproved, no bracket for the age or sex, or a unit
+    # with no curated conversion all leave the report's own printed range in charge and
+    # write a row to `ai_thp_fallbacks`. That table is the R&D worklist, and until now it
+    # has been answering a question nobody ever asked it.
+    #
+    # What DOES change: an ideal range is tighter than a lab's reference range by design,
+    # so a result that read "normal" against the printed range can now read high or low.
+    # That is the product decision, not a side effect of it.
+    #
+    # `thp_alternate_units` is still empty, so a report printing anything but a
+    # parameter's own unit falls back. Measured against one real 65-test panel that is
+    # the four absolute counts (`Cells/cumm` against a curated `10³/mm³`, a factor of
+    # 1000 apart) and the platelet count — all of which fall back correctly rather than
+    # being compared across units, which is the behaviour worth having while the
+    # conversion table is bare.
+    #
+    # Kept as an emergency stop, like the other three flags. Off degrades SAFELY: every
+    # flag is computed against the printed range exactly as it was before this ran.
+    #
+    # **The ordering constraint, and it is why this was not flipped sooner:** anything
+    # showing a limit beside a flag has to read `flagged_against`, never
+    # `reference_range`. With the override on those are different numbers, and the
+    # printed one is a limit the value never crossed. mhn-spring's `AiMarkers` and
+    # mhn-react's `ResultsTable` both read the printed one and had to be fixed first —
+    # deploy them before or with this, never after.
+    ideal_ranges_enabled: bool = True
 
     # --- Prescriptions ------------------------------------------------------
     # When on, a document classified as a prescription is filed into Spring's

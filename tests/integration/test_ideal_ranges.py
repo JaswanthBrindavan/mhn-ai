@@ -132,6 +132,12 @@ def _enabled(settings):
     return settings.model_copy(update={"ideal_ranges_enabled": True})
 
 
+def _disabled(settings):
+    """Stated, not inherited. The flag defaults ON since 2026-08-31, so a test about what
+    "off" does has to say so — otherwise it silently becomes a second test of "on"."""
+    return settings.model_copy(update={"ideal_ranges_enabled": False})
+
+
 def _payload(
     test_name: str,
     value: str,
@@ -363,7 +369,7 @@ def test_flag_off_is_unchanged_and_writes_no_worklist(
     # Same value/range as the override test, but the flag is OFF -> report range wins.
     ai = FakeAIProvider(response=structured_response(_payload(GLUCOSE, "95", "70-99")))
 
-    extract_report(_context(db_session, aws, test_settings, document_id, item_id, ai))
+    extract_report(_context(db_session, aws, _disabled(test_settings), document_id, item_id, ai))
 
     result = _result(db_session, item_id)
     assert result["range_source"] == "report_range"
