@@ -27,3 +27,14 @@ def test_analysis_on_demand_is_on_by_default():
     made, pinned here so a future edit has to be deliberate.
     """
     assert Settings(**BASE).analysis_on_demand is True
+
+
+def test_ideal_ranges_are_on_by_default():
+    """The R&D-approved ideal range is the product; the printed range is the fallback.
+
+    Off by default meant the code that reads the whole THP catalogue had never run in
+    production, and the evidence was `ai_thp_fallbacks` sitting empty — a table that
+    exists to tell R&D which parameters still need curating, answering a question nothing
+    had ever asked it. Pinned here so a future edit has to be deliberate.
+    """
+    assert Settings(**BASE).ideal_ranges_enabled is True
