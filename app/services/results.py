@@ -309,6 +309,11 @@ def retry_document(
                     intended_section=(
                         DocumentSection(item.intended_section) if item.intended_section else None
                     ),
+                    # Same reasoning, and it only bites on a document that was never filed
+                    # — one that failed during classification, say. A filed one skips the
+                    # pause because the pipeline sees it as resumed. Retry is owner-only in
+                    # Spring, so this can never carry a tick across a change of owner.
+                    analyze_now=bool(item.analyze_now),
                 )
             ]
         ),
@@ -576,6 +581,22 @@ def confirm_identity(
                     intended_section=(
                         DocumentSection(item.intended_section) if item.intended_section else None
                     ),
+                    # And not about whether they wanted it read, which is the other half of
+                    # that same sentence.
+                    #
+                    # `analyze_now` is per attempt and never inherited, so this new item
+                    # would default to false and the document would file and stop —
+                    # discarding a tick the user made at upload and asking them to press
+                    # Analyse for something they had already asked for. It is the ONLY
+                    # re-submission where that happens: every other one is of a document
+                    # that was already FILED, and a filed document skips the pause anyway.
+                    #
+                    # The rule this looks like an exception to is not one. "Never
+                    # inherited" exists so an uploader's tick cannot follow a document into
+                    # somebody else's wallet — that is `reassign`, where the OWNER changes
+                    # and Spring publishes false. Here the owner is the same person, saying
+                    # the document was theirs all along.
+                    analyze_now=bool(item.analyze_now),
                 )
             ]
         ),

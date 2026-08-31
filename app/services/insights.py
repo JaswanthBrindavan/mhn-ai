@@ -44,7 +44,12 @@ from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ins-2026-08-29"
+#: ins-2026-08-31 rewrote the `suggestions` guidance. It listed "name real foods, name
+#: the follow-up test, give the retest gap" as three equal things, and a model can satisfy
+#: that with the last two — so most suggestions came back as nothing but "get retested in
+#: N weeks", which is nothing to do for N weeks. Lifestyle first is now the rule, a test is
+#: the last line, and inventing a diet for a marker diet does not move is banned outright.
+PROMPT_VERSION = "ins-2026-08-31"
 #: ins-5 shortened ``risk_patterns`` (60 -> 40 words) and ``summary`` (unbudgeted -> 60),
 #: with their caps moved down to match. The shape is unchanged — same five fields, same
 #: rules — but payloads either side of the boundary are not comparable in LENGTH, which
@@ -145,7 +150,15 @@ class Insight(BaseModel):
     suggestion_heading: str = Field(min_length=1, max_length=120)
     #: The Suggestions card body: concrete steps, two or three short lines. Never
     #: medication, dosage, or starting/stopping a drug.
-    suggestions: str = Field(min_length=1, max_length=500)
+    #:
+    #: 700, raised with the ins-2026-08-31 prompt and because of it. This field now has to
+    #: carry a lifestyle change AND the follow-up, where before a model could satisfy the
+    #: instruction with the follow-up alone — so the same 60-word budget is being asked to
+    #: hold more, against what was the tightest cap-to-budget ratio left (8.3 characters
+    #: per budgeted word). Raising it in the same change is the point: the failure this
+    #: whole set of comments exists for is a cap that fires because the budget moved
+    #: underneath it.
+    suggestions: str = Field(min_length=1, max_length=700)
     #: Test names from the extraction this insight refers to.
     related_tests: list[str] = Field(default_factory=list)
 
@@ -247,10 +260,22 @@ SYSTEM_PROMPT = (
     "- suggestion_heading: the Suggestions card title. An action, AT MOST 6 WORDS: "
     "'Cut Down Uric Acid Through Food'. 'Check for Low Iron'.\n"
     "- suggestions: TWO OR THREE SHORT LINES, AT MOST 60 WORDS, of things to "
-    "actually do. Name real foods, name the follow-up test, give the "
-    "retest gap. 'Eat less red meat, organ meat and "
-    "shellfish, and cut back on alcohol. Drink more water. Get uric acid checked again "
-    "in 4 to 6 weeks.' Say what to do, not who to ask.\n"
+    "actually do. Say what to do, not who to ask.\n"
+    "  START with what the reader can change THEMSELVES — food, drink, movement, sleep, "
+    "sunlight, weight, alcohol, tobacco — named specifically. 'Eat better' and 'improve "
+    "your diet' are not suggestions; 'eat more spinach, rajma and dates' is. Name foods "
+    "and habits an ordinary Indian household already recognises.\n"
+    "  A FOLLOW-UP TEST IS THE LAST LINE, NEVER THE WHOLE ANSWER. A reader told only to "
+    "get retested in six weeks has been given nothing to do for six weeks, which is "
+    "exactly the stretch where a change would show. Give the retest gap once the "
+    "actions are there.\n"
+    "  Where the marker genuinely has no lifestyle lever — most red-cell indices, "
+    "platelet size and distribution, a ratio derived from other results — say so plainly "
+    "in a few words and give the follow-up instead. **Do not invent a diet for a number "
+    "that diet does not move**: a made-up food fix is worse than admitting there is "
+    "none, because the reader will follow it and believe they are treating something.\n"
+    "  'Eat less red meat, organ meat and shellfish, and cut back on alcohol. Drink more "
+    "water. Get uric acid checked again in 4 to 6 weeks.'\n"
     "  BANNED here, because they are true of every result and so say nothing: 'discuss "
     "this with your doctor', 'ask a clinician', 'consult a healthcare professional', "
     "'interpret alongside your other results', 'a clinician can advise'. A disclaimer "
