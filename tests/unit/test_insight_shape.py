@@ -9,8 +9,11 @@ import pytest
 from pydantic import ValidationError
 
 from app.services.insights import (
+    FIELD_LIMITS,
     INSIGHTS_JSON_SCHEMA,
     INSIGHTS_MAX_TOKENS,
+    SYSTEM_PROMPT,
+    DocumentInsights,
     Insight,
 )
 
@@ -61,43 +64,68 @@ def test_the_json_schema_matches_the_model() -> None:
     )
 
 
-#: The word budget the prompt states for each capped field. The caps must sit ABOVE these
-#: with real headroom — see `_CHARS_PER_WORD` below.
-PROMPT_WORD_BUDGETS = {
-    "explanation": 40,
-    "risk_patterns": 40,
-    "suggestions": 60,
-    "suggestion_heading": 6,
-}
+def _pydantic_cap(field: str) -> int:
+    """The validator's ceiling for one field.
 
-#: Characters of headroom per budgeted word. Not a style preference — the arithmetic of a
-#: failure that has already happened once. `risk_patterns` sat at 8.7 and rejected real
-#: output in production (`insights.0.risk_patterns: string_too_long`), and because this
-#: stage treats a validation failure as TRANSIENT that cost three paid retries and then a
-#: report with no insights at all. Medical prose spends characters fast: test names, units
-#: and a cited limit are long tokens, and one insight may group several results.
-_CHARS_PER_WORD = 11
+    `summary` is a property of the whole payload rather than of one insight, which is why
+    it lives on a different model — and it is the field that most recently blew its cap,
+    so leaving it out of these checks would miss the case they were written for.
 
-
-def test_every_cap_sits_above_the_budget_the_prompt_states() -> None:
-    """The rule that was broken, expressed as arithmetic rather than as four numbers.
-
-    The class docstring already says never to tighten a cap without tightening the
-    prompt's budget with it. This is the other half: a cap is a SAFETY NET, and the net
-    firing is worse than the thing it catches — the reader gets nothing at all, instead of
-    one paragraph running long. Tighten a budget here and this test tells you which cap
-    has to move with it.
+    The constraints arrive as a list of annotated-types markers (MinLen, MaxLen) in
+    declaration order, so this looks one up by attribute rather than by position — which
+    would silently read min_length the day someone reorders them.
     """
-    for field, words in PROMPT_WORD_BUDGETS.items():
-        # The constraints come through as a list of annotated-types markers (MinLen,
-        # MaxLen), in declaration order — so it is looked up by attribute rather than by
-        # position, which would silently read min_length the day someone reorders them.
-        cap = next(
-            m.max_length for m in Insight.model_fields[field].metadata if hasattr(m, "max_length")
+    model = DocumentInsights if field == "summary" else Insight
+    return next(
+        m.max_length for m in model.model_fields[field].metadata if hasattr(m, "max_length")
+    )
+
+
+def test_the_model_is_told_every_limit_it_is_validated_against() -> None:
+    """The bug behind three thrown-away payloads in one day.
+
+    A character limit existed only in the Pydantic model; the prompt asked for a WORD
+    budget. Output was rejected for breaking a rule that had never been stated in the unit
+    it was measured in — and because a validation failure here is TRANSIENT, that cost
+    three paid retries and then a report with no insights at all. `summary` came back at
+    779 against 700.
+
+    The prompt is the ONLY place this can be said. Anthropic's structured outputs do not
+    support `maxLength`, so it cannot be put in the schema and enforced — see
+    FIELD_LIMITS. Change a limit and this test fails until the prompt says so too.
+    """
+    for field, limit in FIELD_LIMITS.items():
+        assert f"{limit} CHARACTERS" in SYSTEM_PROMPT, (
+            f"{field} is validated against {limit} characters and the prompt never says "
+            f"so. The model cannot be constrained to a length — only asked — so a limit "
+            f"missing from the prompt is a limit that exists nowhere the model can see."
         )
-        assert cap >= words * _CHARS_PER_WORD, (
-            f"{field} is capped at {cap} against a stated budget of {words} words "
-            f"({cap / words:.1f} chars/word). An ordinary overshoot destroys the payload."
+
+
+def test_the_schema_claims_no_length_it_cannot_enforce() -> None:
+    """`maxLength` in this schema would be silently stripped by the SDK before sending.
+
+    It reads as a guarantee and is not one, which is worse than its absence: someone would
+    then tighten the validator towards it, on the theory that generation is constrained.
+    Tried on 2026-08-31, caught before it shipped.
+    """
+    item = INSIGHTS_JSON_SCHEMA["properties"]["insights"]["items"]["properties"]
+    for node in (*item.values(), INSIGHTS_JSON_SCHEMA["properties"]["summary"]):
+        assert "maxLength" not in node
+        assert "minLength" not in node
+
+
+def test_the_validator_sits_well_above_the_limit_the_model_is_given() -> None:
+    """The two numbers do different jobs, and conflating them is what kept breaking.
+
+    `FIELD_LIMITS` is the product decision and reaches the model. The Pydantic cap only
+    decides whether to throw the answer away — so it belongs where that is worth doing: an
+    answer twice as long as asked is broken, one slightly over is just long.
+    """
+    for field, stated in FIELD_LIMITS.items():
+        assert _pydantic_cap(field) > stated, (
+            f"{field}'s validator cap is not above the limit the model is given, so an "
+            "ordinary overshoot destroys the payload rather than merely reading long."
         )
 
 
