@@ -327,15 +327,26 @@ def _finish(db_session, item_id) -> None:
     db_session.flush()
 
 
-def test_adopt_prior_copies_the_whole_classification_onto_a_new_item(
+def test_adopt_prior_copies_the_reading_but_not_the_verdict(
     db_session, make_document, aws, test_settings
 ):
-    """A resumed or retried document takes the classification it already has.
+    """A resumed or retried document takes the READING it already has, and nothing else.
 
-    Tested here rather than only through the worker, because two of these fields are also
-    restored downstream by identity._carry_settled -- so a worker-level test passes even
-    if this function drops them, and would go on passing until someone switched name
-    matching off.
+    `patient_name` is part of the reading: it is printed on the page and does not change.
+    `name_match` and `identity_confirmed_at` are a judgement about the ACCOUNT the
+    document is being filed into, and a reassignment changes that account -- so copying
+    them could carry a "mismatch" computed against the previous owner into the new
+    owner's pass and refuse the document in the wallet it belongs to.
+
+    Tested here rather than only through the worker, because `identity.gate` writes both
+    fields back straight afterwards (`_carry_settled`) whenever a verdict is settled. A
+    worker-level test therefore cannot see the difference, and the one case where it
+    shows is the one nobody would think to look at: `NAME_MATCHING_ENABLED` off, where
+    the gate returns before writing anything and the resumed row keeps a null verdict.
+    Null is the honest value there -- that flag's contract is that the document behaves
+    as it did before the feature existed -- and the user's confirmation is not lost
+    either way, because `identity.settled_row` looks across every row for the document
+    rather than only the newest.
     """
     document_id = make_document()
     first_item = _seed_item(db_session, document_id)
@@ -359,14 +370,13 @@ def test_adopt_prior_copies_the_whole_classification_onto_a_new_item(
         classification.adopt_prior(db_session, item_id=second_item, document_id=document_id) is True
     )
 
-    columns = (
-        "section, title, confidence, reasoning, patient_name, name_match, "
-        "identity_confirmed_at, document_date, document_date_label, prompt_version, "
-        "schema_version"
+    reading = (
+        "section, title, confidence, reasoning, patient_name, document_date, "
+        "document_date_label, prompt_version, schema_version"
     )
     rows = [
         db_session.execute(
-            text(f"SELECT {columns} FROM ai_report_classifications WHERE run_item_id = :i"),
+            text(f"SELECT {reading} FROM ai_report_classifications WHERE run_item_id = :i"),
             {"i": item},
         ).one()
         for item in (second_item, first_item)
@@ -374,7 +384,17 @@ def test_adopt_prior_copies_the_whole_classification_onto_a_new_item(
     assert rows[0] == rows[1]
     # Spelt out so the equality above cannot pass on two rows of nulls.
     assert rows[0].document_date == date(2026, 3, 12)
-    assert rows[0].identity_confirmed_at is not None
+    assert rows[0].patient_name == "PRIYA MENON"
+
+    verdict = db_session.execute(
+        text(
+            "SELECT name_match, identity_confirmed_at FROM ai_report_classifications "
+            "WHERE run_item_id = :i"
+        ),
+        {"i": second_item},
+    ).one()
+    assert verdict.name_match is None
+    assert verdict.identity_confirmed_at is None
 
 
 def test_adopting_records_no_process_log_and_no_fresh_version(
