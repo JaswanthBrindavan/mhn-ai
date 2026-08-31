@@ -11,7 +11,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -337,9 +337,9 @@ def _adopt_or_classify(ctx: StageContext) -> None:
     ``ai_process_logs`` row, because no model was called and the log is the record of what
     was spent.
 
-    The fallback is defensive rather than expected: a filed document was classified before
-    it could be filed. If that row is ever missing, reading the document again is better
-    than failing the pass.
+    The fallback is defensive rather than expected: this only runs when a previous item is
+    known to have read the document. If that row is ever missing, reading it again is
+    better than failing the pass.
     """
     if classification.adopt_prior(ctx.session, item_id=ctx.item_id, document_id=ctx.document_id):
         return
@@ -358,9 +358,14 @@ _ADOPT_STAGE: StageStep = (RunItemStatus.CLASSIFYING, _adopt_or_classify)
 def _already_filed(session: Session, document_id: int) -> bool:
     """Has some earlier run item filed this document into a section table?
 
-    True means this pass is a resume or a retry, not an upload. Both differ from a first
-    pass in the same two ways: the pipeline must not stop for the user again, and the
-    classification can be adopted rather than re-read.
+    True means the document is already in a section, so this pass must not stop for the
+    user again — they have already asked for it.
+
+    Narrower than ``_reading_already_made`` below, and deliberately kept apart from it. A
+    name-mismatched document that the user then claims is a resumption for the purpose of
+    the READING and an upload for the purpose of the PAUSE: they answered a question about
+    whose it is, which is not the same as asking for it to be analysed. Collapsing the two
+    would spend money nobody asked for.
     """
     return (
         session.execute(
@@ -368,6 +373,42 @@ def _already_filed(session: Session, document_id: int) -> bool:
             .where(
                 AiProcessingRunItem.document_id == document_id,
                 AiProcessingRunItem.section_row_id.is_not(None),
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
+def _reading_already_made(session: Session, document_id: int) -> bool:
+    """Has an earlier item read this document on a pass that re-reading cannot improve?
+
+    Two cases, and they are one case seen from either side of filing:
+
+    * the document was **filed** — the reading is committed, a section row exists for it,
+      and a second reading landing differently could only disagree with a row that cannot
+      be moved (``filing._adopt_prior_filing``'s ``section_changed_on_retry``);
+    * the document was stopped by the **identity gate**. The reading was fine; what
+      stopped it was a question about whose document it is, and ``/confirm-identity``,
+      Spring's ``/reassign`` and a hand move all answer that question and no other. The
+      gate refuses *before* filing, which is exactly why the first case did not cover this
+      one — and why ``ai_process_logs`` carried two ``classifying`` rows for nearly every
+      document in production.
+
+    Deliberately NOT every terminal state. A retry of a document rejected as ``unknown``
+    is someone asking for it to be read AGAIN, usually after a prompt or model change, and
+    adopting there would turn the one endpoint that can rescue it into a no-op. A document
+    that failed *during* classification has no row to adopt and reads again on its own.
+    """
+    return (
+        session.execute(
+            select(AiProcessingRunItem.id)
+            .where(
+                AiProcessingRunItem.document_id == document_id,
+                or_(
+                    AiProcessingRunItem.section_row_id.is_not(None),
+                    AiProcessingRunItem.last_error_code == "name_mismatch",
+                ),
             )
             .limit(1)
         ).first()
@@ -387,12 +428,18 @@ def _run_pipeline(ctx: StageContext, session: Session) -> Outcome:
     The pipeline's shape is chosen *after* classification because the section decides it:
     a report is extracted and interpreted, a section document is transcribed and stops.
     """
-    # A document a previous item already filed is being resumed or retried, not uploaded.
-    # Two things follow: it must not stop for the user again — they have already asked for
-    # this pass — and its classification is adopted rather than read a second time.
+    # A document a previous item already filed is being resumed or retried, not uploaded:
+    # it must not stop for the user again, because they have already asked for this pass.
     resumed = _already_filed(session, ctx.document_id)
 
-    if not _run_stage(ctx, session, _ADOPT_STAGE if resumed else CLASSIFY_STAGE):
+    # Whether to READ the document is a different question, and a wider one: a document
+    # the identity gate refused was read perfectly well and never filed, so it is adopted
+    # here while still pausing above. See _reading_already_made.
+    if not _run_stage(
+        ctx,
+        session,
+        _ADOPT_STAGE if _reading_already_made(session, ctx.document_id) else CLASSIFY_STAGE,
+    ):
         return Outcome.CANCELLED
     # Re-checked here specifically: routing reads the classification row *unguarded*, and a
     # cancel landing while the stage ran would otherwise be seen as a missing row. The

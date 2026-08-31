@@ -387,6 +387,15 @@ def adopt_prior(session: Session, *, item_id: UUID, document_id: int) -> bool:
     was made under this version, and claiming one would put a lie in the audit trail — the
     rule that makes a skipped insights stage record ``"skipped"`` rather than the
     configured model.
+
+    **What is copied is the READING, never the verdict.** ``patient_name`` is part of the
+    reading — it is printed on the page and does not change — but ``name_match`` and
+    ``identity_confirmed_at`` are a judgement about the ACCOUNT the document is being
+    filed into, and a reassignment changes that account. ``identity.gate`` runs straight
+    after this and re-derives both from ``settled_row``, which is keyed on the document
+    rather than on any one item, so nothing is lost by leaving them out; what is gained is
+    that this function cannot carry a "mismatch" computed against a previous owner into
+    the new owner's pass, whatever order anything is called in later.
     """
     prior = session.execute(
         select(AiReportClassification)
@@ -410,8 +419,6 @@ def adopt_prior(session: Session, *, item_id: UUID, document_id: int) -> bool:
             confidence=prior.confidence,
             reasoning=prior.reasoning,
             patient_name=prior.patient_name,
-            name_match=prior.name_match,
-            identity_confirmed_at=prior.identity_confirmed_at,
             document_date=prior.document_date,
             document_date_label=prior.document_date_label,
             prompt_version=prior.prompt_version,
