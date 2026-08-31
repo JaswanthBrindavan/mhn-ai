@@ -25,6 +25,7 @@ def _seed_mismatch(
     last_error_code: str | None = "name_mismatch",
     name_match: str | None = "mismatch",
     intended_section: str | None = None,
+    analyze_now: bool = False,
 ) -> tuple[int, uuid.UUID]:
     """A document the gate stopped: classified, name read, not filed, intake row intact."""
     document_id = make_document()
@@ -34,8 +35,8 @@ def _seed_mismatch(
     item_id = db_session.execute(
         text(
             "INSERT INTO ai_processing_run_items "
-            "(run_id, document_id, status, last_error_code, intended_section) "
-            "VALUES (:r, :d, :s, :e, :i) RETURNING id"
+            "(run_id, document_id, status, last_error_code, intended_section, analyze_now) "
+            "VALUES (:r, :d, :s, :e, :i, :a) RETURNING id"
         ),
         {
             "r": run_id,
@@ -43,6 +44,7 @@ def _seed_mismatch(
             "s": status,
             "e": last_error_code,
             "i": intended_section,
+            "a": analyze_now,
         },
     ).scalar_one()
     db_session.execute(
@@ -103,6 +105,50 @@ def test_confirm_identity_keeps_the_users_section_choice(api, db_session, make_d
             {"i": item_id},
         ).scalar_one()
         == "vaccinations"
+    )
+
+
+def test_confirm_identity_keeps_the_users_read_it_now_choice(
+    api, db_session, make_document
+) -> None:
+    """The other half of the same sentence, and the half that was dropped.
+
+    A user who ticked "read it straight away" and was then asked whose the document is
+    has answered a question about the OWNER — not about whether they still want it read.
+    Without this the new item defaults `analyze_now` to false, the document files and
+    stops, and they are asked to press Analyse for something they already asked for.
+
+    This is the only re-submission where it can happen: every other one is of a document
+    that was already FILED, and a filed document skips the pause regardless.
+    """
+    document_id, _ = _seed_mismatch(db_session, make_document, analyze_now=True)
+
+    item_id = api.post(f"/v1/documents/{document_id}/confirm-identity").json()["item_id"]
+
+    assert (
+        db_session.execute(
+            text("SELECT analyze_now FROM ai_processing_run_items WHERE id = :i"),
+            {"i": item_id},
+        ).scalar_one()
+        is True
+    )
+
+
+def test_confirm_identity_does_not_invent_a_read_it_now_choice(
+    api, db_session, make_document
+) -> None:
+    """Carried, not defaulted on. A document uploaded without the tick still pauses, so
+    confirming an identity never becomes a way to spend money nobody asked to spend."""
+    document_id, _ = _seed_mismatch(db_session, make_document, analyze_now=False)
+
+    item_id = api.post(f"/v1/documents/{document_id}/confirm-identity").json()["item_id"]
+
+    assert (
+        db_session.execute(
+            text("SELECT analyze_now FROM ai_processing_run_items WHERE id = :i"),
+            {"i": item_id},
+        ).scalar_one()
+        is False
     )
 
 
