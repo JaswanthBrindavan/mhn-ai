@@ -49,7 +49,10 @@ logger = logging.getLogger(__name__)
 #: that with the last two — so most suggestions came back as nothing but "get retested in
 #: N weeks", which is nothing to do for N weeks. Lifestyle first is now the rule, a test is
 #: the last line, and inventing a diet for a marker diet does not move is banned outright.
-PROMPT_VERSION = "ins-2026-08-31"
+#: ins-2026-08-31b states each field's CHARACTER limit beside its word budget. Words were
+#: the only unit given before, and a model counts them badly enough that `summary` came
+#: back at 779 against a 700-char cap it had never been told about.
+PROMPT_VERSION = "ins-2026-08-31b"
 #: ins-5 shortened ``risk_patterns`` (60 -> 40 words) and ``summary`` (unbudgeted -> 60),
 #: with their caps moved down to match. The shape is unchanged — same five fields, same
 #: rules — but payloads either side of the boundary are not comparable in LENGTH, which
@@ -59,7 +62,11 @@ PROMPT_VERSION = "ins-2026-08-31"
 #: 350 started rejecting real output. The prompt's word budgets are untouched, so payloads
 #: either side of this boundary ARE comparable — unlike ins-5's, which is why that one is
 #: called out above and this one is recorded rather than explained.
-SCHEMA_VERSION = "ins-6"
+#: ins-7 split the length the model is ASKED for (``FIELD_LIMITS``, stated in the prompt)
+#: from the length the validator REJECTS at (twice that, a runaway guard). Payloads either
+#: side are comparable in shape; lengths are not, because everything up to ins-6 asked for
+#: a length in words and enforced a different one, in characters, in code.
+SCHEMA_VERSION = "ins-7"
 STAGE_NAME = "generating_insights"
 #: Headroom, not a target: the fields are individually capped and a typical report now
 #: lands well under this. Truncation IS detected — ``check_response`` ends the item
@@ -79,6 +86,52 @@ DISCLAIMER = (
 ALL_IN_RANGE_SUMMARY = "All extracted results fall within their reference ranges."
 
 
+#: How long each field should be, in characters. Used twice: the prompt, which STATES it,
+#: and the validator, which sits well above it.
+#:
+#: **A length cannot be enforced on the model, only asked for.** Anthropic's structured
+#: outputs do not support `minLength`/`maxLength` — they are on the documented unsupported
+#: list, alongside numeric bounds and recursive schemas, and the SDK strips unsupported
+#: keywords out of the schema before sending it. So putting them in
+#: `_INSIGHT_ITEM_SCHEMA` would not constrain generation; it would read as a guarantee and
+#: be silently discarded, which is worse than not being there. That was tried on
+#: 2026-08-31 and reverted before it shipped.
+#:
+#: What IS available is the prompt, and there the unit matters: the fields carried only a
+#: WORD budget until now, and `summary` came back at 779 characters against a 700-character
+#: cap it had never been told about in any unit. Every field now states both.
+#:
+#: The consequence is that these numbers are a request and the validator must be forgiving
+#: — see `_RUNAWAY_FACTOR`. Do not tighten the cap towards this value on the theory that
+#: the model will comply; nothing makes it comply.
+FIELD_LIMITS: dict[str, int] = {
+    "heading": 200,
+    "explanation": 500,
+    "risk_patterns": 500,
+    "suggestion_heading": 120,
+    "suggestions": 700,
+    "summary": 700,
+}
+
+#: How far above the stated limit the VALIDATOR sits.
+#:
+#: The two numbers do different jobs and conflating them is what kept breaking. The limit
+#: above is a product decision — how much a person will read on a phone — and it belongs in
+#: the schema and the prompt, where it can actually shorten the output. This one is a
+#: runaway guard: it exists to reject a model that returns a page of prose, not to police
+#: the last 11% of a paragraph.
+#:
+#: A validation failure here is TRANSIENT, so a field over the line costs three paid
+#: retries and then the reader gets no insights at all. Set the guard where that is worth
+#: it — an answer twice as long as asked is broken; one slightly over is just long.
+_RUNAWAY_FACTOR = 2
+
+
+def _cap(field: str) -> int:
+    """The validator's ceiling for a field: its stated limit, doubled. See above."""
+    return FIELD_LIMITS[field] * _RUNAWAY_FACTOR
+
+
 class Insight(BaseModel):
     """One finding, shaped for the app's two cards.
 
@@ -91,16 +144,16 @@ class Insight(BaseModel):
     product requirement, not storage hygiene. ``explanation`` merges what were two
     separate fields that each explained the same thing at length.
 
-    **The prompt states a word budget for each field, and these caps sit above it.** A cap
-    the model is not told about is not a limit, it is a paid failure: over-long output
-    fails validation, which this stage treats as transient, so it retries the whole call
-    at full price. A 400-char ``risk_patterns`` cap with no stated budget did exactly that
-    once, at $0.046 per attempt. Tighten a cap and the budget together, or not at all —
-    which is how ``risk_patterns`` and ``summary`` were shortened on 2026-08-29.
+    **The length the model is ASKED for is ``FIELD_LIMITS``; the number here is a runaway
+    guard at twice that.** They are different jobs and conflating them cost three payloads
+    in one day. A length cannot be enforced on the model — structured outputs do not
+    support ``maxLength`` — so ``FIELD_LIMITS`` is a request stated in the prompt, and
+    this is the point at which an answer is thrown away instead of merely read long.
 
-    One exception, deliberately left: ``heading`` has a cap and no budget. It is a card
-    title of a few words in practice, so 200 characters is not a limit it can reach — but
-    it is the one field where the paragraph above is aspiration rather than fact.
+    That distinction is the whole lesson. A validation failure here is TRANSIENT: three
+    paid retries and then the reader gets no insights at all. Worth it for a model
+    returning a page of prose; not worth it for a paragraph 11% over, which is exactly
+    what ``summary`` did at 779 against 700.
 
     **These are clinically directive, by product decision (2026-08-03).** They name
     conditions, state the risk a pattern carries, and recommend concrete actions — diet,
@@ -116,14 +169,14 @@ class Insight(BaseModel):
 
     #: Names the finding AND its risk, as the Risk Patterns card title:
     #: "Elevated Uric Acid - Gout & Renal Risk".
-    heading: str = Field(min_length=1, max_length=200)
+    heading: str = Field(min_length=1, max_length=_cap("heading"))
     #: One or two lines: what this test looks at and what moves it, together. Merged
     #: from two fields that were separately explaining the same thing at length.
     #:
     #: 500, raised from 350 alongside ``risk_patterns`` and for the same reason — it is
     #: the other 40-word field and carried the identical cap, so it fails the identical
     #: way. Fixed together rather than one at a time.
-    explanation: str = Field(min_length=1, max_length=500)
+    explanation: str = Field(min_length=1, max_length=_cap("explanation"))
     #: The Risk Patterns card body: the value against the limit it crossed, then what
     #: that can lead to. Two short lines.
     #:
@@ -145,9 +198,9 @@ class Insight(BaseModel):
     #: The rule the class docstring states still holds — never tighten a cap without
     #: tightening the budget with it. What is added here is its other half: never size a
     #: cap so close to the budget that an ordinary overshoot destroys the payload.
-    risk_patterns: str = Field(min_length=1, max_length=500)
+    risk_patterns: str = Field(min_length=1, max_length=_cap("risk_patterns"))
     #: The Suggestions card title — an action, e.g. "Reduce Uric Acid Through Diet".
-    suggestion_heading: str = Field(min_length=1, max_length=120)
+    suggestion_heading: str = Field(min_length=1, max_length=_cap("suggestion_heading"))
     #: The Suggestions card body: concrete steps, two or three short lines. Never
     #: medication, dosage, or starting/stopping a drug.
     #:
@@ -158,7 +211,7 @@ class Insight(BaseModel):
     #: per budgeted word). Raising it in the same change is the point: the failure this
     #: whole set of comments exists for is a cap that fires because the budget moved
     #: underneath it.
-    suggestions: str = Field(min_length=1, max_length=700)
+    suggestions: str = Field(min_length=1, max_length=_cap("suggestions"))
     #: Test names from the extraction this insight refers to.
     related_tests: list[str] = Field(default_factory=list)
 
@@ -172,12 +225,13 @@ class DocumentInsights(BaseModel):
     #: The ratio of cap to budget is looser than ``risk_patterns``' on purpose: this is
     #: also where unchecked tests are named in a clause, and a list of test names spends
     #: characters without spending words.
-    summary: str | None = Field(default=None, max_length=700)
+    summary: str | None = Field(default=None, max_length=_cap("summary"))
 
 
 _INSIGHT_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        # No `maxLength` here, and it is not an oversight — see FIELD_LIMITS.
         "heading": {"type": "string"},
         "explanation": {"type": "string"},
         "risk_patterns": {"type": "string"},
@@ -240,16 +294,17 @@ SYSTEM_PROMPT = (
     "use if the sentence already reads clearly.\n"
     "- Do not repeat between fields. Say a thing once.\n\n"
     "Each insight fills five fields. STAY INSIDE THE LINE LIMITS:\n\n"
-    "- heading: the Risk Patterns card title. Name the finding AND what it can lead to, "
+    "- heading: the Risk Patterns card title, AT MOST 200 CHARACTERS. Name the finding "
+    "AND what it can lead to, "
     "joined by a dash, in plain words. 'High Uric Acid - Joint Pain & Kidney Risk'. "
     "'Slightly High LDL Cholesterol - Heart Risk'. Where several results form one "
     "pattern, name it once: 'Low Iron-Related Blood Markers - Possible Nutritional Gap'.\n"
-    "- explanation: ONE OR TWO LINES, AT MOST 40 WORDS, covering both what this "
+    "- explanation: ONE OR TWO LINES, AT MOST 40 WORDS / 500 CHARACTERS, covering both what this "
     "test looks at and what commonly moves it. 'Uric acid is a waste "
     "product your kidneys clear out. It builds "
     "up when you eat a lot of red meat or shellfish, drink alcohol, or do not drink "
     "enough water.'\n"
-    "- risk_patterns: TWO SHORT LINES, AT MOST 40 WORDS. Start with the "
+    "- risk_patterns: TWO SHORT LINES, AT MOST 40 WORDS / 500 CHARACTERS. Start with the "
     "value and the limit it crossed. The limit MUST be taken from 'flagged_against', "
     "which is the range the result was actually checked against — never a number from "
     "anywhere else. Then say "
@@ -257,9 +312,10 @@ SYSTEM_PROMPT = (
     "is 8.6, above the normal top of 8.0. Staying this high can cause sudden joint pain "
     "and, over time, kidney stones.' Say when something is only mild — 'this is only "
     "slightly above the line' — so the reader can tell small from serious.\n"
-    "- suggestion_heading: the Suggestions card title. An action, AT MOST 6 WORDS: "
+    "- suggestion_heading: the Suggestions card title. An action, AT MOST 6 WORDS / "
+    "120 CHARACTERS: "
     "'Cut Down Uric Acid Through Food'. 'Check for Low Iron'.\n"
-    "- suggestions: TWO OR THREE SHORT LINES, AT MOST 60 WORDS, of things to "
+    "- suggestions: TWO OR THREE SHORT LINES, AT MOST 60 WORDS / 700 CHARACTERS, of things to "
     "actually do. Say what to do, not who to ask.\n"
     "  START with what the reader can change THEMSELVES — food, drink, movement, sleep, "
     "sunlight, weight, alcohol, tobacco — named specifically. 'Eat better' and 'improve "
@@ -292,7 +348,8 @@ SYSTEM_PROMPT = (
     "NOT give it its own insight and do NOT judge whether it is in range. Name those "
     "tests in the SUMMARY instead, in one clause — 'X and Y were reported without "
     "reference ranges, so they could not be checked'.\n\n"
-    "summary: TWO OR THREE SHORT SENTENCES, AT MOST 60 WORDS, covering the whole panel — "
+    "summary: TWO OR THREE SHORT SENTENCES, AT MOST 60 WORDS / 700 CHARACTERS, covering "
+    "the whole panel — "
     "what was flagged, grouped sensibly, and what came back within range. Written for "
     "someone reading it before any of the detail below it."
 )
