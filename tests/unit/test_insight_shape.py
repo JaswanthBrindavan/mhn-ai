@@ -61,6 +61,46 @@ def test_the_json_schema_matches_the_model() -> None:
     )
 
 
+#: The word budget the prompt states for each capped field. The caps must sit ABOVE these
+#: with real headroom — see `_CHARS_PER_WORD` below.
+PROMPT_WORD_BUDGETS = {
+    "explanation": 40,
+    "risk_patterns": 40,
+    "suggestions": 60,
+    "suggestion_heading": 6,
+}
+
+#: Characters of headroom per budgeted word. Not a style preference — the arithmetic of a
+#: failure that has already happened once. `risk_patterns` sat at 8.7 and rejected real
+#: output in production (`insights.0.risk_patterns: string_too_long`), and because this
+#: stage treats a validation failure as TRANSIENT that cost three paid retries and then a
+#: report with no insights at all. Medical prose spends characters fast: test names, units
+#: and a cited limit are long tokens, and one insight may group several results.
+_CHARS_PER_WORD = 11
+
+
+def test_every_cap_sits_above_the_budget_the_prompt_states() -> None:
+    """The rule that was broken, expressed as arithmetic rather than as four numbers.
+
+    The class docstring already says never to tighten a cap without tightening the
+    prompt's budget with it. This is the other half: a cap is a SAFETY NET, and the net
+    firing is worse than the thing it catches — the reader gets nothing at all, instead of
+    one paragraph running long. Tighten a budget here and this test tells you which cap
+    has to move with it.
+    """
+    for field, words in PROMPT_WORD_BUDGETS.items():
+        # The constraints come through as a list of annotated-types markers (MinLen,
+        # MaxLen), in declaration order — so it is looked up by attribute rather than by
+        # position, which would silently read min_length the day someone reorders them.
+        cap = next(
+            m.max_length for m in Insight.model_fields[field].metadata if hasattr(m, "max_length")
+        )
+        assert cap >= words * _CHARS_PER_WORD, (
+            f"{field} is capped at {cap} against a stated budget of {words} words "
+            f"({cap / words:.1f} chars/word). An ordinary overshoot destroys the payload."
+        )
+
+
 def test_token_ceiling_leaves_room_for_the_four_part_shape() -> None:
     """Four parts per insight is roughly 3x the old single-body output. A 9-insight
     report measured 2,774 output tokens; the old 4096 ceiling would have truncated it,
