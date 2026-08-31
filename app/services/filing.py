@@ -361,19 +361,35 @@ def mark_content_failed(session: Session, item_id: UUID) -> None:
 def extra_columns(session: Session, item_id: UUID, section: DocumentSection) -> dict[str, Any]:
     """Section-table columns we can fill from the extraction, beyond ``content``.
 
-    Two sections have them. ``vaccinations.next_due_on`` drives Spring's reminder index,
-    and ``bills`` carries ``amount`` / ``amount_due`` / ``amount_currency`` — the very
-    fields that section extracts, so leaving them null would mean the bills list renders
-    nothing while the value sits in ``content``. The rest (``hospital``,
-    ``insurance.provider``) are foreign keys into master tables and need a name-to-id
-    lookup, which is separate work.
+    Three sections have them, and all three are the same story: the columns hold the very
+    fields that section extracts, so leaving them null means a list renders nothing while
+    the value sits unread in ``content``.
+
+    * ``vaccinations`` — ``next_due_on`` and ``dose``
+    * ``bills`` — ``amount`` / ``amount_due`` / ``amount_currency``
+    * ``insurance`` — ``from_date`` / ``to_date`` / ``sum_insured`` / ``premium`` /
+      ``amount_currency`` (added 2026-08-31; before that this returned ``{}`` for
+      insurance, so **every policy ever filed has null dates**)
+
+    What is left out stays left out: ``hospital`` and ``insurance.provider`` are foreign
+    keys into master tables and need a name-to-id lookup, which is separate work.
 
     Every value written here is one a column has a *shape* for, so each is checked against
     that shape before it is written. A value that fails is skipped, never coerced: it is
     still in ``content.ai`` for the reader, and a bad one would fail the UPDATE of a
     Spring-owned row.
+
+    **Note when this runs.** It is called from the ``write_content`` at the END of the
+    pipeline, so a document paused by ``ANALYSIS_ON_DEMAND`` reaches none of it. A filed
+    but unanalysed policy therefore has no dates and can raise no renewal alarm — which is
+    honest (we have not read the policy) but has to be said on any screen that lists them,
+    or an empty list reads as "nothing is expiring".
     """
-    if section not in (DocumentSection.VACCINATIONS, DocumentSection.BILLS):
+    if section not in (
+        DocumentSection.VACCINATIONS,
+        DocumentSection.BILLS,
+        DocumentSection.INSURANCE,
+    ):
         return {}
 
     data = (
@@ -387,15 +403,32 @@ def extra_columns(session: Session, item_id: UUID, section: DocumentSection) -> 
     fields = data.get("fields") or {}
     if section is DocumentSection.VACCINATIONS:
         return _vaccination_columns(item_id, data, fields)
+    if section is DocumentSection.INSURANCE:
+        return _insurance_columns(item_id, fields)
     return _bill_columns(item_id, fields)
+
+
+#: What ``vaccinations.dose`` can hold, and the cap the extraction already applies to
+#: ``dose_info``. Checked anyway rather than trusted: the two are set in different repos.
+_DOSE_MAX = 128
 
 
 def _vaccination_columns(
     item_id: UUID, data: dict[str, Any], fields: dict[str, Any]
 ) -> dict[str, Any]:
+    columns: dict[str, Any] = {}
+
+    # Independent of the reminder below. A card stating a dose and no next date is
+    # ordinary -- the final dose of a course -- and must still record which dose it was.
+    dose = str(fields.get("dose_info") or "").strip()
+    if dose and len(dose) <= _DOSE_MAX:
+        columns["dose"] = dose
+    elif dose:
+        logger.warning("dose_too_long_for_column", extra={"item_id": str(item_id)})
+
     raw = fields.get("next_due_date")
     if not raw:
-        return {}
+        return columns
 
     # A pair we have already recorded as inconsistent does not get to set a reminder.
     # `dates_out_of_order` means the next dose reads as earlier than the dose given, which
@@ -406,18 +439,41 @@ def _vaccination_columns(
     flags = data.get("flags") or []
     if any(f.get("code") == "dates_out_of_order" for f in flags):
         logger.warning("next_due_date_not_written", extra={"item_id": str(item_id)})
-        return {}
+        # `columns`, not `{}`: only the REMINDER is withheld. The dose is an independent
+        # reading and a misread date pair says nothing about which dose the card names.
+        return columns
+    parsed = _utc_datetime(item_id, "next_due_date", raw)
+    if parsed is None:
+        return columns
+    columns["next_due_on"] = parsed
+    return columns
+
+
+def _utc_datetime(item_id: UUID, field: str, raw: object) -> datetime | None:
+    """An ISO value from the extraction as something a ``timestamptz`` column accepts.
+
+    ``app.services.dates`` has already normalised these, so the parse is a formality; the
+    timezone is not. The columns are ``timestamptz`` and Spring's entities read them as
+    ``OffsetDateTime``, so a naive value is interpreted in the session's zone and dates a
+    document a day early for every reader west of Greenwich. Every date this module writes
+    goes through here for that reason.
+    """
     try:
-        # Already normalised to ISO by app.services.dates; parse rather than trust a shape.
         parsed = datetime.fromisoformat(str(raw))
     except ValueError:
-        logger.warning("next_due_date_unparseable", extra={"item_id": str(item_id)})
-        return {}
-    return {"next_due_on": parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)}
+        logger.warning("date_unparseable", extra={"item_id": str(item_id), "field": field})
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 #: What ``bills.amount`` and ``bills.amount_due`` can hold: ``numeric(10, 2)``.
 _AMOUNT_CEILING = Decimal("99999999.99")
+
+#: What ``insurance.sum_insured`` and ``insurance.premium`` can hold: ``numeric(12, 2)``.
+#: Wider than the bills pair on purpose — a sum insured of one crore is eight digits
+#: before a policy is in any way unusual, and a skipped value leaves the column empty on
+#: exactly the largest policies.
+_POLICY_AMOUNT_CEILING = Decimal("9999999999.99")
 
 #: What ``bills.amount_currency`` can hold: Postgres's ``currency_enum``. A code outside
 #: this set is a legal ISO code that this column has no value for — ``normalise_currency``
@@ -431,7 +487,7 @@ _BILL_AMOUNTS = (("total_amount", "amount"), ("amount_due", "amount_due"))
 def _bill_columns(item_id: UUID, fields: dict[str, Any]) -> dict[str, Any]:
     columns: dict[str, Any] = {}
     for field, column in _BILL_AMOUNTS:
-        amount = _bill_amount(item_id, field, fields.get(field))
+        amount = _amount(item_id, field, fields.get(field), _AMOUNT_CEILING)
         if amount is not None:
             columns[column] = amount
 
@@ -446,25 +502,76 @@ def _bill_columns(item_id: UUID, fields: dict[str, Any]) -> dict[str, Any]:
     return columns
 
 
-def _bill_amount(item_id: UUID, field: str, raw: object) -> Decimal | None:
-    """A bare decimal string from the extraction as a value ``numeric(10, 2)`` accepts.
+def _amount(item_id: UUID, field: str, raw: object, ceiling: Decimal) -> Decimal | None:
+    """A bare decimal string from the extraction as a value the column accepts.
 
     ``money.normalise_amount`` has already reduced this to digits, so the parse is a
     formality; the ceiling is not. A bill printed in paise, or a misread that ran two
     columns together, overflows the column and fails the whole UPDATE — losing the
     ``content`` write for a document that was otherwise processed correctly.
+
+    The ceiling is a parameter because the two tables differ: bills is ``numeric(10, 2)``
+    and insurance ``numeric(12, 2)``. Everything else about the check is identical, which
+    is why there is one function rather than two that drift.
     """
     if not raw:
         return None
     try:
         value = Decimal(str(raw))
     except InvalidOperation:
-        logger.warning("bill_amount_unparseable", extra={"item_id": str(item_id), "field": field})
+        logger.warning("amount_unparseable", extra={"item_id": str(item_id), "field": field})
         return None
-    if value.copy_abs() > _AMOUNT_CEILING:
-        logger.warning("bill_amount_out_of_range", extra={"item_id": str(item_id), "field": field})
+    if value.copy_abs() > ceiling:
+        logger.warning("amount_out_of_range", extra={"item_id": str(item_id), "field": field})
         return None
     return value
+
+
+#: Extracted field -> the ``insurance`` column it fills.
+_POLICY_AMOUNTS = (("sum_insured", "sum_insured"), ("premium_amount", "premium"))
+
+
+def _insurance_columns(item_id: UUID, fields: dict[str, Any]) -> dict[str, Any]:
+    """A policy's own dates and money, promoted out of ``content`` into columns.
+
+    The dates are the point: ``to_date`` is what a renewal alarm is computed from, and
+    until this existed it was null on every policy ever filed.
+    """
+    columns: dict[str, Any] = {}
+
+    start = _utc_datetime(item_id, "start_date", fields.get("start_date"))
+    end = _utc_datetime(item_id, "end_date", fields.get("end_date"))
+    # The same rule the vaccination arm follows, for the same reason. A policy that ends
+    # at or before it starts is a misread, and these columns are the one place a misread
+    # would be ACTED on rather than merely displayed — an alarm about a renewal that
+    # already happened, or one that never will. Neither date is written; both stay
+    # readable in `content` for a human. The amounts are a separate reading and are
+    # unaffected: a wrong date says nothing about them.
+    if start is not None and end is not None and end <= start:
+        logger.warning("policy_dates_out_of_order", extra={"item_id": str(item_id)})
+    else:
+        if start is not None:
+            columns["from_date"] = start
+        if end is not None:
+            columns["to_date"] = end
+
+    for field, column in _POLICY_AMOUNTS:
+        amount = _amount(item_id, field, fields.get(field), _POLICY_AMOUNT_CEILING)
+        if amount is not None:
+            columns[column] = amount
+
+    # Only when there is an amount for it to qualify. A currency alone describes nothing,
+    # and writing one beside two null amounts would make a policy look part-read.
+    currency = fields.get("currency")
+    if columns.keys() & {"sum_insured", "premium"}:
+        if currency in _STORABLE_CURRENCIES:
+            columns["amount_currency"] = currency
+        elif currency:
+            logger.warning(
+                "policy_currency_not_storable",
+                extra={"item_id": str(item_id), "currency": currency},
+            )
+    return columns
 
 
 def _delete_quietly(s3: "S3Client", bucket: str, key: str) -> None:

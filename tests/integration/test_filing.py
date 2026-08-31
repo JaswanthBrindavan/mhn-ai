@@ -18,7 +18,7 @@ from app.integrations.s3 import (
     SourceObjectUnavailableError,
     object_exists,
 )
-from app.models.spring import bills, reports, unclassified_files, vaccinations
+from app.models.spring import bills, insurance, reports, unclassified_files, vaccinations
 from app.services import filing
 from app.services.assembly import ContentState, build_content
 from app.services.classification import DocumentSection
@@ -564,9 +564,262 @@ def test_a_reminder_is_not_set_from_dates_we_flagged_as_inconsistent(
     assert filing.extra_columns(db_session, seed.item_id, DocumentSection.VACCINATIONS) == {}
 
 
+def test_a_flagged_date_pair_still_records_which_dose_it_was(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """Only the REMINDER is withheld, not everything the card said.
+
+    The two are independent readings, and this branch used to return `{}` — which was
+    invisible while `next_due_on` was the only column here, and silently dropped the dose
+    the moment a second one existed. mypy found it as an unreachable statement; the
+    behaviour is what the statement was hiding.
+    """
+    seed = classified_item(DocumentSection.VACCINATIONS)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "vaccinations",
+        {"dose_info": "Booster", "date_given": "2027-03-14", "next_due_date": "2026-01-01"},
+        flags=[{"code": "dates_out_of_order", "field": "next_due_date", "detail": "..."}],
+    )
+
+    assert filing.extra_columns(db_session, seed.item_id, DocumentSection.VACCINATIONS) == {
+        "dose": "Booster"
+    }
+
+
 def test_extra_columns_is_empty_for_a_section_with_none(db_session, classified_item) -> None:
     seed = classified_item(DocumentSection.REPORTS)
     assert filing.extra_columns(db_session, seed.item_id, DocumentSection.REPORTS) == {}
+
+
+# --- insurance -------------------------------------------------------------
+#
+# `extra_columns` returned {} for insurance until 2026-08-31, so `from_date` and `to_date`
+# were null on EVERY policy ever filed while the values sat in `content`. The upcoming-
+# events flags are computed from those two columns, so an empty column is a policy that
+# can never say it is expiring.
+
+
+def test_a_policys_dates_and_amounts_reach_the_columns(
+    db_session, s3_client, bucket, classified_item, seed_section_extraction
+) -> None:
+    seed = classified_item(DocumentSection.INSURANCE)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "insurance",
+        {
+            "start_date": "2026-04-01",
+            "end_date": "2027-03-31",
+            "sum_insured": "500000",
+            "premium_amount": "12450.50",
+            "currency": "INR",
+        },
+    )
+    row_id = filing.file_document(
+        db_session,
+        s3_client,
+        item_id=seed.item_id,
+        document_id=seed.document_id,
+        section=DocumentSection.INSURANCE,
+        content=build_content(db_session, seed.item_id, state=ContentState.CLASSIFIED),
+        bucket=bucket,
+        expected={"classifying"},
+    )
+
+    filing.write_content(
+        db_session,
+        seed.item_id,
+        build_content(db_session, seed.item_id, state=ContentState.COMPLETE),
+        extra=filing.extra_columns(db_session, seed.item_id, DocumentSection.INSURANCE),
+    )
+
+    row = db_session.execute(
+        select(
+            insurance.c.from_date,
+            insurance.c.to_date,
+            insurance.c.sum_insured,
+            insurance.c.premium,
+            insurance.c.amount_currency,
+        ).where(insurance.c.id == row_id)
+    ).one()
+    assert (row.from_date.year, row.from_date.month, row.from_date.day) == (2026, 4, 1)
+    assert (row.to_date.year, row.to_date.month, row.to_date.day) == (2027, 3, 31)
+    assert row.sum_insured == Decimal("500000")
+    assert row.premium == Decimal("12450.50")
+    assert row.amount_currency == "INR"
+
+
+def test_a_policy_dates_are_midnight_utc_like_every_other_date_we_write(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """The columns are timestamptz and Spring reads them as OffsetDateTime.
+
+    A naive value is read in the session's zone, which dates a renewal a day early for
+    every reader west of Greenwich — and the whole feature is a comparison against today.
+    """
+    seed = classified_item(DocumentSection.INSURANCE)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "insurance",
+        {"start_date": "2026-04-01", "end_date": "2027-03-31"},
+    )
+
+    columns = filing.extra_columns(db_session, seed.item_id, DocumentSection.INSURANCE)
+
+    for key in ("from_date", "to_date"):
+        assert columns[key].tzinfo is not None
+        assert (columns[key].hour, columns[key].minute, columns[key].second) == (0, 0, 0)
+
+
+def test_a_policy_that_ends_before_it_starts_sets_no_dates(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """The same rule the vaccination arm follows, for the same reason.
+
+    An end date at or before the start is a misread, and these two columns are what a
+    renewal alarm is computed from — so this is the one consumer that would ACT on the
+    bad pair. Neither date is written; both stay visible in `content` for a human.
+
+    The amounts are unaffected: they are a separate reading and a wrong date says nothing
+    about them.
+    """
+    seed = classified_item(DocumentSection.INSURANCE)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "insurance",
+        {"start_date": "2027-03-31", "end_date": "2026-04-01", "sum_insured": "500000"},
+    )
+
+    columns = filing.extra_columns(db_session, seed.item_id, DocumentSection.INSURANCE)
+
+    assert "from_date" not in columns
+    assert "to_date" not in columns
+    assert columns["sum_insured"] == Decimal("500000")
+
+
+def test_a_policy_amount_the_column_cannot_hold_is_skipped_not_coerced(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """numeric(12,2) tops out below this. Skipped, never truncated: a value the column
+    rejects fails the whole UPDATE and takes the `content` write down with it."""
+    seed = classified_item(DocumentSection.INSURANCE)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "insurance",
+        {"sum_insured": "99999999999999", "premium_amount": "12450.50"},
+    )
+
+    columns = filing.extra_columns(db_session, seed.item_id, DocumentSection.INSURANCE)
+
+    assert "sum_insured" not in columns
+    assert columns["premium"] == Decimal("12450.50")
+
+
+def test_a_currency_the_enum_has_no_value_for_is_left_out(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """`normalise_currency` passes any three letters through; `currency_enum` holds four
+    values. A legal ISO code this column cannot store stays in `content`."""
+    seed = classified_item(DocumentSection.INSURANCE)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "insurance",
+        {"sum_insured": "500000", "currency": "AED"},
+    )
+
+    columns = filing.extra_columns(db_session, seed.item_id, DocumentSection.INSURANCE)
+
+    assert "amount_currency" not in columns
+    assert columns["sum_insured"] == Decimal("500000")
+
+
+def test_a_policy_with_nothing_extracted_writes_no_columns(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    seed = classified_item(DocumentSection.INSURANCE)
+    seed_section_extraction(seed.item_id, seed.document_id, "insurance", {})
+
+    assert filing.extra_columns(db_session, seed.item_id, DocumentSection.INSURANCE) == {}
+
+
+# --- vaccination dose ------------------------------------------------------
+
+
+def test_the_dose_reaches_its_column_as_printed(
+    db_session, s3_client, bucket, classified_item, seed_section_extraction
+) -> None:
+    """Free text, never parsed into a number: "Dose 2 of 3" is what the card says."""
+    seed = classified_item(DocumentSection.VACCINATIONS)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "vaccinations",
+        {"dose_info": "Dose 2 of 3", "next_due_date": "2027-03-14"},
+    )
+    row_id = filing.file_document(
+        db_session,
+        s3_client,
+        item_id=seed.item_id,
+        document_id=seed.document_id,
+        section=DocumentSection.VACCINATIONS,
+        content=build_content(db_session, seed.item_id, state=ContentState.CLASSIFIED),
+        bucket=bucket,
+        expected={"classifying"},
+    )
+
+    filing.write_content(
+        db_session,
+        seed.item_id,
+        build_content(db_session, seed.item_id, state=ContentState.COMPLETE),
+        extra=filing.extra_columns(db_session, seed.item_id, DocumentSection.VACCINATIONS),
+    )
+
+    assert (
+        db_session.execute(
+            select(vaccinations.c.dose).where(vaccinations.c.id == row_id)
+        ).scalar_one()
+        == "Dose 2 of 3"
+    )
+
+
+def test_a_dose_longer_than_the_column_is_skipped(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """The extraction caps `dose_info` at 128 and so does the column, so this should be
+    unreachable — which is exactly why it is checked rather than trusted."""
+    seed = classified_item(DocumentSection.VACCINATIONS)
+    seed_section_extraction(
+        seed.item_id,
+        seed.document_id,
+        "vaccinations",
+        {"dose_info": "x" * 129, "next_due_date": "2027-03-14"},
+    )
+
+    columns = filing.extra_columns(db_session, seed.item_id, DocumentSection.VACCINATIONS)
+
+    assert "dose" not in columns
+    assert columns["next_due_on"] is not None
+
+
+def test_a_dose_is_written_even_when_no_reminder_is(
+    db_session, classified_item, seed_section_extraction
+) -> None:
+    """The two are independent readings. A card stating a dose and no next date is
+    ordinary — the final dose of a course — and must still record which dose it was."""
+    seed = classified_item(DocumentSection.VACCINATIONS)
+    seed_section_extraction(
+        seed.item_id, seed.document_id, "vaccinations", {"dose_info": "Booster"}
+    )
+
+    assert filing.extra_columns(db_session, seed.item_id, DocumentSection.VACCINATIONS) == {
+        "dose": "Booster"
+    }
 
 
 def test_bill_amounts_reach_the_columns_the_app_reads(
