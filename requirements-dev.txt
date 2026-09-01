@@ -8,7 +8,7 @@ ruff==0.15.22
 mypy==2.3.0
 boto3-stubs[s3,sqs]==1.43.53
 
-# Authors the PDF fixtures the OCR tests read. Neither pdfplumber nor pypdfium2 can
+# Authors the PDF fixtures the text-layer tests read. Neither pdfplumber nor pypdfium2 can
 # *create* a PDF — they read and render — so tests need something that writes one.
 # Dev-only: it is never imported by app/, and never ships in the image.
 reportlab==4.4.4

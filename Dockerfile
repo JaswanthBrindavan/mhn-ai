@@ -7,14 +7,15 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv
 
-# Tesseract, the OCR binary. pytesseract is only a binding to it, so without this a
-# document whose pages carry no text layer — a photographed or scanned insurance policy,
-# scan report or vaccination card — fails with `text_extraction_failed`. Digital PDFs and
-# every lab report are unaffected either way, which is what makes the omission easy to
-# miss until a user uploads a photo.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr \
-    && rm -rf /var/lib/apt/lists/*
+# NO apt layer, and no Tesseract — removed 2026-09-01 with the OCR path. Section
+# documents now go to the vision model as files, the way reports and prescriptions always
+# have, so nothing in this image rasterises or OCRs a page. The only text this service
+# reads is a PDF's embedded layer (app/services/text_layer.py, pure Python), used solely
+# by the prescription name guard.
+#
+# If OCR ever returns, the binary has to come back with it: `pytesseract` is a binding
+# only, and without the binary a scanned document fails while digital ones work — which
+# looks like a model problem and is not.
 
 # Dependencies first so code edits do not invalidate the install layer.
 COPY requirements.txt ./

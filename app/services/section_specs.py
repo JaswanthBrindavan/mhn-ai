@@ -266,13 +266,18 @@ _SCAN_PROMPT = (
     "settings) is not a finding and does not belong in the summary at all.\n"
     "- impression: the radiologist's impression or conclusion, as printed.\n"
     "- findings: at most 5 short key findings, most important first.\n\n"
+    "**YOU CAN SEE THE IMAGE. DO NOT READ IT.** You transcribe text that is PRINTED on "
+    "the page. You are not a radiologist and you are not being asked to be one: never "
+    "describe, interpret, or report on the picture itself — not the anatomy, not a "
+    "device, not a fracture, not whether anything looks normal. Every word you return "
+    "must be copied from text somebody else wrote on this document.\n\n"
     "**Many uploads are the IMAGE alone — an X-ray or scan with a burned-in header and no "
-    "radiologist's report anywhere in the text.** That is expected and is not a failure. "
-    "Transcribe the factual fields you can read (scan_type, body_part, scan_date, "
-    "facility) and return null for summary and impression and an empty findings list. Do "
-    "not describe what the picture might show: you are reading TEXT, you cannot see the "
-    "image, and a reassuring sentence about a scan nobody reported on is the most harmful "
-    "thing you could write here.\n\n"
+    "radiologist's report printed anywhere on it.** That is expected and is not a failure. "
+    "Transcribe the factual fields that are printed (scan_type, body_part, scan_date, "
+    "facility) and return null for summary and impression and an empty findings list — "
+    "even though you can see the picture perfectly well. A reassuring sentence about a "
+    "scan nobody reported on is the most harmful thing you could write here, and looking "
+    "at the image yourself does not make it less so.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
 )
 
@@ -482,11 +487,20 @@ class SectionSpec:
     derived_from_interval: tuple[tuple[str, str, str], ...] = ()
 
 
-INSTRUCTION_PREFIX = (
-    "Below is the text extracted from one document. Some of it may come from OCR of a "
-    "scan, so it can contain broken words, stray characters, and lost table alignment. "
-    "Read through that: transcribe what the document states, and use null for anything "
-    "you cannot read with confidence rather than guessing at it.\n\n"
+#: Sent with the document itself, which the model can see (2026-09-01 — it used to be a
+#: prefix on a block of OCR'd text).
+#:
+#: The completeness demand is not decoration. Vision's characteristic failure is silent
+#: under-reading — on a 34-page report the text path once found 102 results to vision's 69
+#: — and ``extraction.INSTRUCTION`` carries the same paragraph for the same reason. On
+#: insurance it is the most important sentence here: the prompt tells the model a person
+#: will be told they are covered for exactly what it lists, so a benefit table read to
+#: three quarters of its length is worse than one not read at all.
+INSTRUCTION = (
+    "Transcribe this document's fields as structured data. Read EVERY page and, where a "
+    "field is a list, return EVERY row of it — do not summarise, sample, or stop at a "
+    "representative few. Transcribe only what the document states, and use null for "
+    "anything you cannot read with confidence rather than guessing at it."
 )
 
 SECTION_SPECS: dict[DocumentSection, SectionSpec] = {

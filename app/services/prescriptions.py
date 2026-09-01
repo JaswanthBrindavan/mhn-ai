@@ -63,8 +63,8 @@ from app.services.ai_logging import (
 )
 from app.services.classification import DocumentSection
 from app.services.dates import interval_days, iso_date
-from app.services.ocr import TextExtractionError, extract_text
 from app.services.source_loading import load_source_document
+from app.services.text_layer import TextExtractionError, extract_text
 from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
@@ -523,10 +523,11 @@ def _verify_against_document(
         return [], nameless, [], True, {}
 
     try:
-        # Text layer only, never OCR: this guard rejects nothing without text it can trust,
-        # so reading a photograph would cost a full pass to arrive at "cannot verify".
-        # A page with no text layer comes back "skipped" and carries none.
-        extracted = extract_text(document, allow_ocr=False)
+        # Text layer only, and now that is the only thing ``extract_text`` does — the
+        # ``allow_ocr=False`` this used to pass became the module's whole behaviour when
+        # the OCR path was removed. The guard rejects nothing without text it can trust,
+        # so a page with no usable layer comes back "skipped" and carries none.
+        extracted = extract_text(document)
     except TextExtractionError:
         logger.warning("document could not be read as text - prescription names unchecked")
         return rows, nameless, [], False, {}

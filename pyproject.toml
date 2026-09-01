@@ -32,11 +32,12 @@ exclude = ["^alembic/versions/"]
 module = ["tests.*"]
 disallow_untyped_defs = false
 
-# None of these ship a py.typed marker. They are confined to app/services/pdf_pages.py,
-# which wraps pypdfium2 behind a bytes-in/bytes-out function, and app/services/ocr.py,
-# which wraps all three behind typed dataclasses.
+# Neither ships a py.typed marker. They are confined to app/services/pdf_pages.py, which
+# wraps pypdfium2 behind a bytes-in/bytes-out function, and app/services/text_layer.py,
+# which wraps both behind typed dataclasses. (pytesseract was here until the OCR path was
+# removed on 2026-09-01.)
 [[tool.mypy.overrides]]
-module = ["pdfplumber.*", "pypdfium2.*", "pytesseract.*"]
+module = ["pdfplumber.*", "pypdfium2.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

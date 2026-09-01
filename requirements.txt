@@ -33,11 +33,10 @@ anthropic==0.117.1
 pypdfium2==5.12.1
 pdfplumber==0.11.10
 
-# OCR, for pages with no text layer and pages whose text comes back scrambled.
-# NOTE: pytesseract is a binding only; the Tesseract BINARY must be installed in the
-# image (Debian/Ubuntu: apt-get install -y tesseract-ocr).
-pytesseract==0.3.13
-# pdfplumber requires Pillow>=12.2.0, so this cannot go back to the 11.x line.
+# No pytesseract, and no Tesseract binary in the image — the OCR path was removed
+# 2026-09-01 when section extraction moved to sending the document to the vision model.
+# Pillow stays: pdfplumber requires Pillow>=12.2.0, so this cannot go back to the 11.x
+# line even though nothing here rasterises a page any more.
 pillow==12.3.0
 
 # Gemini, for running classification and extraction on a cheaper provider

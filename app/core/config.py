@@ -100,6 +100,18 @@ class Settings(BaseSettings):
     # flash tiers returned 503 on nearly every request. See app/services/prescriptions.py.
     prescription_provider: str = ""
     ai_model_prescription: str = ""
+    # Section documents — insurance, scans/imaging, vaccinations, bills. Since 2026-09-01
+    # this stage sends the DOCUMENT to the model rather than its OCR'd text, so it is a
+    # vision workload like extraction and prescriptions, and it gets its own pair for the
+    # same reason they do: a policy schedule and a lab panel are different reading
+    # problems, and a model measured on one must not silently move the other.
+    #
+    # Gemini is the intended value. It reads PDFs natively, and this is the stage where the
+    # OCR flattening defects lived — a benefit table read across two columns produced a
+    # phantom benefit and a sum insured glued to its neighbour, neither of which was a
+    # character-recognition failure.
+    section_provider: str = ""
+    ai_model_section: str = ""
     google_api_key: str = ""
 
     # --- Ideal ranges (approved-THP override) -------------------------------
