@@ -211,63 +211,106 @@ def test_rerunning_the_stage_upserts_rather_than_duplicating(
     assert len(_logs(db_session, item_id)) == 1
 
 
-def test_a_document_with_no_text_completes_without_paying_the_model(
+def test_a_scan_with_no_report_completes_and_says_why(
     db_session, aws, test_settings, make_document
 ):
-    """A photographed X-ray: 4 characters of text, and nothing worth asking a model.
+    """A photographed X-ray with a burned-in header and no radiologist's read.
 
     The real case from production. It must NOT reject — filing has already happened, so a
     reject stamps the filed row failed and the user is shown a broken document for a file
-    we handled correctly. It completes, stores empty fields, and says why.
+    we handled correctly. It completes, keeps the factual fields, and explains the empty
+    half.
+
+    Unlike the OCR era it DOES reach the model now: with the document going to vision there
+    is no text length to pre-check, and a bare image is a fraction of a cent rather than a
+    branch. What has to survive is the guard — the model can see the picture, and nothing
+    it sees may become a finding.
     """
     document_id = make_document(body=_pdf("20cm"))
     item_id = _seed_item(db_session, document_id)
     _seed_classification(db_session, item_id, document_id, "scans_imaging")
-    ai = FakeAIProvider(response=structured_response(SCAN_PAYLOAD))
+    # What a well-behaved model returns for an image with no report on it: the printed
+    # header transcribed, and nothing invented from the picture.
+    ai = FakeAIProvider(
+        response=structured_response(
+            {**SCAN_PAYLOAD, "summary": None, "impression": None, "findings": []}
+        )
+    )
 
     extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
-
-    # The whole point: no model call was made, so none was paid for.
-    assert ai.calls == []
 
     row = _extraction_row(db_session, item_id)
     assert row is not None
     assert row["section"] == "scans_imaging"
-    # Empty, not the fake's payload — nothing was read, and nothing was invented.
-    assert all(not value for value in row["data"]["fields"].values())
+    # The factual transcription survives — that is the half worth having.
+    assert row["data"]["fields"]["scan_type"] == "X-Ray"
+    assert row["data"]["fields"]["summary"] is None
     codes = {flag["code"] for flag in row["data"]["flags"]}
     # One explanation, not two. Scans say it in their own words; the generic
     # nothing_extracted would only repeat it, and the app gives each flag its own line.
     assert "no_radiologist_read" in codes
     assert "nothing_extracted" not in codes
-    # A stage that made no call must not claim one, per the ai_process_logs rule.
-    log = _logs(db_session, item_id)[0]
-    assert log["outcome"] == "succeeded"
-    assert log["provider"] == log["model"] == "skipped"
 
 
-def test_a_section_with_no_explanation_of_its_own_gets_the_generic_one(
+def test_a_summary_invented_from_the_image_is_still_dropped(
+    db_session, aws, test_settings, make_document
+):
+    """The failure this change made newly reachable, and the backstop that catches it.
+
+    Under OCR a bare X-ray yielded four characters and the model had nothing to work from.
+    It can see the image now, so a model that ignores the prompt's ban will write a
+    confident all-clear — which is diagnosis, and nothing downstream could contradict it.
+    `_drop_unsourced_summary` is the Python half of that line: a summary survives only when
+    an impression or a finding it could have been written from survives.
+    """
+    document_id = make_document(body=_pdf("20cm"))
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(db_session, item_id, document_id, "scans_imaging")
+    ai = FakeAIProvider(
+        response=structured_response(
+            {
+                **SCAN_PAYLOAD,
+                "summary": "The radiologist found no problems with the heart or lungs.",
+                "impression": None,
+                "findings": [],
+            }
+        )
+    )
+
+    extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
+
+    row = _extraction_row(db_session, item_id)
+    assert row["data"]["fields"]["summary"] is None
+    assert "no_radiologist_read" in {flag["code"] for flag in row["data"]["flags"]}
+
+
+def test_a_section_read_as_entirely_empty_gets_the_generic_explanation(
     db_session, aws, test_settings, make_document
 ):
     """Insurance has no `no_radiologist_read` equivalent, so it must still say something.
 
-    Without this the policy completes with an empty card and nothing explaining it, which
-    is the failure the whole change exists to remove — just moved to another section.
+    Without this the policy completes with an empty card and nothing explaining it, and an
+    empty card with no reason reads as "the AI failed" rather than "there was nothing here
+    to read".
     """
     document_id = make_document(body=_pdf("20cm"))
     item_id = _seed_item(db_session, document_id)
     _seed_classification(db_session, item_id, document_id, "insurance")
-    ai = FakeAIProvider(response=structured_response(INSURANCE_PAYLOAD))
+    empty = dict.fromkeys(INSURANCE_PAYLOAD)
+    ai = FakeAIProvider(
+        response=structured_response({**empty, "covered_conditions": [], "exclusions": []})
+    )
 
     extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
-    assert ai.calls == []
     codes = {flag["code"] for flag in _extraction_row(db_session, item_id)["data"]["flags"]}
     assert "nothing_extracted" in codes
 
 
-def test_a_thin_but_real_document_is_still_read(db_session, aws, test_settings, make_document):
-    """The guard bites only on noise. Bias low: a short real document still reaches the model."""
+def test_a_document_that_was_read_gets_no_empty_card_flag(
+    db_session, aws, test_settings, make_document
+):
+    """The other direction: one field read is enough to mean the card is not empty."""
     document_id = make_document(body=_pdf("Covishield Dose 2 on 23/12/2021"))
     item_id = _seed_item(db_session, document_id)
     _seed_classification(db_session, item_id, document_id, "vaccinations")
@@ -275,8 +318,29 @@ def test_a_thin_but_real_document_is_still_read(db_session, aws, test_settings, 
 
     extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
 
+    row = _extraction_row(db_session, item_id)
     assert len(ai.calls) == 1
-    assert _extraction_row(db_session, item_id)["data"]["fields"]["vaccine_name"] == "Covishield"
+    assert row["data"]["fields"]["vaccine_name"] == "Covishield"
+    assert "nothing_extracted" not in {flag["code"] for flag in row["data"]["flags"]}
+
+
+def test_the_document_itself_is_sent_not_its_text(db_session, aws, test_settings, make_document):
+    """The whole change, pinned: this stage sends the FILE, like reports and prescriptions.
+
+    Sending text instead is what put a benefit table's neighbouring column into a sum
+    insured, and it is the regression this test exists to catch.
+    """
+    document_id = make_document(body=_pdf())
+    item_id = _seed_item(db_session, document_id)
+    _seed_classification(db_session, item_id, document_id, "insurance")
+    ai = FakeAIProvider(response=structured_response(INSURANCE_PAYLOAD))
+
+    extract_section(_context(db_session, aws, test_settings, document_id, item_id, ai))
+
+    call = ai.calls[-1]
+    assert call["document"] is not None, "the stage sent text, not the document"
+    assert call["document"].content_type == "application/pdf"
+    assert call["document"].data.startswith(b"%PDF")
 
 
 def test_unhandled_section_is_rejected_not_retried(db_session, aws, test_settings, make_document):

@@ -52,7 +52,33 @@ logger = logging.getLogger(__name__)
 #: ins-2026-08-31b states each field's CHARACTER limit beside its word budget. Words were
 #: the only unit given before, and a model counts them badly enough that `summary` came
 #: back at 779 against a 700-char cap it had never been told about.
-PROMPT_VERSION = "ins-2026-08-31b"
+#: ins-2026-09-01 stopped sending results flagged `normal`. Every flag is computed in
+#: Python — against the R&D ideal range where one resolved — so a normal result is a
+#: settled question, and the prompt already forbade giving one its own insight.
+#:
+#: **Measured both ways on two real full-body panels before changing anything**
+#: (`docs/live-runs/2026-09-01-insights-payload-ab.md`), because the objection to it was
+#: that an insight might quietly lean on a normal result for context:
+#:
+#: * **it does not.** Across 48- and 73-result panels and ten insights, **not one normal
+#:   result was cited in `related_tests`**. The context those rows were paying for was
+#:   never used.
+#: * **coverage did not regress; it improved.** On the 73-result panel the full payload
+#:   missed two flagged results, the trimmed one missed one.
+#: * **the summary got more accurate, which was not the point but is the best part.**
+#:   Asked to count normals from rows, the model got it wrong both times (28 against 32,
+#:   45 against 62). Given `normal_count` it was exact both times. Counting rows is
+#:   arithmetic, and this codebase does arithmetic in Python.
+#: * cost: input tokens down 43% and 61%, but **output did not shrink** (it grew 22% on one),
+#:   and output bills at 5x input — so the real saving is ~19% of the stage on Sonnet
+#:   prices, not the 60% the input cut suggests. Worth having, smaller than it looks.
+#:
+#: **The residual risk, stated plainly:** an insight can no longer use a normal result as
+#: context — a high neutrophil percentage beside a normal absolute count now reaches the
+#: model as the percentage alone. The measurement says that is not happening today; it does
+#: not prove it never would. And both arms ran on Gemini because the Anthropic account was
+#: out of credit, so Sonnet's PROSE under this payload is still unverified.
+PROMPT_VERSION = "ins-2026-09-01"
 #: ins-5 shortened ``risk_patterns`` (60 -> 40 words) and ``summary`` (unbudgeted -> 60),
 #: with their caps moved down to match. The shape is unchanged — same five fields, same
 #: rules — but payloads either side of the boundary are not comparable in LENGTH, which
@@ -338,8 +364,11 @@ SYSTEM_PROMPT = (
     "on every payload already says that. Give the reader something to act on instead.\n\n"
     "**Write an insight ONLY for results flagged 'low' or 'high'.** Nothing else earns "
     "one:\n"
-    "- A result flagged 'normal' NEVER gets its own insight. Use it as context inside "
-    "another finding if it sharpens the picture, and nothing more.\n"
+    "- **Results that came back NORMAL are not given to you.** Only the ones that need "
+    "interpreting are: everything flagged 'low' or 'high', plus anything the system could "
+    "not check. How many were normal is in 'normal_count'. Do not ask for the others, do "
+    "not guess which tests they were, and never imply you have seen a result you were not "
+    "given.\n"
     "- **Never write a round-up insight** — no 'Remaining Tests - All Within Normal "
     "Limits', no 'Other Results', no 'Everything Else Is Fine'. The summary already "
     "covers what came back normal. A card that says nothing happened is a card the "
@@ -349,9 +378,10 @@ SYSTEM_PROMPT = (
     "tests in the SUMMARY instead, in one clause — 'X and Y were reported without "
     "reference ranges, so they could not be checked'.\n\n"
     "summary: TWO OR THREE SHORT SENTENCES, AT MOST 60 WORDS / 700 CHARACTERS, covering "
-    "the whole panel — "
-    "what was flagged, grouped sensibly, and what came back within range. Written for "
-    "someone reading it before any of the detail below it."
+    "the whole panel — what was flagged, grouped sensibly, and how many came back within "
+    "range. Use 'normal_count' for that last part and state it as a number ('the other 41 "
+    "results were within their normal ranges'); you were not given those results, so do "
+    "not name them. Written for someone reading it before any of the detail below it."
 )
 
 INSTRUCTION_PREFIX = (
@@ -452,26 +482,51 @@ def _load_extraction(ctx: StageContext) -> dict[str, Any]:
     return dict(data)
 
 
+#: The fields of a result the model may see. ``flagged_against`` is here and
+#: ``reference_range`` is NOT, and that is the point. The two are the same number until an
+#: approved ideal range is in play, and then they are not: the flag is computed against
+#: R&D's age-bracket bounds while the report goes on printing the lab's own. A model shown
+#: only the printed range would write "8.6, above the normal top of 8.0" about a value that
+#: crossed a different limit entirely — citing a number the reader can see on their own
+#: report, beside a verdict it does not support. Sending one range rather than both is
+#: deliberate: the prompt tells the model to quote the limit that was crossed, and given two
+#: it would have to choose, which is a judgement this stage exists to keep away from it.
+_SENT_FIELDS = ("test_name", "value", "unit", "flagged_against", "abnormal_flag")
+
+
 def _context_json(extraction: dict[str, Any]) -> str:
-    """The subset of the extraction the model may reason over — including OUR abnormal
-    flag, so it uses the deterministic verdict rather than re-judging ranges.
+    """What the model may reason over: the results that need interpreting, and nothing else.
 
-    ``flagged_against`` is here and ``reference_range`` is NOT, and that is the point. The
-    two are the same number until an approved ideal range is in play, and then they are
-    not: the flag is computed against R&D's age-bracket bounds while the report goes on
-    printing the lab's own. A model shown only the printed range would write "8.6, above
-    the normal top of 8.0" about a value that crossed a different limit entirely — citing
-    a number the reader can see on their own report, beside a verdict it does not support.
+    **Results flagged ``normal`` are not sent** (2026-09-01). Every flag is already computed
+    in Python — against the R&D-approved ideal range where one resolved, the report's own
+    printed range otherwise — so a normal result is a settled question, and the prompt has
+    always forbidden giving one its own insight. Sending forty of them bought one sentence
+    in the summary and paid for the whole panel to be re-read. They are still extracted,
+    still stored, and still shown to the reader in the results table; they are simply not
+    part of what the model is asked about.
 
-    Sending one range rather than both is deliberate. The prompt tells the model to quote
-    the limit that was crossed; given two, it has to choose, and that is a judgement this
-    stage exists to keep away from the model.
+    **Results with a NULL flag are sent, and that is not an oversight.** Null means the
+    system could not check the value against any range at all — no approved THP matched, or
+    the report printed a unit with no curated conversion — which is a different thing from
+    "in range" and the one case the reader most needs named. The prompt requires them
+    listed in the summary, so they have to be in the payload to be listed.
+
+    **``normal_count`` replaces the rows it stands for.** The summary is required to say
+    what came back within range, and with the normals gone the model would otherwise have
+    to either omit that or invent it. A count is the whole of what that sentence needs, and
+    it cannot be misquoted as a value.
     """
+    results = extraction.get("results", [])
     rows = [
-        {k: r.get(k) for k in ("test_name", "value", "unit", "flagged_against", "abnormal_flag")}
-        for r in extraction.get("results", [])
+        {k: r.get(k) for k in _SENT_FIELDS} for r in results if r.get("abnormal_flag") != "normal"
     ]
-    return json.dumps({"results": rows, "report_date": extraction.get("report_date")})
+    return json.dumps(
+        {
+            "results": rows,
+            "normal_count": sum(1 for r in results if r.get("abnormal_flag") == "normal"),
+            "report_date": extraction.get("report_date"),
+        }
+    )
 
 
 def _persist_insights(ctx: StageContext, payload: dict[str, Any]) -> None:

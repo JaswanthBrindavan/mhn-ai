@@ -9,16 +9,32 @@ sends the document itself rather than its OCR text, because the dosing sits in a
 beside the medicine and flattening that puts a dose on the wrong row. The one section that
 remains rejected is ``medical_condition``, which is manual-entry-only by product decision.
 
-Flow: read this item's classification to learn the section, reload the source object,
-extract its TEXT (embedded layer first, Tesseract OCR for image-only pages), ask the
-model for that section's fields under a fixed schema, validate with Pydantic (never
-repaired), normalise dates in Python (never the model), then persist and log. A document
-with almost no text skips the model entirely and still completes — see ``MIN_TEXT_CHARS``.
+Flow: read this item's classification to learn the section, reload the source object, send
+the **document itself** to the vision model, validate with Pydantic (never repaired),
+normalise dates in Python (never the model), then persist and log.
 
-The model is given the extracted text, not the file — the opposite of what the report
-pipeline does. ``app.services.ocr`` carries that argument and what it costs; the part
-that matters here is that OCR provenance is stored in the payload, so a missing field
-can be traced to a bad scan rather than blamed on the model.
+**The document goes to the model, not its OCR'd text** (changed 2026-09-01). This stage
+used to flatten the page to text with Tesseract and send that. Both insurance defects ever
+found here were flattening artefacts in which OCR misread no character at all: a phantom
+benefit ``{"name": "Claims free", "cap": "4"}`` spliced out of a two-column table, and a
+sum insured glued to the column beside it (``"3,00,000 5,00,000"``, stored as thirty
+thousand crore). What was lost was which cell belongs to which column, which a better OCR
+engine cannot fix and vision does not create. The precedent was already in this repo:
+``prescriptions`` sends the document because "a prescription is a layout", and an insurance
+benefit table is the same shape.
+
+**What that cost, recorded honestly.** Attributability went with it — there is no
+``low_ocr_confidence`` or ``pages_not_read`` any more, so a missing field can no longer be
+traced to a bad scan rather than to the model. And vision has its own silent-omission mode
+(on a 34-page report the text path once found 102 results to vision's 69), which is why
+``INSTRUCTION`` below demands completeness the way ``extraction.INSTRUCTION`` does.
+
+**A scan image is still never described.** The model can now see the page, which makes the
+one thing this stage must not do newly reachable: reading the picture and reporting what it
+shows is diagnosis, not transcription, and nothing downstream could check it. The scans
+prompt forbids it explicitly and ``_drop_unsourced_summary`` is the Python backstop — a
+summary survives only when an impression or a finding it could have been written from
+survives. See ``docs/FUTURE.md`` § "The distinction this entry must not blur".
 
 Dates are normalised here rather than trusted from the model, for the same reason
 extraction computes abnormal flags in Python: a deterministic rule beats a prompt. An
@@ -31,22 +47,22 @@ printed in a column header rarely survives text extraction intact.
 Idempotent: the extraction row and the process log are upserted, so a redelivery that
 re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 
-Live since the auto-filing work. ``SECTION_PIPELINES`` routes insurance, scans/imaging and
-vaccinations here — the branch it once needed — and each runs this stage and stops. The
-supported set is derived from ``SECTION_SPECS``, so adding a section is an entry there and
-nothing else.
+Live since the auto-filing work. ``SECTION_PIPELINES`` routes insurance, scans/imaging,
+vaccinations and bills here, and each runs this stage and stops. The supported set is
+derived from ``SECTION_SPECS``, so adding a section is an entry there and nothing else.
 """
 
 import logging
 import time
 from functools import partial
-from typing import Any, get_origin
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.integrations.ai.base import AIProviderError
+from app.integrations.ai.factory import get_stage_provider
 from app.models.ai_results import AiReportClassification, AiSectionExtraction
 from app.services.ai_logging import (
     check_response,
@@ -57,26 +73,22 @@ from app.services.ai_logging import (
 from app.services.classification import DocumentSection
 from app.services.dates import add_interval, in_order, iso_date
 from app.services.money import normalise_amount, normalise_currency
-from app.services.ocr import ExtractedText, TextExtractionError, extract_text
-from app.services.section_specs import INSTRUCTION_PREFIX, SectionSpec, spec_for
+from app.services.section_specs import INSTRUCTION, SectionSpec, spec_for
 from app.services.source_loading import load_source_document
 from app.workers.stagetypes import RejectStageError, StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "sec-2026-08-11"
+#: sec-2026-09-01 is the vision rewrite: the model receives the document rather than its
+#: OCR'd text, so every prompt gained a completeness demand and the scans prompt gained an
+#: explicit ban on describing the image it can now see.
+PROMPT_VERSION = "sec-2026-09-01"
 #: sec-3 added ``next_due_interval``: a vaccination record stating "due after 4 weeks"
 #: rather than a date. The model used to compute that date; Python does now.
+#: The SHAPE is unchanged by the vision rewrite — same fields, same schemas — so this does
+#: not move. What changed is what the model was shown, which is what PROMPT_VERSION records.
 SCHEMA_VERSION = "sec-3"
 STAGE_NAME = "extracting_section"
-
-#: Below this many characters there is nothing a section's worth of fields could be read
-#: out of, so the model is not asked. A real chest X-ray reached production yielding **4**
-#: characters — a scale marking down the edge of the image — and we paid to be told seven
-#: nulls. The bias is deliberately low: too low costs a fraction of a cent, too high stops
-#: reading a thin but genuine document, and the sparsest real one this stage sees (a
-#: vaccination card naming a vaccine and a date) still runs to dozens of characters.
-MIN_TEXT_CHARS = 16
 
 
 def extract_section(ctx: StageContext) -> None:
@@ -85,31 +97,19 @@ def extract_section(ctx: StageContext) -> None:
     spec = _spec_or_reject(section)
 
     document = load_source_document(ctx)
-
-    try:
-        extracted = extract_text(document)
-    except TextExtractionError as exc:
-        # Unreadable by both the text layer and OCR — no model call is worth making.
-        _log(
-            ctx,
-            outcome="rejected",
-            error_code="text_extraction_failed",
-            detail=str(exc),
-            duration_ms=0,
-        )
-        raise RejectStageError("text_extraction_failed", str(exc)) from exc
-
-    if len(extracted.text.strip()) < MIN_TEXT_CHARS:
-        # Nothing a section's worth of fields could be read out of. Say so rather than
-        # paying to be told — and complete rather than reject, see _record_unread.
-        _record_unread(ctx, spec, extracted)
-        return
+    # Redirectable per stage, and DELIBERATELY so as of 2026-09-01. It used to call
+    # ``ctx.ai`` directly, which insulated it from every provider override — by accident,
+    # not by design, and the accident mattered more once the whole document started going
+    # to the model. Insights is the stage that must never be redirectable; this one is not
+    # that stage, and it transcribes rather than reasons.
+    provider = get_stage_provider(ctx.settings, ctx.ai, stage=STAGE_NAME)
 
     started = time.perf_counter()
     try:
-        response = ctx.ai.generate_structured(
+        response = provider.analyze_document(
+            document=document,
             system=spec.system_prompt,
-            instruction=INSTRUCTION_PREFIX + extracted.text,
+            instruction=INSTRUCTION,
             json_schema=spec.json_schema,
             max_tokens=spec.max_tokens,
         )
@@ -148,7 +148,7 @@ def extract_section(ctx: StageContext) -> None:
         )
         raise TransientStageError("section extraction output failed validation") from exc
 
-    payload = build_payload(spec, result, extracted)
+    payload = build_payload(spec, result)
     _persist(ctx, section, payload)
     _log(ctx, outcome="succeeded", response=response, duration_ms=duration_ms)
 
@@ -201,66 +201,6 @@ def record_section_mismatch(
     )
 
 
-def _record_unread(ctx: StageContext, spec: SectionSpec, extracted: ExtractedText) -> None:
-    """Record a document nothing could be read out of — completed, not rejected.
-
-    This used to raise ``RejectStageError("no_text_extracted")``, and rejecting is the
-    wrong verdict. Filing has already happened by the time this stage runs, so a reject
-    stamps ``content.ai.state = "failed"`` on a document that is perfectly fine — it is a
-    photograph of an X-ray, and there is no text on an X-ray. The user was then shown a
-    failed document, or nothing at all, for a file we had handled correctly.
-
-    Completing with empty fields and the flags that explain them is the honest record, and
-    it is the shape ``record_section_mismatch`` already uses: no model call, so the process
-    log records ``"skipped"`` for provider and model rather than claiming one that never
-    happened. ``build_payload`` supplies the rest — ``no_radiologist_read`` for a scan with
-    no report behind it, the OCR provenance, and the confidence flag.
-
-    The flag below is added because the scans one is not universal: an insurance policy
-    that yields no text would otherwise complete with an empty card and nothing saying why,
-    which is the failure this whole change exists to remove. It is *skipped* when the
-    section already produced its own explanation — the app renders each of these as its own
-    line, so a second sentence saying the same thing makes the card worse rather than more
-    informative.
-    """
-    payload = build_payload(spec, _empty_result(spec), extracted)
-    if not any(flag["code"] == "no_radiologist_read" for flag in payload["flags"]):
-        payload["flags"].append(
-            {
-                "code": "nothing_extracted",
-                "field": "",
-                "detail": (
-                    "No readable text was found in this document, so nothing could be "
-                    "taken out of it. It is saved and you can open it any time."
-                ),
-            }
-        )
-    _persist(ctx, spec.section, payload)
-    _log(ctx, outcome="succeeded", duration_ms=0)
-    logger.info(
-        "section_extraction_skipped_no_text",
-        extra={
-            "item_id": str(ctx.item_id),
-            "section": spec.section.value,
-            "chars": len(extracted.text.strip()),
-        },
-    )
-
-
-def _empty_result(spec: SectionSpec) -> BaseModel:
-    """The spec's own model with nothing in it, to feed ``build_payload``.
-
-    ``model_construct`` rather than the constructor: there is no model output to validate
-    here, and the list fields (``findings``, ``exclusions``, …) are the only required ones,
-    so validating would mean inventing values to satisfy a schema nothing filled.
-    """
-    empty: dict[str, Any] = {
-        name: [] if get_origin(field.annotation) is list else None
-        for name, field in spec.model.model_fields.items()
-    }
-    return spec.model.model_construct(**empty)
-
-
 #: Section names as a person would say them, for the sentence above.
 _SECTION_LABEL = {
     DocumentSection.REPORTS: "a lab report",
@@ -278,10 +218,8 @@ def _article(section: DocumentSection) -> str:
     return _SECTION_LABEL.get(section, section.value.replace("_", " "))
 
 
-def build_payload(
-    spec: SectionSpec, result: BaseModel, extracted: ExtractedText | None = None
-) -> dict[str, Any]:
-    """The stored shape: validated fields, ISO dates, data-quality flags, OCR provenance.
+def build_payload(spec: SectionSpec, result: BaseModel) -> dict[str, Any]:
+    """The stored shape: validated fields, ISO dates, and data-quality flags.
 
     Separated from the stage so it can be exercised without a database or a model call.
     """
@@ -299,16 +237,13 @@ def build_payload(
 
     flags = _date_flags(spec, fields)
     flags.extend(_drop_unsourced_summary(spec, fields))
+    flags.extend(_nothing_extracted(fields, flags))
 
-    payload: dict[str, Any] = {
+    return {
         "section": spec.section.value,
         "fields": fields,
         "flags": flags,
     }
-    if extracted is not None:
-        payload["source"] = extracted.as_metadata()
-        payload["flags"].extend(_ocr_flags(extracted))
-    return payload
 
 
 # --- helpers ----------------------------------------------------------------
@@ -380,34 +315,40 @@ def _drop_unsourced_summary(spec: SectionSpec, fields: dict[str, Any]) -> list[d
     ]
 
 
-#: Below this mean Tesseract confidence the read is unreliable enough that a missing
-#: field is more likely a bad scan than a bad model. Flagged, not rejected — a poor scan
-#: still yields usable fields, and discarding them helps nobody.
-LOW_CONFIDENCE_THRESHOLD = 0.60
+def _nothing_extracted(fields: dict[str, Any], flags: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Say so when the model read nothing off the document at all.
 
+    Derived from the payload rather than from a text-length pre-check, which is what this
+    replaced. The old gate measured the OCR'd text and skipped the model below sixteen
+    characters; with the document going to the model there is nothing to measure in
+    advance, and a bare X-ray is a model call worth a fraction of a cent rather than a
+    branch.
 
-def _ocr_flags(extracted: ExtractedText) -> list[dict[str, str]]:
-    """Surface a weak read so a reviewer can tell OCR apart from model error."""
-    flags: list[dict[str, str]] = []
-    confidence = extracted.mean_confidence
-    if confidence is not None and confidence < LOW_CONFIDENCE_THRESHOLD:
-        flags.append(
-            {
-                "code": "low_ocr_confidence",
-                "field": "",
-                "detail": f"mean OCR confidence {confidence:.2f}",
-            }
-        )
-    skipped = [p for p in extracted.pages if p.method == "skipped"]
-    if skipped:
-        flags.append(
-            {
-                "code": "pages_not_read",
-                "field": "",
-                "detail": f"{len(skipped)} page(s) past the OCR cap were not read",
-            }
-        )
-    return flags
+    The behaviour it preserves is the one that matters. An empty card with nothing saying
+    why reads as "the AI failed" rather than "there was nothing here to read" — the same
+    absence-versus-failure confusion the pending-document note had. Completing with an
+    explanation is the honest record; rejecting would stamp ``content.ai.state = "failed"``
+    on a document that was filed correctly and is fine.
+
+    **Skipped when the section already explained itself.** A scan with no radiologist's
+    report emits ``no_radiologist_read``, which says the same thing in that section's own
+    words, and the app gives every flag its own line — so a second sentence makes the card
+    worse rather than more informative.
+    """
+    if any(value for value in fields.values()):
+        return []
+    if any(flag["code"] == "no_radiologist_read" for flag in flags):
+        return []
+    return [
+        {
+            "code": "nothing_extracted",
+            "field": "",
+            "detail": (
+                "Nothing could be read from this document. It is saved and you can "
+                "open it any time."
+            ),
+        }
+    ]
 
 
 def _classified_section(ctx: StageContext) -> DocumentSection:

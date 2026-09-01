@@ -26,7 +26,10 @@ def _settings(**over) -> Settings:
     return Settings(**{**base, **over})
 
 
-@pytest.mark.parametrize("stage", ["classifying", "extracting", "generating_insights"])
+@pytest.mark.parametrize(
+    "stage",
+    ["classifying", "extracting", "extracting_section", "generating_insights"],
+)
 def test_no_override_returns_the_injected_provider(stage):
     injected = _Sentinel()
     assert get_stage_provider(_settings(), injected, stage=stage) is injected
@@ -35,8 +38,25 @@ def test_no_override_returns_the_injected_provider(stage):
 def test_insights_has_no_override_even_when_others_are_set():
     """Insights is the patient-facing reasoning stage; it must not be swappable by config."""
     injected = _Sentinel()
-    settings = _settings(classification_provider="gemini", extraction_provider="gemini")
+    settings = _settings(
+        classification_provider="gemini",
+        extraction_provider="gemini",
+        section_provider="gemini",
+        prescription_provider="gemini",
+    )
     assert get_stage_provider(settings, injected, stage="generating_insights") is injected
+
+
+def test_section_extraction_is_redirectable_on_purpose():
+    """It calls ``get_stage_provider`` rather than ``ctx.ai``, and that is deliberate now.
+
+    It used to call ``ctx.ai`` directly, which made it the one transcription stage no
+    configuration could move — insulation by accident. That accident mattered more once the
+    whole document started going to the model, so the override exists and is named.
+    """
+    settings = _settings(section_provider="gemini", google_api_key="")
+    with pytest.raises(RuntimeError, match="GOOGLE_API_KEY"):
+        get_stage_provider(settings, _Sentinel(), stage="extracting_section")
 
 
 def test_an_unknown_stage_falls_back_to_the_injected_provider():

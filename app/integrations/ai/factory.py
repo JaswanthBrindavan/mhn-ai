@@ -39,6 +39,16 @@ _STAGE_OVERRIDES = {
     # automatically right for the other, and pinning them together would mean a change
     # measured on reports silently moves prescriptions too.
     "extracting_prescription": ("prescription_provider", "ai_model_prescription"),
+    # Section documents (insurance, scans, vaccinations, bills). Its own pair for the
+    # reason prescriptions has one: a policy schedule, an X-ray and a vaccination card are
+    # not the same reading problem as a lab panel, so a model measured on reports must not
+    # silently move them too.
+    #
+    # DELIBERATE as of 2026-09-01. This stage previously called ``ctx.ai`` directly and so
+    # could not be redirected at all — insulation by accident rather than by design, and an
+    # accident that mattered more the moment the whole document started going to the model
+    # rather than its OCR'd text.
+    "extracting_section": ("section_provider", "ai_model_section"),
 }
 
 

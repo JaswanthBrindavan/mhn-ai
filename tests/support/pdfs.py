@@ -2,7 +2,7 @@
 
 Most fixtures get away with placeholder bytes (`b"%PDF-1.4 fake report"`), because the
 report pipeline hands the file to the model without opening it. Anything that goes through
-``app.services.ocr`` does open it, so those tests need a genuine PDF.
+``app.services.text_layer`` does open it, so those tests need a genuine PDF.
 
 reportlab is a dev-only dependency: neither pdfplumber nor pypdfium2 can *create* a PDF —
 they read and render — and a fixture written in code beats a committed binary.
