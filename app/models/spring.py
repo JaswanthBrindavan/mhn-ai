@@ -115,6 +115,22 @@ insurance = Table(
     # The date printed on the document, chosen by app/services/document_date.py.
     # NOT created_at, which is the moment this service filed the row.
     Column("date", DateTime(timezone=True), nullable=True),
+    # The policy's own period. `to_date` is what a renewal alarm is computed from, and
+    # both were null on every policy ever filed until filing began writing them
+    # (2026-08-31) -- the values had been sitting in `content` all along.
+    Column("from_date", DateTime(timezone=True), nullable=True),
+    Column("to_date", DateTime(timezone=True), nullable=True),
+    # numeric(12, 2), wider than the bills pair: a sum insured of one crore is eight
+    # digits before a policy is unusual, and an over-ceiling value is skipped rather than
+    # truncated -- so too narrow a column empties exactly the largest policies.
+    Column("sum_insured", Numeric(12, 2), nullable=True),
+    Column("premium", Numeric(12, 2), nullable=True),
+    # One currency for BOTH amounts, as bills does it: a policy prints one.
+    Column(
+        "amount_currency",
+        ENUM("INR", "USD", "EUR", "GBP", name="currency_enum", create_type=False),
+        nullable=True,
+    ),
 )
 
 #: The prescriptions section. INSERTed into when a prescription is filed; read otherwise.
@@ -191,6 +207,10 @@ vaccinations = Table(
     # NOT created_at, which is the moment this service filed the row.
     Column("date", DateTime(timezone=True), nullable=True),
     Column("next_due_on", DateTime(timezone=True), nullable=True),
+    # Which dose this record is, as printed: "Booster", "Dose 2 of 3", "Td". Free text at
+    # 128 to match the extraction's own cap on `dose_info` -- an integer column would
+    # force a parse that silently drops three of those four.
+    Column("dose", String(128), nullable=True),
 )
 
 # --- Staff-dashboard THP tables (read-only) ---------------------------------
