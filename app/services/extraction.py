@@ -11,6 +11,7 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 
 import logging
 import time
+from datetime import date
 from functools import partial
 from typing import Any
 
@@ -27,6 +28,7 @@ from app.services.ai_logging import (
     log_process,
     sanitize_validation_error,
 )
+from app.services.dates import parse_date
 from app.services.source_loading import load_source_document
 from app.services.thp_fallback import FallbackEntry, record_fallbacks
 from app.workers.stagetypes import StageContext, TransientStageError
@@ -226,6 +228,30 @@ def extract_report(ctx: StageContext) -> None:
 # --- helpers ----------------------------------------------------------------
 
 
+#: Symbols a lab prints BESIDE a test name to mark the value abnormal or critical — the
+#: legend on a MedPlus report reads "Abnormal * Critical". They qualify the reading, not
+#: the analyte, and the model transcribes the name as printed, so they arrive attached to
+#: it.
+_ABNORMAL_MARKERS = "*†‡#!^"
+
+
+def name_key(name: str) -> str:
+    """What counts as the same test, for deduplication only. Never stored.
+
+    Case and **all** whitespace are dropped, so ``BILIRUBIN -DIRECT`` and
+    ``BILIRUBIN - DIRECT`` are one test, as are ``HDL / LDL RATIO`` and ``HDL/LDL RATIO``.
+    Two genuinely different analytes never differ by spacing alone.
+
+    Trailing abnormality markers go too, and that one is not cosmetic. A cumulative report
+    printed the same reading twice — once in the current-visit column marked
+    ``Cholesterol - LDL (Direct) *`` with its reference range, once in the comparison table
+    as ``Cholesterol - LDL (Direct)`` with none. Different keys, so BOTH survived: the
+    reader saw one LDL flagged high and a second identical LDL reported as impossible to
+    check, and the insights model was handed both.
+    """
+    return "".join(name.lower().split()).strip(_ABNORMAL_MARKERS)
+
+
 def _informativeness(row: ExtractedLabResult) -> tuple[int, int, int]:
     """How much a row tells us, for picking between duplicates. Higher wins."""
     return (
@@ -264,7 +290,7 @@ def _dedupe_results(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
     best: dict[tuple[str, str], ExtractedLabResult] = {}
     order: list[tuple[str, str]] = []
     for row in rows:
-        key = ("".join(row.test_name.lower().split()), (row.observed_date or "").strip())
+        key = (name_key(row.test_name), (row.observed_date or "").strip())
         if key not in best:
             best[key] = row
             order.append(key)
@@ -329,12 +355,47 @@ def _normalize(
             )
 
     payload = {
-        "results": enriched,
+        "results": mark_superseded(enriched),
         "report_date": result.report_date,
         "patient_age": result.patient_age,
         "patient_gender": result.patient_gender,
     }
     return payload, fallbacks
+
+
+def mark_superseded(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flag each result a LATER observation of the same test replaces. Mutates and returns.
+
+    A cumulative report prints the same analyte across several visits, and every copy is
+    kept — the trend is what such a report is for. But every consumer then has to work out
+    which reading is current, and there are three of them: the insights payload, the app's
+    results table, and anything added later. Deciding it once here is the same rule this
+    codebase applies to abnormal flags, dates, money and dose schedules; the alternative is
+    a second implementation in TypeScript, and two answers to "which value is today's" is
+    strictly worse than none.
+
+    **Only a strictly LATER parseable date supersedes.** Two undated rows both stand, and a
+    dated row never displaces an undated one — "no date" is not evidence of being older. So
+    an ordinary single-visit report gets ``superseded: False`` on every row and nothing
+    changes for it.
+
+    Absent on extractions written before 2026-09-02. Every consumer reads it as falsy,
+    which is exactly the old behaviour, and a re-run rewrites the payload.
+    """
+    latest: dict[str, date] = {}
+    for row in results:
+        when = parse_date(row.get("observed_date"))
+        if when is None:
+            continue
+        key = name_key(str(row.get("test_name") or ""))
+        if key not in latest or when > latest[key]:
+            latest[key] = when
+
+    for row in results:
+        when = parse_date(row.get("observed_date"))
+        newest = latest.get(name_key(str(row.get("test_name") or "")))
+        row["superseded"] = bool(when and newest and when < newest)
+    return results
 
 
 def _persist_extraction(ctx: StageContext, payload: dict[str, Any]) -> None:

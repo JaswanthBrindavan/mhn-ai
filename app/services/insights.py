@@ -494,6 +494,39 @@ def _load_extraction(ctx: StageContext) -> dict[str, Any]:
 _SENT_FIELDS = ("test_name", "value", "unit", "flagged_against", "abnormal_flag")
 
 
+def _current_only(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop a result that a later observation of the SAME test supersedes.
+
+    Reads the ``superseded`` flag ``extraction.mark_superseded`` already computed rather
+    than re-deriving it, so this stage and the app's results table cannot disagree about
+    which reading is current. Absent on an extraction written before 2026-09-02, which
+    reads as falsy — the old behaviour, and a re-run rewrites the payload.
+
+    A cumulative report prints the same analyte across several visits — "YOUR CURRENT
+    VISIT" beside "FROM YOUR PREVIOUS 3 VISITS" — and ``extraction._dedupe_results`` keeps
+    every one of them **on purpose**: the trend is what such a report is for, and its
+    docstring says losing half of it is silent. That is right for what is STORED.
+
+    It is wrong for what is interpreted. ``_context_json`` sends no ``observed_date``, so
+    the model cannot tell a current value from a sixteen-month-old one and will write
+    about whichever it is handed. On the report that found this (document 32): current
+    triglycerides 139, in range — and the 2024 column's 219, out of range. The reader
+    would have been told their triglycerides are high, with a real number, from a value
+    that is no longer true.
+
+    **The normals filter above made that certain rather than likely.** The current 139 is
+    ``normal`` and is dropped there, so the stale 219 was the only triglycerides row left
+    in the payload. Two changes that are each correct alone, and together produce a
+    confident falsehood.
+
+    Only a STRICTLY LATER parseable date supersedes, which is the refuse-rather-than-guess
+    rule the rest of this pipeline follows. Two undated rows both survive; a dated row
+    never displaces an undated one, because "no date" is not evidence of being older. So
+    an ordinary single-visit report is untouched — nothing in it has a later twin.
+    """
+    return [r for r in results if not r.get("superseded")]
+
+
 def _context_json(extraction: dict[str, Any]) -> str:
     """What the model may reason over: the results that need interpreting, and nothing else.
 
@@ -516,7 +549,7 @@ def _context_json(extraction: dict[str, Any]) -> str:
     to either omit that or invent it. A count is the whole of what that sentence needs, and
     it cannot be misquoted as a value.
     """
-    results = extraction.get("results", [])
+    results = _current_only(extraction.get("results", []))
     rows = [
         {k: r.get(k) for k in _SENT_FIELDS} for r in results if r.get("abnormal_flag") != "normal"
     ]

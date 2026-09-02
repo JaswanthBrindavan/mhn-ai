@@ -8,7 +8,12 @@ which limit the reader is told their result crossed.
 
 import json
 
-from app.services.insights import SYSTEM_PROMPT, _context_json, _needs_interpretation
+from app.services.extraction import mark_superseded
+from app.services.insights import (
+    SYSTEM_PROMPT,
+    _context_json,
+    _needs_interpretation,
+)
 
 
 def _rows(extraction: dict) -> list[dict]:
@@ -167,3 +172,102 @@ def test_the_prompt_tells_the_model_the_normals_are_missing() -> None:
     it — which is exactly when it starts describing results it was never given."""
     assert "normal_count" in SYSTEM_PROMPT
     assert "are not given to you" in SYSTEM_PROMPT
+
+
+# --- cumulative reports -------------------------------------------------------
+#
+# `_current_only` reads the `superseded` flag rather than re-deriving it, so these build
+# their fixtures through `mark_superseded` — the real chain, extraction marking and
+# insights filtering. Setting the flag by hand here would test the filter against an
+# assumption instead of against what extraction actually writes.
+
+
+def _dated(name: str, value: str, flag: str | None, observed: str | None) -> dict:
+    return {
+        "test_name": name,
+        "value": value,
+        "unit": "mg/dL",
+        "reference_range": "0 - 150",
+        "flagged_against": "0 - 150",
+        "abnormal_flag": flag,
+        "observed_date": observed,
+    }
+
+
+def _marked(*rows: dict) -> dict:
+    return {"results": mark_superseded(list(rows))}
+
+
+def test_a_superseded_result_is_not_interpreted() -> None:
+    """Document 32: a cumulative report with "YOUR CURRENT VISIT" beside "FROM YOUR
+    PREVIOUS 3 VISITS".
+
+    Both readings are STORED on purpose — `_dedupe_results` keeps the trend, and its
+    docstring says losing half of it is silent. But `_context_json` sends no
+    `observed_date`, so the model cannot tell them apart and writes about whichever it is
+    handed. Here the current triglycerides is 139 and in range; the 2024 column's 219 is
+    not. Without this the reader is told their triglycerides are high, with a real
+    number, from a value sixteen months stale.
+
+    The normals filter made that certain rather than likely: 139 is `normal` and is
+    dropped, so 219 was the ONLY triglycerides row left in the payload.
+    """
+    extraction = _marked(
+        _dated("Triglycerides", "139", "normal", "18-Mar-26"),
+        _dated("Triglycerides", "219", "high", "25-Nov-24"),
+    )
+
+    assert _rows(extraction) == []
+    # And it counts as the normal it is, rather than vanishing from the tally.
+    assert _context(extraction)["normal_count"] == 1
+
+
+def test_the_marker_on_one_copy_does_not_hide_the_supersession() -> None:
+    """The current copy is the one the lab marked abnormal, so the names differ by an
+    asterisk. Same test, and the older reading must still be dropped."""
+    extraction = _marked(
+        _dated("Cholesterol - LDL (Direct) *", "123", "high", "18-Mar-26"),
+        _dated("Cholesterol - LDL (Direct)", "142", "high", "25-Nov-24"),
+    )
+
+    assert [r["value"] for r in _rows(extraction)] == ["123"]
+
+
+def test_two_undated_results_both_survive() -> None:
+    """Only a strictly LATER date supersedes. With no dates there is nothing to order
+    by, and dropping one would be a guess about which reading is current."""
+    extraction = _marked(
+        _dated("Ferritin", "30", "low", None),
+        _dated("Ferritin", "45", "high", None),
+    )
+
+    assert len(_rows(extraction)) == 2
+
+
+def test_a_dated_result_does_not_displace_an_undated_one() -> None:
+    """ "No date" is not evidence of being older, so it is never treated as superseded."""
+    extraction = _marked(
+        _dated("Ferritin", "30", "low", "18-Mar-26"),
+        _dated("Ferritin", "45", "high", None),
+    )
+
+    assert len(_rows(extraction)) == 2
+
+
+def test_an_ordinary_single_visit_report_is_untouched() -> None:
+    """Nothing in it has a later twin, so the filter is a no-op — which is what keeps
+    this change confined to the cumulative case that motivated it."""
+    extraction = _marked(
+        _dated("Triglycerides", "219", "high", "18-Mar-26"),
+        _dated("Cholesterol - HDL", "30", "low", "18-Mar-26"),
+    )
+
+    assert len(_rows(extraction)) == 2
+
+
+def test_an_extraction_written_before_the_flag_existed_is_unchanged() -> None:
+    """No `superseded` key at all reads as falsy — the behaviour before 2026-09-02, and
+    a re-run rewrites the payload."""
+    extraction = {"results": [_dated("Triglycerides", "219", "high", "25-Nov-24")]}
+
+    assert len(_rows(extraction)) == 1

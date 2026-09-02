@@ -206,3 +206,21 @@ def test_interval_days_and_add_interval_agree_on_a_range():
     """One parser, so an end date and a day count cannot disagree about "6-8 weeks"."""
     assert interval_days("6-8 weeks") == 42
     assert add_interval("01/01/2026", "6-8 weeks") == "2026-02-12"  # 01 Jan + 42 days
+
+
+def test_a_hyphenated_month_abbreviation_parses() -> None:
+    """ "18-Mar-26" — how Indian lab reports routinely date a column.
+
+    Unparseable until 2026-09-02, and it cost more than a date: `document_date.pick`
+    chooses the wallet date from these, so every report from a lab printing this shape
+    filed with a null date and showed the reader an empty field to fill in.
+    """
+    assert parse_date("18-Mar-26") == date(2026, 3, 18)
+    assert parse_date("25-Nov-24") == date(2024, 11, 25)
+    assert parse_date("18-Mar-2026") == date(2026, 3, 18)
+    assert parse_date("18-March-2026") == date(2026, 3, 18)
+
+
+def test_a_numeric_hyphenated_date_is_still_day_first() -> None:
+    """The new formats need an alphabetic month, so they cannot capture this one."""
+    assert parse_date("03-07-2014") == date(2014, 7, 3)
