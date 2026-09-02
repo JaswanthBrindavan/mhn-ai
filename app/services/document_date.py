@@ -57,6 +57,24 @@ _NEVER: dict[str, tuple[str, ...]] = {
 #: One day of slack. A document issued today in a timezone ahead of ours is not an error.
 _FUTURE_SLACK = timedelta(days=1)
 
+#: How far back from the newest date on the page a date can sit and still belong to the
+#: same visit.
+#:
+#: A document's own dates cluster: collected, received, released are days apart, and a
+#: slow culture or histopathology report stretches that to a few weeks. A PREVIOUS VISIT
+#: does not cluster — some labs print a comparison table ("YOUR CURRENT VISIT" beside
+#: "FROM YOUR PREVIOUS 3 VISITS", the previous three being within two years), and the
+#: dates in it are months or years back.
+#:
+#: Without this the fallback below took a reading from November 2024 as the date of a
+#: report from March 2026: the rule is "earliest wins", which is right for administrative
+#: dates and wrong for another visit entirely. Measured on document 114.
+#:
+#: The window is relative to the newest date ON THE PAGE, never to today, so an old
+#: document uploaded now is unaffected — its own dates are still the newest it prints.
+#: A date of birth, decades back, falls outside it for free.
+_SAME_VISIT_WINDOW = timedelta(days=60)
+
 
 def pick(
     section: str,
@@ -89,6 +107,13 @@ def pick(
 
     if not usable:
         return None, None
+
+    # Anything belonging to an earlier visit is out of the running entirely — before the
+    # priority list, not just before the fallback. A comparison table's columns are dates
+    # with no label at all, but nothing guarantees a stale one cannot carry a label the
+    # priority list matches, and a labelled date from 2024 must not date a 2026 report.
+    newest = max(parsed for _, parsed in usable)
+    usable = [pair for pair in usable if pair[1] >= newest - _SAME_VISIT_WINDOW]
 
     for fragment in _PRIORITY.get(section, ()):
         for label, parsed in usable:
