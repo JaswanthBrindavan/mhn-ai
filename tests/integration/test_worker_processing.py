@@ -1430,7 +1430,11 @@ def test_filing_a_document_tells_spring_where_it_went(
             # What the row said at the moment it appeared. The stages that follow update
             # it; the announcement is about arriving, not about finishing.
             "state": "classified",
-        }
+        },
+        # And then, once the run comes to rest, a second announcement carrying nothing but
+        # the document. It is not about where the document went — Spring already knows —
+        # but about there being nothing further coming without the reader.
+        {"document_id": document_id},
     ]
 
 
@@ -1454,7 +1458,9 @@ def test_a_mismatched_document_is_announced_too(
     )
 
     assert outcome is Outcome.REJECTED
-    assert [n["section"] for n in sent] == ["reports"]  # where the USER put it
+    # The filing announcement, then the settling one. `None` is not a missing section: it
+    # is the second announcement, which deliberately carries no location at all.
+    assert [n.get("section") for n in sent] == ["reports", None]  # where the USER put it
     assert sent[0]["state"] == "complete"
 
 
@@ -1476,6 +1482,42 @@ def test_nothing_is_announced_when_nothing_was_filed(
 
     assert outcome is Outcome.CANCELLED
     assert sent == []
+
+
+def test_a_document_rejected_before_filing_still_announces_that_it_settled(
+    db_session, make_document, session_factory, test_settings, aws, monkeypatch
+):
+    """The case the whole settling announcement exists for.
+
+    A name mismatch is rejected BEFORE filing, so the document lives in no section: a reader
+    who opens the app and looks cannot find it, and it waits for ever until they answer it.
+    There is no filing announcement to carry it, and the reject path returns early past the
+    tail of `_process` — so before this existed, the one document that most needed a
+    notification was the one document nothing told Spring about.
+
+    Nothing is asserted about WHAT gets said. That is Spring's decision, read from its own
+    tables; this side's only job is to say that the document has come to rest.
+    """
+    _, sqs, queue_url, _ = aws
+    sent = _capture_notifications(monkeypatch)
+    item_id, run_id, document_id = _seed_item(db_session, make_document)
+    publish_processing_item(sqs, queue_url, item_id=item_id, run_id=run_id, document_id=document_id)
+
+    from app.models.enums import RunItemStatus as S
+    from app.workers.stages import RejectStageError
+
+    def _reject(_ctx) -> None:
+        raise RejectStageError(
+            "name_mismatch", "The name on this document does not match the account"
+        )
+
+    monkeypatch.setattr("app.workers.processor.CLASSIFY_STAGE", (S.CLASSIFYING, _reject))
+
+    outcome = _process(sqs, queue_url, session_factory, _notifying(test_settings), aws)
+
+    assert outcome is Outcome.REJECTED
+    # Never filed, so no location — and announced all the same.
+    assert sent == [{"document_id": document_id}]
 
 
 def test_the_announcement_happens_after_filing_returns(
@@ -1512,7 +1554,10 @@ def test_the_announcement_happens_after_filing_returns(
             return False
 
     def fake_urlopen(request, timeout=None):
-        order.append("announced")
+        # The two announcements are told apart by their payload, not by counting: only the
+        # filing one carries a location, and only its position relative to `filed` matters.
+        body = json.loads(request.data)
+        order.append("announced" if "section" in body else "settled")
         return _Response()
 
     monkeypatch.setattr(filing, "file_document", tracking_file)
@@ -1522,7 +1567,9 @@ def test_the_announcement_happens_after_filing_returns(
 
     _process(sqs, queue_url, session_factory, _notifying(test_settings), aws)
 
-    assert order == ["filed", "announced"]
+    # Filing is announced after the row exists; settling is announced after everything,
+    # which is what lets Spring read a terminal status when it goes looking.
+    assert order == ["filed", "announced", "settled"]
 
 
 def test_a_failed_announcement_changes_nothing(

@@ -129,3 +129,52 @@ def test_a_rejection_logs_springs_own_status(settings, monkeypatch, caplog):
     record = next(r for r in caplog.records if r.message == "filed_notify_rejected")
     assert record.status == 403
     assert record.reason == "Forbidden"
+
+
+def test_settled_sends_only_the_document(settings, monkeypatch):
+    """The settling announcement carries no section — that is what makes it usable for a
+    name mismatch, which is rejected before filing and so lives in no section at all."""
+    sent = {}
+
+    def fake_urlopen(request, timeout=None):
+        sent["url"] = request.full_url
+        sent["body"] = request.data
+        sent["headers"] = request.headers
+        return _Response()
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+
+    notify.document_settled(settings, document_id=101)
+
+    # Same endpoint as filing: one URL to configure, and Spring decides what to say by
+    # reading its own tables rather than by being told.
+    assert sent["url"] == "http://spring.internal/internal/ai/filed"
+    assert sent["headers"]["Authorization"] == f"Bearer {settings.mhn_service_token}"
+    assert sent["body"] == b'{"document_id": 101}'
+
+
+def test_settled_never_raises(settings, monkeypatch):
+    """Same contract as filing. This one runs after EVERY terminal outcome, including the
+    failures, so an exception here would turn a handled rejection into a redelivery."""
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.URLError("spring is down")
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+
+    notify.document_settled(settings, document_id=101)
+
+
+def test_settled_is_silent_without_a_callback_url(monkeypatch):
+    called = False
+
+    def fake_urlopen(request, timeout=None):  # pragma: no cover - must not run
+        nonlocal called
+        called = True
+        return _Response()
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+
+    notify.document_settled(Settings(**BASE, mhn_service_token="t" * 40), document_id=101)
+
+    assert called is False

@@ -74,6 +74,16 @@ _IN_PROGRESS = {
     RunItemStatus.GENERATING_INSIGHTS.value,
 }
 
+#: Outcomes after which nothing further happens to the document without its reader — which
+#: is exactly when Spring should look at whether the reader needs telling.
+#:
+#: `CANCELLED` is absent because the reader cancelled it themselves and does not need to be
+#: told what they just did. `RETRY` is absent because the item is coming back. The rest are
+#: rests: read, rejected (a name or section mismatch), or given up on.
+_SETTLED = frozenset(
+    {Outcome.COMPLETED, Outcome.REJECTED, Outcome.FAILED, Outcome.GAVE_UP}
+)
+
 
 def process_message(
     message: ReceivedMessage,
@@ -86,9 +96,21 @@ def process_message(
 ) -> Outcome:
     session = session_factory()
     try:
-        return _process(message, session=session, s3=s3, sqs=sqs, ai=ai, settings=settings)
+        outcome = _process(message, session=session, s3=s3, sqs=sqs, ai=ai, settings=settings)
     finally:
         session.close()
+
+    # Here, and not at any of the several places an item reaches a terminal state, because
+    # this is the only one of them that cannot be forgotten when the next one is added. Two
+    # of those places return early past the tail of `_process`, which is how the nudge for
+    # `name_mismatch` would have been missed — the kind that matters most, since that
+    # document is filed nowhere and so cannot be found by opening the app and looking.
+    #
+    # After the session is closed, so Spring cannot be asked to read a row this transaction
+    # is still holding. Best-effort and never raises; the sweep in Spring is the backstop.
+    if outcome in _SETTLED:
+        notify.document_settled(settings, document_id=message.document_id)
+    return outcome
 
 
 def _process(
