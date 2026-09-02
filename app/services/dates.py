@@ -30,6 +30,14 @@ _DATE_FORMATS: tuple[str, ...] = (
     "%d.%m.%Y",
     "%d %B %Y",
     "%d %b %Y",
+    # Hyphenated month abbreviation — "18-Mar-2026". Extremely common on Indian lab
+    # reports and absent here until 2026-09-02, which cost more than a parse: the
+    # document's own date is chosen from these (``document_date.pick``), so every
+    # report from a lab printing this shape filed with a NULL date and showed the
+    # reader an empty field. It cannot collide with "%d-%m-%Y" — that one needs a
+    # numeric month, and this one an alphabetic name.
+    "%d-%b-%Y",
+    "%d-%B-%Y",
     "%B %d %Y",
     "%b %d %Y",
     "%Y%m%d",  # DICOM StudyDate, common on imaging reports
@@ -38,6 +46,9 @@ _DATE_FORMATS: tuple[str, ...] = (
     "%d-%m-%y",
     "%d.%m.%y",
     "%d %b %y",
+    # "18-Mar-26" — the same shape as above with the year abbreviated, which is how the
+    # comparison table on a MedPlus cumulative report dates its columns.
+    "%d-%b-%y",
 )
 
 #: "28th July" / "1st Jan" — both printed on documents and typed by people.

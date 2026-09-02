@@ -25,6 +25,7 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import json
 import logging
 import time
+from datetime import date
 from functools import partial
 from typing import Any
 
@@ -40,6 +41,8 @@ from app.services.ai_logging import (
     log_process,
     sanitize_validation_error,
 )
+from app.services.dates import parse_date
+from app.services.extraction import name_key
 from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
@@ -494,6 +497,55 @@ def _load_extraction(ctx: StageContext) -> dict[str, Any]:
 _SENT_FIELDS = ("test_name", "value", "unit", "flagged_against", "abnormal_flag")
 
 
+def _current_only(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop a result that a later observation of the SAME test supersedes.
+
+    A cumulative report prints the same analyte across several visits — "YOUR CURRENT
+    VISIT" beside "FROM YOUR PREVIOUS 3 VISITS" — and ``extraction._dedupe_results`` keeps
+    every one of them **on purpose**: the trend is what such a report is for, and its
+    docstring says losing half of it is silent. That is right for what is STORED.
+
+    It is wrong for what is interpreted. ``_context_json`` sends no ``observed_date``, so
+    the model cannot tell a current value from a sixteen-month-old one and will write
+    about whichever it is handed. On the report that found this (document 32): current
+    triglycerides 139, in range — and the 2024 column's 219, out of range. The reader
+    would have been told their triglycerides are high, with a real number, from a value
+    that is no longer true.
+
+    **The normals filter above made that certain rather than likely.** The current 139 is
+    ``normal`` and is dropped there, so the stale 219 was the only triglycerides row left
+    in the payload. Two changes that are each correct alone, and together produce a
+    confident falsehood.
+
+    Only a STRICTLY LATER parseable date supersedes, which is the refuse-rather-than-guess
+    rule the rest of this pipeline follows. Two undated rows both survive; a dated row
+    never displaces an undated one, because "no date" is not evidence of being older. So
+    an ordinary single-visit report is untouched — nothing in it has a later twin.
+    """
+    latest: dict[str, date] = {}
+    for r in results:
+        when = parse_date(r.get("observed_date"))
+        if when is None:
+            continue
+        key = _test_key(r)
+        if key not in latest or when > latest[key]:
+            latest[key] = when
+
+    kept = []
+    for r in results:
+        when = parse_date(r.get("observed_date"))
+        newest = latest.get(_test_key(r))
+        if when is not None and newest is not None and when < newest:
+            continue
+        kept.append(r)
+    return kept
+
+
+def _test_key(result: dict[str, Any]) -> str:
+    """Same-test identity, matching ``extraction._dedupe_results``' own key."""
+    return name_key(str(result.get("test_name") or ""))
+
+
 def _context_json(extraction: dict[str, Any]) -> str:
     """What the model may reason over: the results that need interpreting, and nothing else.
 
@@ -516,7 +568,7 @@ def _context_json(extraction: dict[str, Any]) -> str:
     to either omit that or invent it. A count is the whole of what that sentence needs, and
     it cannot be misquoted as a value.
     """
-    results = extraction.get("results", [])
+    results = _current_only(extraction.get("results", []))
     rows = [
         {k: r.get(k) for k in _SENT_FIELDS} for r in results if r.get("abnormal_flag") != "normal"
     ]

@@ -226,6 +226,30 @@ def extract_report(ctx: StageContext) -> None:
 # --- helpers ----------------------------------------------------------------
 
 
+#: Symbols a lab prints BESIDE a test name to mark the value abnormal or critical — the
+#: legend on a MedPlus report reads "Abnormal * Critical". They qualify the reading, not
+#: the analyte, and the model transcribes the name as printed, so they arrive attached to
+#: it.
+_ABNORMAL_MARKERS = "*†‡#!^"
+
+
+def name_key(name: str) -> str:
+    """What counts as the same test, for deduplication only. Never stored.
+
+    Case and **all** whitespace are dropped, so ``BILIRUBIN -DIRECT`` and
+    ``BILIRUBIN - DIRECT`` are one test, as are ``HDL / LDL RATIO`` and ``HDL/LDL RATIO``.
+    Two genuinely different analytes never differ by spacing alone.
+
+    Trailing abnormality markers go too, and that one is not cosmetic. A cumulative report
+    printed the same reading twice — once in the current-visit column marked
+    ``Cholesterol - LDL (Direct) *`` with its reference range, once in the comparison table
+    as ``Cholesterol - LDL (Direct)`` with none. Different keys, so BOTH survived: the
+    reader saw one LDL flagged high and a second identical LDL reported as impossible to
+    check, and the insights model was handed both.
+    """
+    return "".join(name.lower().split()).strip(_ABNORMAL_MARKERS)
+
+
 def _informativeness(row: ExtractedLabResult) -> tuple[int, int, int]:
     """How much a row tells us, for picking between duplicates. Higher wins."""
     return (
@@ -264,7 +288,7 @@ def _dedupe_results(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
     best: dict[tuple[str, str], ExtractedLabResult] = {}
     order: list[tuple[str, str]] = []
     for row in rows:
-        key = ("".join(row.test_name.lower().split()), (row.observed_date or "").strip())
+        key = (name_key(row.test_name), (row.observed_date or "").strip())
         if key not in best:
             best[key] = row
             order.append(key)
