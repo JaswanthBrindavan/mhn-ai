@@ -25,7 +25,6 @@ re-runs the stage overwrites its own prior attempt rather than duplicating rows.
 import json
 import logging
 import time
-from datetime import date
 from functools import partial
 from typing import Any
 
@@ -41,8 +40,6 @@ from app.services.ai_logging import (
     log_process,
     sanitize_validation_error,
 )
-from app.services.dates import parse_date
-from app.services.extraction import name_key
 from app.workers.stagetypes import StageContext, TransientStageError
 
 logger = logging.getLogger(__name__)
@@ -500,6 +497,11 @@ _SENT_FIELDS = ("test_name", "value", "unit", "flagged_against", "abnormal_flag"
 def _current_only(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop a result that a later observation of the SAME test supersedes.
 
+    Reads the ``superseded`` flag ``extraction.mark_superseded`` already computed rather
+    than re-deriving it, so this stage and the app's results table cannot disagree about
+    which reading is current. Absent on an extraction written before 2026-09-02, which
+    reads as falsy — the old behaviour, and a re-run rewrites the payload.
+
     A cumulative report prints the same analyte across several visits — "YOUR CURRENT
     VISIT" beside "FROM YOUR PREVIOUS 3 VISITS" — and ``extraction._dedupe_results`` keeps
     every one of them **on purpose**: the trend is what such a report is for, and its
@@ -522,28 +524,7 @@ def _current_only(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     never displaces an undated one, because "no date" is not evidence of being older. So
     an ordinary single-visit report is untouched — nothing in it has a later twin.
     """
-    latest: dict[str, date] = {}
-    for r in results:
-        when = parse_date(r.get("observed_date"))
-        if when is None:
-            continue
-        key = _test_key(r)
-        if key not in latest or when > latest[key]:
-            latest[key] = when
-
-    kept = []
-    for r in results:
-        when = parse_date(r.get("observed_date"))
-        newest = latest.get(_test_key(r))
-        if when is not None and newest is not None and when < newest:
-            continue
-        kept.append(r)
-    return kept
-
-
-def _test_key(result: dict[str, Any]) -> str:
-    """Same-test identity, matching ``extraction._dedupe_results``' own key."""
-    return name_key(str(result.get("test_name") or ""))
+    return [r for r in results if not r.get("superseded")]
 
 
 def _context_json(extraction: dict[str, Any]) -> str:

@@ -8,7 +8,11 @@ cleaned up deterministically here rather than by prompting harder.
 
 import pytest
 
-from app.services.extraction import ExtractedLabResult, _dedupe_results
+from app.services.extraction import (
+    ExtractedLabResult,
+    _dedupe_results,
+    mark_superseded,
+)
 
 
 def _row(
@@ -131,3 +135,55 @@ def test_the_same_test_on_two_dates_still_survives():
         _row("Triglycerides", "219", None, None, "25-Nov-24"),
     ]
     assert len(_dedupe_results(rows)) == 2
+
+
+def test_a_previous_visit_reading_is_marked_superseded():
+    """The flag every consumer reads instead of re-deriving "which one is current".
+
+    Computed once here for the same reason abnormal flags, dates and money are: the
+    alternative is a second implementation in the app, and two answers to "which value is
+    today's" is strictly worse than none.
+    """
+    rows = mark_superseded(
+        [
+            {"test_name": "Triglycerides", "observed_date": "18-Mar-26"},
+            {"test_name": "Triglycerides", "observed_date": "25-Nov-24"},
+        ]
+    )
+    assert [r["superseded"] for r in rows] == [False, True]
+
+
+def test_a_marker_on_the_current_copy_does_not_hide_the_supersession():
+    """The current reading is the flagged one, so the names differ by an asterisk."""
+    rows = mark_superseded(
+        [
+            {"test_name": "Cholesterol - LDL (Direct) *", "observed_date": "18-Mar-26"},
+            {"test_name": "Cholesterol - LDL (Direct)", "observed_date": "25-Nov-24"},
+        ]
+    )
+    assert [r["superseded"] for r in rows] == [False, True]
+
+
+def test_nothing_is_superseded_without_a_later_date():
+    """Undated rows both stand, a dated row never displaces an undated one, and an
+    ordinary single-visit report is untouched — every row False."""
+    undated = mark_superseded(
+        [{"test_name": "Ferritin"}, {"test_name": "Ferritin", "observed_date": None}]
+    )
+    assert [r["superseded"] for r in undated] == [False, False]
+
+    mixed = mark_superseded(
+        [
+            {"test_name": "Ferritin", "observed_date": "18-Mar-26"},
+            {"test_name": "Ferritin", "observed_date": None},
+        ]
+    )
+    assert [r["superseded"] for r in mixed] == [False, False]
+
+    one_visit = mark_superseded(
+        [
+            {"test_name": "Triglycerides", "observed_date": "18-Mar-26"},
+            {"test_name": "Cholesterol - HDL", "observed_date": "18-Mar-26"},
+        ]
+    )
+    assert [r["superseded"] for r in one_visit] == [False, False]
