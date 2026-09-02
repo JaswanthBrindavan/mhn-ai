@@ -50,17 +50,43 @@ def document_filed(
     Never raises. A disabled URL, an unreachable Spring, a 500, a timeout and a malformed
     response are all one thing here: the app finds out by polling instead.
     """
-    if not settings.spring_callback_url:
-        return
-
-    body = json.dumps(
-        {
+    _announce(
+        settings,
+        document_id=document_id,
+        payload={
             "document_id": document_id,
             "section": section,
             "section_row_id": section_row_id,
             "state": state,
-        }
-    ).encode()
+        },
+    )
+
+
+def document_settled(settings: "Settings", *, document_id: int) -> None:
+    """Announce that ``document_id``'s run has come to rest.
+
+    Distinct from :func:`document_filed`, and not a replacement for it, because they are
+    different moments. Filing is when the row appears and the screen can move to it — it
+    happens BEFORE the run item completes, and in the analyse-now path a further minute of
+    stages follows. Settling is when nothing more will happen without the reader.
+
+    That second moment is the one worth a notification, and it is the only one that can
+    describe **a document that was never filed at all**: a name mismatch is rejected before
+    filing, so it lives in no section, and a reader who opens the app cannot find it by
+    looking. Hence no ``section`` here — Spring reads what the document is waiting on out of
+    its own tables, so this service never has to know what a notification is.
+
+    Never raises, for the same reason as its sibling: the sweep behind it is the backstop.
+    """
+    _announce(settings, document_id=document_id, payload={"document_id": document_id})
+
+
+def _announce(settings: "Settings", *, document_id: int, payload: dict) -> None:
+    """POST one announcement to Spring, swallowing everything. See the module docstring."""
+    if not settings.spring_callback_url:
+        return
+
+    body = json.dumps(payload).encode()
     request = urllib.request.Request(
         settings.spring_callback_url,
         data=body,
@@ -94,5 +120,7 @@ def document_filed(
 
     logger.info(
         "filed_notify_sent",
-        extra={"document_id": document_id, "section": section, "status": status},
+        # `section` is absent on a settling announcement, which is the whole point of it:
+        # a name mismatch has no section, and that is the case most worth telling about.
+        extra={"document_id": document_id, "section": payload.get("section"), "status": status},
     )

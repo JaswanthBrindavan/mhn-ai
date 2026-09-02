@@ -11,6 +11,7 @@ import pytest
 from app.services.extraction import (
     ExtractedLabResult,
     _dedupe_results,
+    _inherit_ranges,
     mark_superseded,
 )
 
@@ -187,3 +188,45 @@ def test_nothing_is_superseded_without_a_later_date():
         ]
     )
     assert [r["superseded"] for r in one_visit] == [False, False]
+
+
+def test_a_previous_reading_inherits_the_interval_printed_once():
+    """A comparison table prints its reference interval once, for both columns.
+
+    On document 114 the current-visit table carries BRI and the previous-visit table
+    below it has no such column, so 142 arrived with no range, could not be flagged, and
+    rendered as "Not checked" — directly beside its own current reading showing
+    "Range 0-100".
+    """
+    rows = _inherit_ranges(
+        [
+            _row("Cholesterol - LDL (Direct) *", "123", None, "0-100", "18-Mar-26"),
+            _row("Cholesterol - LDL (Direct)", "142", None, None, "25-Nov-24"),
+        ]
+    )
+
+    # Matched through name_key, so the marker on the current copy is no obstacle.
+    assert [r.reference_range for r in rows] == ["0-100", "0-100"]
+    # Only the range travels.
+    assert [r.value for r in rows] == ["123", "142"]
+    assert [r.observed_date for r in rows] == ["18-Mar-26", "25-Nov-24"]
+
+
+def test_a_printed_interval_is_never_replaced():
+    """A row stating its own interval keeps it — including a sex-split pair where the
+    two genuinely differ and inheriting would flag against the wrong sex."""
+    rows = _inherit_ranges(
+        [
+            _row("Haemoglobin", "13.0", None, "13 - 17"),
+            _row("Haemoglobin", "12.0", None, "12 - 15"),
+        ]
+    )
+
+    assert [r.reference_range for r in rows] == ["13 - 17", "12 - 15"]
+
+
+def test_a_test_with_no_interval_anywhere_stays_unchecked():
+    """Nothing is invented: an interval has to be printed somewhere on the document."""
+    rows = _inherit_ranges([_row("Novel Marker", "5"), _row("Novel Marker", "7")])
+
+    assert [r.reference_range for r in rows] == [None, None]
