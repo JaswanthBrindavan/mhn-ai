@@ -162,3 +162,62 @@ def test_an_unknown_section_has_no_priority_list_and_no_never_list():
     chosen, label = pick("unknown", [("Anything", "01/05/2026")])
     assert chosen == date(2026, 5, 1)
     assert label == "Anything"
+
+
+class TestAPreviousVisitNeverDatesTheDocument:
+    """Document 114: a lab that prints "YOUR CURRENT VISIT" beside "FROM YOUR PREVIOUS
+    3 VISITS" puts two dates in the header, both unlabelled.
+
+    The fallback takes the earliest date, which is right for administrative dates —
+    collected, received, released, days apart — and wrong for another visit entirely. It
+    dated a March 2026 report to November 2024, and a wrong date is filed, displayed,
+    sorted on and never questioned.
+
+    Only reachable at all since `18-Mar-26` began parsing on the same day; before that
+    both dates were unreadable and the document filed with none.
+    """
+
+    TODAY = date(2026, 4, 1)
+
+    def test_the_current_visit_wins_over_a_previous_one(self) -> None:
+        picked, _ = pick("reports", [("", "18-Mar-26"), ("", "25-Nov-24")], today=self.TODAY)
+        assert picked == date(2026, 3, 18)
+
+    def test_a_labelled_stale_date_is_excluded_too(self) -> None:
+        """The window is applied before the priority list, not only before the fallback:
+        nothing guarantees a previous visit's column cannot carry a matching label."""
+        picked, _ = pick(
+            "reports",
+            [("", "18-Mar-26"), ("Sample Collected", "25-Nov-24")],
+            today=self.TODAY,
+        )
+        assert picked == date(2026, 3, 18)
+
+    def test_administrative_dates_still_resolve_to_the_earliest(self) -> None:
+        """The behaviour the fallback was written for, unchanged: released comes after
+        collected, and collection is when the values were true of the body."""
+        picked, _ = pick("reports", [("", "15/03/2026"), ("", "12/03/2026")], today=self.TODAY)
+        assert picked == date(2026, 3, 12)
+
+    def test_a_slow_report_is_still_one_visit(self) -> None:
+        """Histopathology and cultures run weeks. Three of them is inside the window."""
+        picked, _ = pick(
+            "reports",
+            [("Sample Collected", "01/03/2026"), ("Reported On", "22/03/2026")],
+            today=self.TODAY,
+        )
+        assert picked == date(2026, 3, 1)
+
+    def test_an_old_document_uploaded_today_is_unaffected(self) -> None:
+        """The window is relative to the newest date ON THE PAGE, never to today."""
+        picked, _ = pick(
+            "reports",
+            [("Sample Collected", "12/03/2024"), ("Reported On", "15/03/2024")],
+            today=self.TODAY,
+        )
+        assert picked == date(2024, 3, 12)
+
+    def test_a_date_of_birth_cannot_date_the_report(self) -> None:
+        """Decades back, so outside the window — a bonus of the same rule."""
+        picked, _ = pick("reports", [("", "18-Mar-26"), ("", "04/07/1971")], today=self.TODAY)
+        assert picked == date(2026, 3, 18)
