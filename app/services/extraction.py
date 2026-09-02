@@ -299,6 +299,50 @@ def _dedupe_results(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
     return [best[key] for key in order]
 
 
+def _inherit_ranges(rows: list[ExtractedLabResult]) -> list[ExtractedLabResult]:
+    """Give a reading with no printed range the one another reading of the SAME test has.
+
+    A cumulative report prints its reference interval once and compares two columns
+    against it. On document 114 the current-visit table carries ``BRI`` and the
+    previous-visit table below it has no such column at all:
+
+        INVESTIGATION                RESULT   BIOLOGICAL REFERENCE INTERVAL
+        Cholesterol - LDL (Direct) *   123    0-100
+        ...
+        From Your Previous Visits    18-Mar-26  25-Nov-24
+        Cholesterol - LDL (Direct)     123        142      <- no interval here
+
+    So 142 arrived with no range, could not be flagged, and rendered as "Not checked"
+    with no Range line — beside its own current reading showing ``Range 0-100``. Four of
+    the seven previous readings escaped that only because the THP catalogue happened to
+    match them by name; LDL (Direct) and the two ratios are not in it.
+
+    The document itself asserts the interval applies to both columns — that is what a
+    comparison table IS — so this copies it rather than leaving the reader a row that
+    says a value could not be checked against a limit printed higher up the same page.
+
+    Deliberately narrow:
+
+    * only fills an ABSENT range, never replaces one, so a row printing its own interval
+      always keeps it — including a sex- or age-split pair where the two genuinely differ;
+    * matches on ``name_key``, so the abnormality marker on the current copy
+      (``Cholesterol - LDL (Direct) *``) does not stop it reaching the previous one;
+    * takes the range only, never the value, unit or date.
+    """
+    known: dict[str, str] = {}
+    for row in rows:
+        if row.reference_range and row.reference_range.strip():
+            known.setdefault(name_key(row.test_name), row.reference_range)
+
+    return [
+        row
+        if (row.reference_range and row.reference_range.strip())
+        or name_key(row.test_name) not in known
+        else row.model_copy(update={"reference_range": known[name_key(row.test_name)]})
+        for row in rows
+    ]
+
+
 def _normalize(
     result: DocumentExtraction,
     lookup: ideal_ranges.Lookup | None,
@@ -309,7 +353,7 @@ def _normalize(
     enriched: list[dict[str, Any]] = []
     fallbacks: list[FallbackEntry] = []
 
-    for r in _dedupe_results(result.results):
+    for r in _inherit_ranges(_dedupe_results(result.results)):
         data = r.model_dump()
         if lookup is None:  # feature off — unchanged behaviour, no worklist
             enriched.append(normalization.enrich_result(data, gender=result.patient_gender))
