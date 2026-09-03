@@ -224,3 +224,19 @@ def test_a_hyphenated_month_abbreviation_parses() -> None:
 def test_a_numeric_hyphenated_date_is_still_day_first() -> None:
     """The new formats need an alphabetic month, so they cannot capture this one."""
     assert parse_date("03-07-2014") == date(2014, 7, 3)
+
+
+def test_a_month_name_between_slashes_is_read():
+    """"01/Jul/2026" — found on a production report on 2026-09-03.
+
+    The hyphenated form was already here; this one was not, and it cost the
+    same thing: `document_date.pick` chooses a document's own date from these,
+    so a report printing this filed with a NULL date and showed the reader an
+    empty field. It cannot collide with "%d/%m/%Y" — that needs a numeric
+    month and this an alphabetic name.
+    """
+    assert parse_date("01/Jul/2026") == date(2026, 7, 1)
+    assert parse_date("01/July/2026") == date(2026, 7, 1)
+    assert parse_date("01/Jul/26") == date(2026, 7, 1)
+    # The numeric form still reads day-first, unchanged.
+    assert parse_date("02/09/2026") == date(2026, 9, 2)

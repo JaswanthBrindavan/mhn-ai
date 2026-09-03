@@ -38,6 +38,14 @@ _DATE_FORMATS: tuple[str, ...] = (
     # numeric month, and this one an alphabetic name.
     "%d-%b-%Y",
     "%d-%B-%Y",
+    # The same month name with SLASHES — "01/Jul/2026". Found on a production
+    # report on 2026-09-03, and it cost exactly what the hyphenated shape above
+    # cost: `pick` chooses the document's own date from these, so every report
+    # printing this filed with a NULL date and showed the reader an empty field.
+    # It cannot collide with "%d/%m/%Y" for the same reason that one cannot
+    # collide with "%d-%m-%Y" — a numeric month against an alphabetic name.
+    "%d/%b/%Y",
+    "%d/%B/%Y",
     "%B %d %Y",
     "%b %d %Y",
     "%Y%m%d",  # DICOM StudyDate, common on imaging reports
@@ -49,6 +57,7 @@ _DATE_FORMATS: tuple[str, ...] = (
     # "18-Mar-26" — the same shape as above with the year abbreviated, which is how the
     # comparison table on a MedPlus cumulative report dates its columns.
     "%d-%b-%y",
+    "%d/%b/%y",
 )
 
 #: "28th July" / "1st Jan" — both printed on documents and typed by people.
