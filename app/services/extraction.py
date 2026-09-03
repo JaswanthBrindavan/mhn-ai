@@ -28,7 +28,7 @@ from app.services.ai_logging import (
     log_process,
     sanitize_validation_error,
 )
-from app.services.dates import parse_date
+from app.services.dates import iso_date, parse_date
 from app.services.source_loading import load_source_document
 from app.services.thp_fallback import FallbackEntry, record_fallbacks
 from app.workers.stagetypes import StageContext, TransientStageError
@@ -400,7 +400,18 @@ def _normalize(
 
     payload = {
         "results": mark_superseded(enriched),
-        "report_date": result.report_date,
+        # Normalised here, the way every `section_extraction` date already is.
+        #
+        # The prompt asks for "the report's overall date if shown" and names no
+        # format, so what comes back is whatever the lab printed — production
+        # rows hold "02 Sep 2026", "18-Mar-2026", "02/09/2026". Stored raw, every
+        # consumer had to guess the shape, and the ones that assumed ISO read the
+        # date as absent and silently fell back to the upload time.
+        #
+        # `iso_date` returns None for a value it cannot read, which is the same
+        # answer as an absent date and the right one: a date nobody can parse is
+        # not a date, and storing it unreadable only moves the problem downstream.
+        "report_date": iso_date(result.report_date),
         "patient_age": result.patient_age,
         "patient_gender": result.patient_gender,
     }
