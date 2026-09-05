@@ -195,6 +195,16 @@ def _process(
         except TransientStageError as exc:
             # Leave the item where it is and do NOT delete: redelivery retries it,
             # and the attempt cap in claim_item eventually gives up.
+            #
+            # But SAY so on the item. Nothing was written here before, so the row went on
+            # reading as mid-stage for however long the queue took to come back — minutes,
+            # when a model is busy — and every client polling it showed a document being
+            # read when nothing at all was happening to it. `note_retry` leaves the status
+            # where it is and marks only the error code, which `claim_item` clears when the
+            # next attempt starts.
+            processing.note_retry(
+                session, item_id, message=str(exc), expected=_IN_PROGRESS
+            )
             logger.warning(
                 "item_transient_failure",
                 extra={"item_id": str(item_id), "reason": str(exc)},
