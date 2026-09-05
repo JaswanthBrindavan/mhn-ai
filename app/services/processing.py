@@ -232,6 +232,38 @@ def reject_item(
     return _execute_update(session, stmt) == 1
 
 
+#: What ``last_error_code`` says while an item is waiting to be redelivered. Not a
+#: failure — ``claim_item`` clears it the moment the next attempt starts — so a client
+#: reading it knows the difference between "being read" and "stumbled, coming back".
+RETRYING = "retrying"
+
+
+def note_retry(
+    session: Session, item_id: UUID, *, message: str, expected: set[str]
+) -> bool:
+    """Record that an attempt failed and another is coming, WITHOUT moving the stage.
+
+    A transient failure used to write nothing at all: the item kept the status of the
+    stage it stumbled in, and the queue brought it back whenever it came back. From
+    outside that is indistinguishable from work in progress — so an app polling the
+    status showed "picking out the details" for the minutes a redelivery took, and a
+    reader watched a screen that had nothing happening behind it.
+
+    The status is deliberately left alone. The item really is still at that stage, and
+    moving it would make the retry look like a fresh run; only the error code changes,
+    and ``claim_item`` clears it on the next attempt.
+    """
+    stmt = (
+        update(AiProcessingRunItem)
+        .where(
+            AiProcessingRunItem.id == item_id,
+            AiProcessingRunItem.status.in_(expected),
+        )
+        .values(last_error_code=RETRYING, last_error_message=message[:500] or None)
+    )
+    return _execute_update(session, stmt) == 1
+
+
 def fail_item(
     session: Session, item_id: UUID, *, code: str, message: str, expected: set[str]
 ) -> bool:
