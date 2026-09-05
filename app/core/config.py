@@ -66,10 +66,12 @@ class Settings(BaseSettings):
     # Comma-separated rather than a JSON list so .env stays human-editable.
     allowed_content_types: str = "application/pdf,image/jpeg,image/png"
 
-    # Pages of a PDF sent to the classifier (the type is evident from the first pages,
-    # so extraction re-reads the whole document but classification need not). 0 disables
-    # trimming and sends the full document.
-    classify_max_pages: int = 2
+    # Pages of a PDF sent to the classifier; extraction re-reads the whole document.
+    # NOT the first N — the front pages plus one sampled from deeper in, see
+    # `services/pdf_pages.py`. Raised 2 -> 3 on 2026-09-05 after a 43-page hospital
+    # bundle classified `medical_condition` off a cover sheet and an empty table of
+    # contents, and was rejected unread. 0 disables trimming and sends the whole file.
+    classify_max_pages: int = 3
 
     # --- AI provider --------------------------------------------------------
     ai_provider: str = "anthropic"
