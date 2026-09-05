@@ -38,7 +38,12 @@ class ModelPrice:
 PRICES: dict[str, ModelPrice] = {
     "claude-opus-4-8": ModelPrice(Decimal("5.00"), Decimal("25.00")),
     "claude-opus-4-7": ModelPrice(Decimal("5.00"), Decimal("25.00")),
-    "claude-sonnet-5": ModelPrice(Decimal("3.00"), Decimal("15.00")),
+    # Sonnet 5 is CHEAPER than the 4-6 it replaces ($2/$10 against $3/$15), which is the
+    # unusual direction and the reason this entry was wrong for so long: it was copied from
+    # 4-6 when the id was added, and a price that merely looks plausible is never questioned.
+    # An entry that exists but lies is worse than a missing one -- a missing price WARNS
+    # (see estimate_cost_usd); a wrong one is silently believed by every cost report.
+    "claude-sonnet-5": ModelPrice(Decimal("2.00"), Decimal("10.00")),
     "claude-sonnet-4-6": ModelPrice(Decimal("3.00"), Decimal("15.00")),
     "claude-haiku-4-5": ModelPrice(Decimal("1.00"), Decimal("5.00")),
     # Gemini (ai.google.dev/gemini-api/docs/pricing, standard tier, 2026-07-29).
