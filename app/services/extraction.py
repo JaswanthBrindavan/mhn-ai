@@ -53,9 +53,22 @@ STAGE_NAME = "extracting"
 #: lower the ceiling, though: a caught truncation is still a document that produced nothing.
 #:
 #: Headroom here is nearly free. Extraction runs on Gemini Flash-Lite at $1.50/M output,
-#: so the 8000-token increase costs at most $0.012 on a document that actually needs it,
+#: so the increase costs at most a couple of cents on a document that actually needs it,
 #: and nothing at all on one that does not — max_tokens is a ceiling, not an allocation.
-EXTRACT_MAX_TOKENS = 24000
+#:
+#: 24000 was not enough either, and a real document proved it (2026-09-07). Documents 219
+#: and 220 — a 43-page hospital investigation bundle — stopped at 23,985 output tokens and
+#: failed ``response_truncated``, extracting nothing at all. Re-run against the same file
+#: with room to finish: **45,926 output tokens and 553 results**. The ceiling was cutting
+#: that document in half.
+#:
+#: **Raise this only against a model's real output limit.** ``gemini-3.1-flash-lite``
+#: allows 65,536 (queried from ``models.get``, not assumed) and ``claude-haiku-4-5``
+#: 64,000, so 60000 fits both with headroom — and 60000 specifically is the value the
+#: measurement above was taken at, so it is known to be accepted rather than merely
+#: plausible. Going past a model's limit is worse than truncation: the API rejects the
+#: request outright, so EVERY document fails instead of the rare enormous one.
+EXTRACT_MAX_TOKENS = 60000
 
 
 class ExtractedLabResult(BaseModel):
