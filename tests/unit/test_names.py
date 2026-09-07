@@ -6,7 +6,14 @@ mismatch costs the user one tap.
 
 import pytest
 
-from app.services.names import NameVerdict, _within_one_edit, compare, matches_any, normalise
+from app.services.names import (
+    NameVerdict,
+    _within_one_edit,
+    compare,
+    compare_all,
+    matches_any,
+    normalise,
+)
 
 MATCHES = [
     ("MR. RAJESH KUMAR SHARMA", "Rajesh Sharma", "honorific + extra middle token"),
@@ -124,3 +131,50 @@ def test_matches_any_is_empty_for_an_unknown_name() -> None:
     """Never fan an unreadable name out across the family."""
     assert matches_any(None, {"sunita-id": "Sunita Devi"}) == []
     assert matches_any("SELF", {"sunita-id": "Sunita Devi"}) == []
+
+
+# --- aliases -----------------------------------------------------------------
+#
+# An account answers to its own name plus any it has confirmed. `compare_all` is the pure
+# half; `identity.owner` supplies the list and `identity.learn_alias` grows it.
+
+
+def test_compare_all_matches_on_an_alias() -> None:
+    """The whole feature: "P Suresh Babu" was confirmed once and must not be asked again,
+    even though it agrees with the account's own name not at all."""
+    assert (
+        compare_all("P Suresh Babu", ["Jaswanth Brindavan", "P Suresh Babu"]) is NameVerdict.MATCH
+    )
+
+
+def test_compare_all_matches_on_the_account_name_with_aliases_present() -> None:
+    assert compare_all("Rajesh Sharma", ["Rajesh Sharma", "P Suresh Babu"]) is NameVerdict.MATCH
+
+
+def test_compare_all_is_a_mismatch_when_nothing_matches() -> None:
+    """Aliases widen the accepted set; they must not blanket-accept."""
+    assert (
+        compare_all("VIKRAM RAO", ["Jaswanth Brindavan", "P Suresh Babu"]) is NameVerdict.MISMATCH
+    )
+
+
+def test_compare_all_still_matches_a_variant_of_an_alias() -> None:
+    """An alias is matched by the same rules as a name, not by string equality — otherwise
+    every honorific and spacing variant would accumulate as its own entry."""
+    assert compare_all("MR. P SURESH BABU", ["Someone Else", "P Suresh Babu"]) is NameVerdict.MATCH
+
+
+def test_compare_all_reports_mismatch_over_unknown() -> None:
+    """An unreadable alias must not soften a real disagreement into "we could not tell":
+    UNKNOWN processes silently, so that would file the document without asking."""
+    assert compare_all("VIKRAM RAO", ["Rajesh Sharma", "SELF"]) is NameVerdict.MISMATCH
+
+
+def test_compare_all_is_unknown_when_the_document_has_no_name() -> None:
+    assert compare_all(None, ["Rajesh Sharma", "P Suresh Babu"]) is NameVerdict.UNKNOWN
+
+
+def test_compare_all_of_nothing_is_unknown() -> None:
+    """Nothing was compared. MISMATCH here would reject every document for an account
+    whose name failed to load."""
+    assert compare_all("Rajesh Sharma", []) is NameVerdict.UNKNOWN

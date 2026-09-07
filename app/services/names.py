@@ -15,6 +15,7 @@ asking about those trains people to dismiss the dialog that matters.
 """
 
 import re
+from collections.abc import Sequence
 from enum import IntEnum, StrEnum
 
 
@@ -144,6 +145,27 @@ def compare(document_name: str | None, account_name: str | None) -> NameVerdict:
     # identical to the OCR case "RAJESH KUMAF SHARMA", so no cheap rule separates them,
     # and dropping edit distance altogether would fail every genuine misread instead.
     return NameVerdict.MATCH
+
+
+def compare_all(document_name: str | None, account_names: Sequence[str | None]) -> NameVerdict:
+    """The verdict across every name one account answers to — its own plus its aliases.
+
+    MATCH if any of them matches, which is the whole point: a user who has confirmed
+    "P Suresh Babu" once should not be asked again on the next document printing it.
+
+    Otherwise the strongest thing anything said. MISMATCH beats UNKNOWN, so an account
+    whose aliases include an unreadable entry still reports the real disagreement rather
+    than being softened into "we could not tell" — every ambiguous rule in this module
+    fails towards MISMATCH, and this one is no exception.
+
+    An empty sequence is UNKNOWN, not MISMATCH: nothing was compared.
+    """
+    verdicts = [compare(document_name, name) for name in account_names]
+    if NameVerdict.MATCH in verdicts:
+        return NameVerdict.MATCH
+    if NameVerdict.MISMATCH in verdicts:
+        return NameVerdict.MISMATCH
+    return NameVerdict.UNKNOWN
 
 
 def matches_any(document_name: str | None, candidates: dict[str, str]) -> list[str]:

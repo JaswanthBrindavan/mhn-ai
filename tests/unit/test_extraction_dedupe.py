@@ -9,6 +9,7 @@ cleaned up deterministically here rather than by prompting harder.
 import pytest
 
 from app.services.extraction import (
+    EXTRACT_MAX_TOKENS,
     ExtractedLabResult,
     _dedupe_results,
     _inherit_ranges,
@@ -230,3 +231,29 @@ def test_a_test_with_no_interval_anywhere_stays_unchecked():
     rows = _inherit_ranges([_row("Novel Marker", "5"), _row("Novel Marker", "7")])
 
     assert [r.reference_range for r in rows] == [None, None]
+
+
+# --- the output ceiling ------------------------------------------------------
+
+
+def test_the_output_ceiling_clears_the_largest_document_measured() -> None:
+    """Documents 219/220 (2026-09-07) were a 43-page hospital investigation bundle. At the
+    then-current 24000 the response stopped at 23,985 tokens and the item failed
+    ``response_truncated``, which is PERMANENT — so the document extracted nothing at all
+    and did not retry. Re-run with room to finish, it needed **45,926 tokens for 553
+    results**.
+
+    Pinned because the failure is invisible from the code: a ceiling that is too low looks
+    exactly like a ceiling that is fine until someone uploads a big enough report.
+    """
+    assert EXTRACT_MAX_TOKENS >= 46_000
+
+
+def test_the_output_ceiling_stays_inside_the_models_that_run_this_stage() -> None:
+    """The other side of the same number, and the worse failure. Past a model's own limit
+    the API rejects the REQUEST, so every document fails rather than the rare enormous one.
+
+    ``gemini-3.1-flash-lite`` allows 65,536 and ``claude-haiku-4-5`` 64,000; the stage can
+    be pointed at either (``_STAGE_OVERRIDES["extracting"]``), so the smaller one governs.
+    """
+    assert EXTRACT_MAX_TOKENS <= 64_000
