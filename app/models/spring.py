@@ -12,8 +12,12 @@ declaration cannot drift into being mistaken for the authoritative schema.
 filing move: once a document is classified into a section this service processes, it
 INSERTs a row into **that section's table** (``reports``, ``scans_imaging``, ``insurance``,
 ``prescriptions``, ``vaccinations`` or ``bills``), writes the row's ``content``, and DELETEs
-the source ``unclassified_files`` row. The THP tables below are read-only. It never issues DDL
-against any Spring table.
+the source ``unclassified_files`` row. The THP tables below are read-only.
+
+The **only other** Spring column this service writes is ``user.aliases`` (2026-09-07), when
+a user claims a name-mismatched document as their own. ``user`` is otherwise read-only, and
+that one exception is called out on the table itself. It never issues DDL against any Spring
+table.
 """
 
 from sqlalchemy import (
@@ -27,7 +31,7 @@ from sqlalchemy import (
     String,
     Table,
 )
-from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, ENUM, JSONB, UUID
 
 spring_metadata = MetaData()
 
@@ -45,16 +49,23 @@ unclassified_files = Table(
     Column("name", String(255), nullable=True),
 )
 
-#: The account holder. READ-ONLY, and only the name: this service resolves whose document
-#: it is holding so it can check the name printed on it against the account's. It makes no
-#: access decision from this table — family access is Spring's, and stays Spring's (see
-#: app/api/deps.py). Bound under its real name, ``user``, which is a reserved word in
-#: Postgres; SQLAlchemy quotes it. The Python name is plural so it cannot shadow anything.
+#: The account holder. This service resolves whose document it is holding so it can check
+#: the name printed on it against the account's. It makes no access decision from this
+#: table — family access is Spring's, and stays Spring's (see app/api/deps.py). Bound under
+#: its real name, ``user``, which is a reserved word in Postgres; SQLAlchemy quotes it. The
+#: Python name is plural so it cannot shadow anything.
+#:
+#: **``aliases`` is the one column here this service WRITES** (Spring's ``V50``, 2026-09-07)
+#: — appended when a user claims a name-mismatched document as their own, so the question is
+#: asked once per name instead of once per document. ``id`` and ``name`` remain read-only,
+#: and this is only the second Spring-owned table we write at all; filing is the other.
+#: Nullable with no default, so every read and write coalesces it to an empty array.
 users = Table(
     "user",
     spring_metadata,
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("name", String(255), nullable=False),
+    Column("aliases", ARRAY(String(255)), nullable=True),
 )
 
 #: The reports section. We INSERT a row here when moving a classified report, and write

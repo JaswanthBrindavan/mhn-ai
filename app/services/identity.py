@@ -11,6 +11,17 @@ a candidate list is needed, Spring hands us one already filtered (see
 ``names.matches_any``). The rule in ``app/api/deps.py`` holds: a second implementation of
 the family rules here would drift, and a drift bug leaks one family member's records to
 another.
+
+**It also WRITES one column, ``user.aliases``** (2026-09-07), and that is the only Spring
+column this service writes outside filing. Confirming a mismatched document records the
+name on it, so the same name is never questioned again: ``identity_confirmed_at`` is keyed
+on the document, and in production one name was confirmed 82 times across 87 documents.
+
+An alias widens what counts as this account holder, permanently and silently, so two
+properties matter. It is only ever written from ``confirm_identity`` — the user claiming a
+document as **theirs** — never from a reassignment, which says the opposite. And it is
+still not an access decision: it says which names this account answers to, never who may
+read whose records.
 """
 
 import logging
@@ -18,32 +29,66 @@ import uuid
 from datetime import UTC, datetime
 from typing import NamedTuple
 
-from sqlalchemy import select, update
+from sqlalchemy import String, func, select, update
+from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.orm import Session
 
 from app.models.ai_results import AiReportClassification
 from app.models.spring import unclassified_files, users
 from app.services import filing
 from app.services.classification import DocumentSection
-from app.services.names import NameVerdict, compare
+from app.services.names import NameVerdict, compare_all, normalise
 from app.workers.stagetypes import RejectStageError, StageContext
 
 logger = logging.getLogger(__name__)
 
+#: Typed, so Postgres can resolve ``array_append``'s element type when the column is NULL.
+#: A bare empty-array literal there is ambiguous and the statement fails to plan.
+_EMPTY_ALIASES = array([], type_=String(255))
 
-def owner_name(session: Session, document_id: int) -> str | None:
-    """The name on the account this document is being filed into.
+
+class Owner(NamedTuple):
+    """Every name an account answers to: the one on the account, plus confirmed aliases."""
+
+    user_id: uuid.UUID
+    name: str
+    aliases: list[str]
+
+    @property
+    def all_names(self) -> list[str]:
+        return [self.name, *self.aliases]
+
+
+def owner(session: Session, document_id: int) -> Owner | None:
+    """The account this document is being filed into, and the names it answers to.
 
     None when the intake row is gone — which is normal, not an error: filing deletes it,
     so every retry of an already-filed document lands here. The caller treats that as
     "already settled" rather than as a failure.
+
+    ``aliases`` are names the user has previously confirmed on their own documents. They
+    are matched exactly as the account's own name is, which is the point: the question is
+    asked once per name rather than once per document. A null column reads as an empty
+    list — Spring's ``V50`` adds it nullable with no default.
     """
-    name = session.execute(
-        select(users.c.name)
+    row = session.execute(
+        select(users.c.id, users.c.name, users.c.aliases)
         .select_from(unclassified_files.join(users, unclassified_files.c.user_id == users.c.id))
         .where(unclassified_files.c.id == document_id)
-    ).scalar_one_or_none()
-    return str(name) if name is not None else None
+    ).one_or_none()
+    if row is None:
+        return None
+    return Owner(row.id, str(row.name), [str(a) for a in (row.aliases or [])])
+
+
+def owner_name(session: Session, document_id: int) -> str | None:
+    """The name on the account this document is being filed into, ignoring aliases.
+
+    Kept for callers that want only the account's own name. The gate uses ``owner`` — it
+    must compare against the aliases too.
+    """
+    found = owner(session, document_id)
+    return found.name if found is not None else None
 
 
 class SettledName(NamedTuple):
@@ -137,25 +182,68 @@ def _carry_settled(session: Session, item_id: uuid.UUID, settled: SettledName) -
     session.commit()
 
 
+def learn_alias(session: Session, *, document_id: int, printed: str | None) -> bool:
+    """Remember that this account answers to ``printed``, so it is never asked again.
+
+    The write half of the aliases feature, and **the only column of ``user`` this service
+    writes**. Everything else it reads there is read-only, so keep this the one place.
+
+    Does nothing when: there is no readable name (nothing to remember); the intake row is
+    gone (a name mismatch is never filed, so the row is always there for the case this
+    serves — its absence means something else, and inventing an alias from it would be a
+    guess); or the name already matches one the account holds, which covers both a repeat
+    confirmation and a variant close enough that ``compare`` already accepts it. Matching
+    rather than string equality is what stops "P SURESH BABU" and "P Suresh Babu"
+    accumulating as two entries.
+
+    Returns whether an alias was actually added, for the caller's log.
+    """
+    if not normalise(printed):
+        return False
+    account = owner(session, document_id)
+    if account is None:
+        return False
+    if compare_all(printed, account.all_names) is NameVerdict.MATCH:
+        return False
+
+    name = str(printed).strip()[:255]
+    session.execute(
+        update(users)
+        .where(users.c.id == account.user_id)
+        .values(aliases=func.array_append(func.coalesce(users.c.aliases, _EMPTY_ALIASES), name))
+    )
+    logger.info(
+        "name_alias_learned",
+        extra={"document_id": document_id, "alias_count": len(account.aliases) + 1},
+    )
+    return True
+
+
 def confirm_identity(session: Session, document_id: int) -> bool:
     """Record that the user claimed a mismatched document as their own.
 
-    Stamps the most recent classification for the document. False when there is nothing
-    to stamp, which the caller turns into a 409.
+    Stamps the most recent classification for the document, **and remembers the name** so
+    the next document printing it is not questioned again. False when there is nothing to
+    stamp, which the caller turns into a 409.
+
+    The stamp and the alias are one transaction on purpose. Stamping without learning
+    leaves the user answering the same question for ever, which is the bug this fixes;
+    learning without stamping would accept the name while still refusing this document.
     """
     latest = session.execute(
-        select(AiReportClassification.id)
+        select(AiReportClassification.id, AiReportClassification.patient_name)
         .where(AiReportClassification.document_id == document_id)
         .order_by(AiReportClassification.created_at.desc())
         .limit(1)
-    ).scalar_one_or_none()
+    ).one_or_none()
     if latest is None:
         return False
     session.execute(
         update(AiReportClassification)
-        .where(AiReportClassification.id == latest)
+        .where(AiReportClassification.id == latest.id)
         .values(identity_confirmed_at=datetime.now(UTC))
     )
+    learn_alias(session, document_id=document_id, printed=latest.patient_name)
     session.commit()
     return True
 
@@ -189,7 +277,7 @@ def gate(ctx: StageContext, section: DocumentSection) -> None:
         _carry_settled(ctx.session, ctx.item_id, settled)
         return
 
-    account = owner_name(ctx.session, ctx.document_id)
+    account = owner(ctx.session, ctx.document_id)
     if account is None:
         return
 
@@ -199,7 +287,10 @@ def gate(ctx: StageContext, section: DocumentSection) -> None:
         )
     ).scalar_one_or_none()
 
-    verdict = compare(printed, account)
+    # Against the account's own name AND every alias it has confirmed. Without the
+    # aliases this asked again on every document: in production one name was confirmed
+    # 82 times across 87 documents, and a dialog answered that often stops being read.
+    verdict = compare_all(printed, account.all_names)
     record_verdict(ctx.session, ctx.item_id, verdict)
     if verdict is NameVerdict.MISMATCH:
         logger.info(

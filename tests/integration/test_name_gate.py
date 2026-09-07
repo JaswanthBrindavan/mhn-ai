@@ -502,3 +502,84 @@ def test_a_document_rejected_as_unknown_is_still_read_again(
 
     assert outcome is Outcome.COMPLETED
     assert _readings(db_session, document_id) == 2
+
+
+# --- aliases -----------------------------------------------------------------
+#
+# Confirming a mismatch records the NAME, not just the document, so the next document
+# printing it passes silently. `identity_confirmed_at` is keyed on the document, and in
+# production one name was confirmed 82 times across 87 documents.
+
+
+def _aliases(db_session, document_id: int) -> list[str]:
+    return (
+        db_session.execute(
+            text(
+                'SELECT aliases FROM "user" WHERE id = '
+                "(SELECT user_id FROM unclassified_files WHERE id = :d)"
+            ),
+            {"d": document_id},
+        ).scalar_one()
+        or []
+    )
+
+
+def test_confirming_records_the_name_as_an_alias(gate_ctx, db_session) -> None:
+    ctx = gate_ctx(document_name="P Suresh Babu", account_name="Jaswanth Brindavan")
+    with pytest.raises(RejectStageError):
+        gate(ctx, DocumentSection.REPORTS)
+
+    assert confirm_identity(db_session, ctx.document_id) is True
+
+    assert _aliases(db_session, ctx.document_id) == ["P Suresh Babu"]
+
+
+def test_a_later_document_with_the_confirmed_name_is_not_questioned(gate_ctx, db_session) -> None:
+    """The point of the feature, end to end: a SECOND document, its own intake row and its
+    own run item, printing the name the user already accepted. It must pass the gate
+    without raising — the settled-verdict short-circuit cannot help here, because that is
+    keyed on document_id and this is a different document."""
+    first = gate_ctx(document_name="P Suresh Babu", account_name="Jaswanth Brindavan")
+    with pytest.raises(RejectStageError):
+        gate(first, DocumentSection.REPORTS)
+    confirm_identity(db_session, first.document_id)
+
+    second = gate_ctx(document_name="P Suresh Babu", account_name="Jaswanth Brindavan")
+    gate(second, DocumentSection.REPORTS)  # does not raise
+
+    assert settled_verdict(db_session, second.document_id) is NameVerdict.MATCH
+
+
+def test_an_alias_does_not_admit_a_different_name(gate_ctx, db_session) -> None:
+    """An alias widens the accepted set by exactly one name. Everything else still stops."""
+    first = gate_ctx(document_name="P Suresh Babu", account_name="Jaswanth Brindavan")
+    with pytest.raises(RejectStageError):
+        gate(first, DocumentSection.REPORTS)
+    confirm_identity(db_session, first.document_id)
+
+    other = gate_ctx(document_name="VIKRAM RAO", account_name="Jaswanth Brindavan")
+    with pytest.raises(RejectStageError):
+        gate(other, DocumentSection.REPORTS)
+
+
+def test_confirming_the_same_name_twice_stores_one_alias(gate_ctx, db_session) -> None:
+    """Otherwise the column grows without bound on a name the matcher already accepts —
+    and the dedupe is by MATCHING, so an honorific variant does not slip past it."""
+    first = gate_ctx(document_name="P Suresh Babu", account_name="Jaswanth Brindavan")
+    with pytest.raises(RejectStageError):
+        gate(first, DocumentSection.REPORTS)
+    confirm_identity(db_session, first.document_id)
+
+    again = gate_ctx(document_name="MR. P SURESH BABU", account_name="Jaswanth Brindavan")
+    confirm_identity(db_session, again.document_id)
+
+    assert _aliases(db_session, again.document_id) == ["P Suresh Babu"]
+
+
+def test_an_unreadable_name_is_never_learned(gate_ctx, db_session) -> None:
+    """ "SELF" names nobody. Storing it would make every placeholder-named document match."""
+    ctx = gate_ctx(document_name="SELF", account_name="Jaswanth Brindavan")
+    gate(ctx, DocumentSection.REPORTS)  # UNKNOWN passes silently
+    confirm_identity(db_session, ctx.document_id)
+
+    assert _aliases(db_session, ctx.document_id) == []
