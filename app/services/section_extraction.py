@@ -54,6 +54,7 @@ derived from ``SECTION_SPECS``, so adding a section is an entry there and nothin
 
 import logging
 import time
+from datetime import UTC, date, datetime
 from functools import partial
 from typing import Any
 
@@ -71,7 +72,7 @@ from app.services.ai_logging import (
     sanitize_validation_error,
 )
 from app.services.classification import DocumentSection
-from app.services.dates import add_interval, in_order, iso_date
+from app.services.dates import add_interval, display_date, in_order, iso_date
 from app.services.money import normalise_amount, normalise_currency
 from app.services.section_specs import INSTRUCTION, SectionSpec, spec_for
 from app.services.source_loading import load_source_document
@@ -87,7 +88,10 @@ PROMPT_VERSION = "sec-2026-09-01"
 #: rather than a date. The model used to compute that date; Python does now.
 #: The SHAPE is unchanged by the vision rewrite — same fields, same schemas — so this does
 #: not move. What changed is what the model was shown, which is what PROMPT_VERSION records.
-SCHEMA_VERSION = "sec-3"
+#: sec-4 added ``doses`` to vaccinations: EVERY dose the document prints, each with its
+#: own dates, rather than the single flat record that could hold only the first row of an
+#: immunisation history and had nowhere at all to put a schedule of upcoming doses.
+SCHEMA_VERSION = "sec-4"
 STAGE_NAME = "extracting_section"
 
 
@@ -218,24 +222,36 @@ def _article(section: DocumentSection) -> str:
     return _SECTION_LABEL.get(section, section.value.replace("_", " "))
 
 
-def build_payload(spec: SectionSpec, result: BaseModel) -> dict[str, Any]:
+def build_payload(
+    spec: SectionSpec, result: BaseModel, *, today: date | None = None
+) -> dict[str, Any]:
     """The stored shape: validated fields, ISO dates, and data-quality flags.
 
     Separated from the stage so it can be exercised without a database or a model call.
+
+    ``today`` is a parameter only so the deadline rule below can be tested against a fixed
+    date; the stage never passes one.
     """
     fields = result.model_dump()
     for name in spec.date_fields:
         fields[name] = iso_date(fields.get(name))
+    for list_name, name in spec.list_date_fields:
+        for row in fields.get(list_name) or ():
+            row[name] = iso_date(row.get(name))
     for name in spec.amount_fields:
         fields[name] = normalise_amount(fields.get(name))
     for name in spec.currency_fields:
         fields[name] = normalise_currency(fields.get(name))
+    # Before the interval fallback, so a date the document actually SCHEDULED beats one
+    # computed from a phrase — the same precedence a printed date already had.
+    schedule_flags = _deadline_from_list(spec, fields, today)
     for target, start, interval in spec.derived_from_interval:
         # A printed date wins; this only fills the gap the model was told to leave.
         if not fields.get(target):
             fields[target] = add_interval(fields.get(start), fields.get(interval))
 
     flags = _date_flags(spec, fields)
+    flags.extend(schedule_flags)
     flags.extend(_drop_unsourced_summary(spec, fields))
     flags.extend(_nothing_extracted(fields, flags))
 
@@ -247,6 +263,78 @@ def build_payload(spec: SectionSpec, result: BaseModel) -> dict[str, Any]:
 
 
 # --- helpers ----------------------------------------------------------------
+
+
+def _deadline_from_list(
+    spec: SectionSpec, fields: dict[str, Any], today: date | None
+) -> list[dict[str, str]]:
+    """Choose the one deadline a document's LIST of rows implies, and say which it is.
+
+    A vaccination certificate prints one next date. An immunisation record prints a
+    schedule — four upcoming doses of four different vaccines — and the flat field this
+    fills is written to ``vaccinations.next_due_on``, which is what raises a reminder. So
+    one of those dates has to be picked, and picking it is the same class of decision as
+    the interval arithmetic next door: it decides when a person is told to come back, so
+    Python does it rather than whichever row a model happened to flatten into the scalar.
+
+    **The rule: the earliest date still ahead; if every one is past, the latest of those.**
+    Earliest-ahead is the next errand, which is the whole question the field is asked.
+    Falling back to the latest past one rather than to null matters twice over — a
+    single-dose certificate whose printed date has already gone by must keep behaving
+    exactly as it did (it is one date, so both arms pick it), and a booster that was missed
+    is precisely what an upcoming screen exists to surface. Of several missed, the latest
+    is the one still outstanding; the earlier ones were superseded by it.
+
+    Only ever overwrites the target when the list actually yields a date, so a document
+    with rows that carry no dates keeps whatever the flat field already held.
+
+    ISO dates, so the comparison is a string comparison. ``today`` is UTC rather than the
+    reader's own zone: the two disagree only for a dose due on the day itself, where the
+    choice is between "due today" and "due tomorrow" and both are true somewhere.
+    """
+    flags: list[dict[str, str]] = []
+    today_iso = (today or datetime.now(UTC).date()).isoformat()
+
+    for target, list_name, name, label_fields in spec.deadline_from_list:
+        rows = [row for row in (fields.get(list_name) or ()) if isinstance(row, dict)]
+        dates = sorted(value for row in rows if (value := row.get(name)))
+        chosen = next((d for d in dates if d >= today_iso), dates[-1]) if dates else None
+        if chosen:
+            fields[target] = chosen
+        if len(rows) > 1:
+            flags.append(_schedule_flag(target, rows, name, label_fields, chosen))
+    return flags
+
+
+def _schedule_flag(
+    target: str,
+    rows: list[dict[str, Any]],
+    name: str,
+    label_fields: tuple[str, ...],
+    chosen: str | None,
+) -> dict[str, str]:
+    """Say that this document held a schedule, and which row the chosen date came from.
+
+    Without it the card asserts something false. The app renders the flat fields as one
+    record — "Hepatitis B, Dose 1, given 14 Aug" — and the date chosen above belongs to
+    whichever row comes next, which on a real immunisation history is a different vaccine
+    entirely. Naming the row is the difference between a next-due date and a next-due date
+    attributed to the wrong vaccine on somebody's medical record.
+
+    It is also what makes the other rows visible at all until a client renders the list:
+    the count says the document held more than the one record shown.
+    """
+    if not chosen:
+        detail = f"This record lists {len(rows)} doses. None of them gives a date for a next dose."
+    else:
+        owner = next((row for row in rows if row.get(name) == chosen), {})
+        label = " ".join(str(owner[f]).strip() for f in label_fields if owner.get(f))
+        due = display_date(chosen) or chosen
+        detail = (
+            f"This record lists {len(rows)} doses. The soonest one due is "
+            f"{label or 'the next dose'} on {due}."
+        )
+    return {"code": "multiple_doses", "field": target, "detail": detail}
 
 
 def _date_flags(spec: SectionSpec, fields: dict[str, Any]) -> list[dict[str, str]]:

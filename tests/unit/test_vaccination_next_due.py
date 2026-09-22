@@ -30,7 +30,7 @@ VACCINATIONS = spec_for(DocumentSection.VACCINATIONS)
 
 
 def _fields(**overrides: object) -> dict:
-    base = {"vaccine_name": "Pentavalent", "date_given": "04/03/2026"}
+    base = {"vaccine_name": "Pentavalent", "date_given": "04/03/2026", "doses": []}
     base.update(overrides)
     return build_payload(VACCINATIONS, VaccinationFields(**base))["fields"]  # type: ignore[arg-type]
 
