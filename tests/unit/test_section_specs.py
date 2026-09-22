@@ -158,7 +158,7 @@ def test_unreadable_date_becomes_null_rather_than_a_guess():
 
 def test_vaccination_payload_flags_a_dose_due_before_it_was_given():
     spec = spec_for(DocumentSection.VACCINATIONS)
-    fields = VaccinationFields(date_given="02/02/2026", next_due_date="02/02/2025")
+    fields = VaccinationFields(date_given="02/02/2026", next_due_date="02/02/2025", doses=[])
     payload = build_payload(spec, fields)
 
     assert [f["field"] for f in payload["flags"]] == ["next_due_date"]
@@ -167,7 +167,7 @@ def test_vaccination_payload_flags_a_dose_due_before_it_was_given():
 def test_vaccination_payload_allows_a_missing_next_dose():
     """A completed series has no next dose; that is not a flag."""
     spec = spec_for(DocumentSection.VACCINATIONS)
-    payload = build_payload(spec, VaccinationFields(date_given="23/12/2021"))
+    payload = build_payload(spec, VaccinationFields(date_given="23/12/2021", doses=[]))
 
     assert payload["fields"]["date_given"] == "2021-12-23"
     assert payload["fields"]["next_due_date"] is None

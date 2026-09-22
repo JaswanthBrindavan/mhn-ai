@@ -285,9 +285,38 @@ _SCAN_PROMPT = (
 # --------------------------------------------------------------------------- #
 # vaccinations                                                                 #
 # --------------------------------------------------------------------------- #
+class VaccinationDose(BaseModel):
+    """One row of a vaccination document: a dose given, a dose due, or both.
+
+    A certificate prints one of these. An immunisation history prints a table of them, and
+    a schedule prints a second table of doses not yet given — which is the shape the flat
+    fields below could not hold, so every row but the first was dropped and an upcoming
+    dose belonging to a different vaccine had nowhere to go at all.
+
+    ``date_given`` null is what makes a row an upcoming dose rather than a past one. That
+    is the only marker: a row is not labelled, it is read.
+    """
+
+    vaccine_name: str | None = Field(default=None, max_length=256)
+    dose_info: str | None = Field(default=None, max_length=128)
+    date_given: str | None = Field(default=None, max_length=64)
+    next_due_date: str | None = Field(default=None, max_length=64)
+    #: The three a history table prints beside each dose. Transcribed because they are on
+    #: the page and a person reading the record wants them; nothing computes on them.
+    batch_lot: str | None = Field(default=None, max_length=128)
+    site: str | None = Field(default=None, max_length=128)
+    vaccinator: str | None = Field(default=None, max_length=256)
+
+
 class VaccinationFields(BaseModel):
     """Validated vaccination-record fields. No free-text summary: a vaccination record
-    is a set of facts, and every one of them is a field here."""
+    is a set of facts, and every one of them is a field here.
+
+    The scalars describe ONE dose — the first administered one — and are what the app
+    renders as the record's headline. ``doses`` is the whole document: every administered
+    row and every upcoming one, each with its own dates. A single-dose certificate fills
+    both, which is why the scalars stay rather than being replaced by the list.
+    """
 
     title: str | None = Field(default=None, max_length=256)
     vaccine_name: str | None = Field(default=None, max_length=256)
@@ -308,6 +337,9 @@ class VaccinationFields(BaseModel):
     #: interval was printed on the document.
     next_due_interval: str | None = Field(default=None, max_length=64)
     facility: str | None = Field(default=None, max_length=256)
+    #: Every dose the document prints, in the order it prints them. Empty for a record
+    #: that carries no table at all — the scalars above still describe it.
+    doses: list[VaccinationDose]
 
 
 _VACCINATION_SCHEMA: dict[str, Any] = {
@@ -320,6 +352,31 @@ _VACCINATION_SCHEMA: dict[str, Any] = {
         "next_due_date": _NULLABLE_STR,
         "next_due_interval": _NULLABLE_STR,
         "facility": _NULLABLE_STR,
+        "doses": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "vaccine_name": _NULLABLE_STR,
+                    "dose_info": _NULLABLE_STR,
+                    "date_given": _NULLABLE_STR,
+                    "next_due_date": _NULLABLE_STR,
+                    "batch_lot": _NULLABLE_STR,
+                    "site": _NULLABLE_STR,
+                    "vaccinator": _NULLABLE_STR,
+                },
+                "required": [
+                    "vaccine_name",
+                    "dose_info",
+                    "date_given",
+                    "next_due_date",
+                    "batch_lot",
+                    "site",
+                    "vaccinator",
+                ],
+                "additionalProperties": False,
+            },
+        },
     },
     "required": [
         "title",
@@ -329,6 +386,7 @@ _VACCINATION_SCHEMA: dict[str, Any] = {
         "next_due_date",
         "next_due_interval",
         "facility",
+        "doses",
     ],
     "additionalProperties": False,
 }
@@ -357,7 +415,25 @@ _VACCINATION_PROMPT = (
     "decides when a person is reminded to come back for a dose, and the arithmetic "
     "belongs in code where it can be checked. Put the phrase here and leave next_due_date "
     "null.\n"
-    "- facility: the vaccination centre or hospital NAME only, not its address.\n\n"
+    "- facility: the vaccination centre or hospital NAME only, not its address.\n"
+    "- doses: EVERY dose the document prints, in the order printed, one entry each. A "
+    "record with an immunisation history AND a schedule of upcoming doses has BOTH "
+    "tables here, merged into this one list — not just the first table, and not just "
+    "the first row of it.\n"
+    "  - A dose that has been GIVEN: date_given is its date, and next_due_date is null "
+    "unless that same row prints a date for its own next dose.\n"
+    "  - A dose that is only SCHEDULED: date_given is null and next_due_date is when it "
+    "is due. Leaving date_given null is HOW a not-yet-given dose is recorded — do not "
+    "copy a date into it to fill the field.\n"
+    "  - batch_lot, site, vaccinator: the batch or lot number, the injection site and "
+    "who administered it, where the row prints them. Null where it does not.\n"
+    "  - Do not list a dose twice because the document mentions it twice. An "
+    "appointment block or a coverage summary restating a dose already in a table is "
+    "the SAME dose.\n"
+    "- The scalar fields above describe the FIRST ADMINISTERED dose, so a certificate "
+    "carrying a single dose fills them and a one-entry doses list identically. Which "
+    "dose comes next across a whole schedule is decided in code, not here: list the "
+    "doses and leave that judgement alone.\n\n"
     "Rules:\n" + _NO_INVENTION_RULE + _DATE_RULE
 )
 
@@ -485,6 +561,21 @@ class SectionSpec:
     #: transcribes the phrase and Python does the arithmetic, for the same reason abnormal
     #: flags and money are computed here. A printed date always wins over a derived one.
     derived_from_interval: tuple[tuple[str, str, str], ...] = ()
+    #: (list field, date field on its entries) — dates INSIDE a list, normalised to ISO
+    #: exactly as ``date_fields`` normalises the flat ones. Listed rather than discovered
+    #: by name for the reason ``currency_fields`` is: the rule stays visible in the spec.
+    list_date_fields: tuple[tuple[str, str], ...] = ()
+    #: (target, list field, date field, label fields) — fill ``target`` with the deadline
+    #: a document's LIST of rows implies, whenever that list carries one. The label fields
+    #: are the row's own columns that name it in the sentence the reader is shown.
+    #:
+    #: A vaccination document does not print "the" next date: it prints a schedule of four
+    #: of them belonging to four different vaccines, and ``target`` is written to
+    #: ``vaccinations.next_due_on``, which is what raises a reminder. Which of those dates
+    #: that is must therefore be a rule in code — earliest still ahead, else the latest
+    #: already past — rather than whichever row a model happened to flatten into the
+    #: scalar field. Same reason ``derived_from_interval`` exists, one level up.
+    deadline_from_list: tuple[tuple[str, str, str, tuple[str, ...]], ...] = ()
 
 
 #: Sent with the document itself, which the model can see (2026-09-01 — it used to be a
@@ -534,9 +625,20 @@ SECTION_SPECS: dict[DocumentSection, SectionSpec] = {
         model=VaccinationFields,
         json_schema=_VACCINATION_SCHEMA,
         system_prompt=_VACCINATION_PROMPT,
-        max_tokens=2048,
+        # Raised with `doses`. A certificate fitted in 2048; an immunisation history of
+        # nine rows, each with a batch number, a site and a vaccinator, does not — and a
+        # truncated response fails validation, which this stage treats as transient, so it
+        # would be retried at full price and truncated identically every time.
+        max_tokens=4096,
         date_fields=("date_given", "next_due_date"),
         date_order=(("date_given", "next_due_date"),),
+        list_date_fields=(("doses", "date_given"), ("doses", "next_due_date")),
+        # WHICH of a schedule's dates the reminder is for, chosen in code rather than
+        # taken from whichever one the model put in the flat field. See
+        # `section_extraction._deadline_from_list`.
+        deadline_from_list=(
+            ("next_due_date", "doses", "next_due_date", ("vaccine_name", "dose_info")),
+        ),
         # The model transcribes the phrase; this derives the date. See VaccinationFields.
         derived_from_interval=(("next_due_date", "date_given", "next_due_interval"),),
     ),

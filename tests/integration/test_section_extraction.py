@@ -121,6 +121,7 @@ VACCINATION_PAYLOAD = {
     "date_given": "23/12/2021",
     "next_due_date": None,
     "facility": "City Clinic",
+    "doses": [],
 }
 
 
